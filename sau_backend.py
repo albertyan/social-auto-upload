@@ -4,8 +4,11 @@ import sqlite3
 import threading
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from queue import Queue
+
+import requests as http_requests
 from flask_cors import CORS
 from myUtils.auth import check_cookie
 from flask import Flask, request, jsonify, Response, render_template, send_from_directory
@@ -718,6 +721,400 @@ def sse_stream(status_queue):
         else:
             # 避免 CPU 占满
             time.sleep(0.1)
+
+# ============================================================
+# v2 API — Task tracking infrastructure
+# ============================================================
+
+# In-memory task store: {task_id: {task_id, platform_key, status, error, ...}}
+task_store = {}
+task_store_lock = threading.Lock()
+
+# Cookies directory (new uploader system)
+V2_COOKIES_DIR = Path(__file__).parent / "cookies"
+
+# Platform key -> cookie-file prefix mapping
+V2_PLATFORM_COOKIE_PREFIX = {
+    "douyin": "douyin",
+    "xiaohongshu": "xiaohongshu",
+    "shipinhao": "tencent",
+    "bilibili": "bilibili",
+    "baijiahao": "baijiahao",
+    "kuaishou": "kuaishou",
+}
+
+
+def create_task(platform_key, material_id=None, callback_url=None):
+    task_id = str(uuid.uuid4())
+    now = datetime.now().isoformat()
+    task = {
+        "task_id": task_id,
+        "platform_key": platform_key,
+        "status": "pending",
+        "error": None,
+        "publish_url": None,
+        "material_id": material_id,
+        "callback_url": callback_url,
+        "created_at": now,
+        "updated_at": now,
+    }
+    with task_store_lock:
+        task_store[task_id] = task
+    return task
+
+
+def get_task(task_id):
+    with task_store_lock:
+        return task_store.get(task_id)
+
+
+def update_task(task_id, **kwargs):
+    with task_store_lock:
+        task = task_store.get(task_id)
+        if task:
+            task.update(kwargs)
+            task["updated_at"] = datetime.now().isoformat()
+        return task
+
+
+def send_callback(task):
+    """POST result to callback_url with 3-attempt exponential backoff."""
+    callback_url = task.get("callback_url")
+    if not callback_url:
+        return
+    payload = {
+        "task_id": task["task_id"],
+        "platform_key": task["platform_key"],
+        "status": task["status"],
+        "error": task.get("error"),
+        "publish_url": task.get("publish_url"),
+    }
+    for attempt in range(3):
+        try:
+            resp = http_requests.post(callback_url, json=payload, timeout=10)
+            if resp.status_code < 300:
+                return
+        except Exception as e:
+            print(f"[v2] Callback attempt {attempt + 1} failed: {e}")
+        time.sleep(2 ** attempt)
+
+
+def _resolve_account_file(platform_key, account_name="default"):
+    """Return cookie file path for a given platform + account."""
+    prefix = V2_PLATFORM_COOKIE_PREFIX.get(platform_key, platform_key)
+    return V2_COOKIES_DIR / f"{prefix}_{account_name}.json"
+
+
+def _find_default_account_name(platform_key):
+    """Scan cookies dir for the first account of this platform, fallback to 'default'."""
+    prefix = V2_PLATFORM_COOKIE_PREFIX.get(platform_key, platform_key)
+    if V2_COOKIES_DIR.exists():
+        for f in V2_COOKIES_DIR.iterdir():
+            if f.name.startswith(f"{prefix}_") and f.name.endswith(".json"):
+                # extract account_name from "{prefix}_{account_name}.json"
+                stem = f.stem  # e.g. "douyin_myacc"
+                return stem[len(prefix) + 1:]
+    return "default"
+
+
+# ---- lazy uploader imports (heavy deps like patchright) ----
+
+def _import_uploader(platform_key):
+    """Return a dict of callables for the given platform.
+    Keys: setup, cookie_auth, VideoClass (may be None for bilibili).
+    """
+    if platform_key == "douyin":
+        from uploader.douyin_uploader.main import (
+            douyin_setup, cookie_auth, DouYinVideo,
+        )
+        return {"setup": douyin_setup, "cookie_auth": cookie_auth, "VideoClass": DouYinVideo}
+
+    if platform_key == "xiaohongshu":
+        from uploader.xiaohongshu_uploader.main import (
+            xiaohongshu_setup, cookie_auth, XiaoHongShuVideo,
+        )
+        return {"setup": xiaohongshu_setup, "cookie_auth": cookie_auth, "VideoClass": XiaoHongShuVideo}
+
+    if platform_key == "shipinhao":
+        from uploader.tencent_uploader.main import (
+            tencent_setup, cookie_auth, TencentVideo,
+        )
+        return {"setup": tencent_setup, "cookie_auth": cookie_auth, "VideoClass": TencentVideo}
+
+    if platform_key == "kuaishou":
+        from uploader.ks_uploader.main import (
+            ks_setup, cookie_auth, KSVideo,
+        )
+        return {"setup": ks_setup, "cookie_auth": cookie_auth, "VideoClass": KSVideo}
+
+    if platform_key == "baijiahao":
+        from uploader.baijiahao_uploader.main import (
+            baijiahao_setup, cookie_auth, BaiJiaHaoVideo,
+        )
+        return {"setup": baijiahao_setup, "cookie_auth": cookie_auth, "VideoClass": BaiJiaHaoVideo}
+
+    if platform_key == "bilibili":
+        # bilibili uses biliup CLI, no VideoClass
+        return {"setup": None, "cookie_auth": None, "VideoClass": None}
+
+    return None
+
+
+async def _run_upload(platform_key, account_file, title, file_path, tags, description, publish_date):
+    """Execute the actual upload for a given platform."""
+    mods = _import_uploader(platform_key)
+    if mods is None:
+        raise ValueError(f"Unsupported platform: {platform_key}")
+
+    # bilibili special path (CLI-based)
+    if platform_key == "bilibili":
+        from uploader.bilibili_uploader.runtime import run_biliup_command
+        arguments = [
+            "-u", str(account_file), "upload",
+            str(file_path), "--title", title,
+            "--desc", description or "", "--tid", "130",  # default tid
+        ]
+        if tags:
+            arguments.extend(["--tag", ",".join(tags)])
+        if publish_date and publish_date != 0:
+            if isinstance(publish_date, datetime):
+                arguments.extend(["--dtime", str(int(publish_date.timestamp()))])
+        result = run_biliup_command(arguments)
+        if result.returncode != 0:
+            raise RuntimeError((result.stderr or result.stdout or "").strip() or "Bilibili upload failed")
+        return
+
+    # Common path: setup -> verify cookie
+    setup_fn = mods["setup"]
+    is_ready = await setup_fn(str(account_file), handle=False)
+    if not is_ready:
+        raise RuntimeError(
+            f"Cookie missing or expired for {platform_key}: {account_file}. "
+            f"Please login first via POST /api/v2/login/{platform_key}."
+        )
+
+    VideoClass = mods["VideoClass"]
+
+    # Instantiate uploader per platform
+    if platform_key == "douyin":
+        from uploader.douyin_uploader.main import DOUYIN_PUBLISH_STRATEGY_IMMEDIATE
+        app_inst = VideoClass(
+            title, str(file_path), tags or [], publish_date or 0,
+            str(account_file), desc=description or "",
+            publish_strategy=DOUYIN_PUBLISH_STRATEGY_IMMEDIATE,
+            debug=True, headless=True,
+        )
+        await app_inst.douyin_upload_video()
+
+    elif platform_key == "xiaohongshu":
+        from uploader.xiaohongshu_uploader.main import XIAOHONGSHU_PUBLISH_STRATEGY_IMMEDIATE
+        app_inst = VideoClass(
+            title=title, file_path=str(file_path), desc=description or "",
+            tags=tags or [], publish_date=publish_date or 0,
+            account_file=str(account_file),
+            publish_strategy=XIAOHONGSHU_PUBLISH_STRATEGY_IMMEDIATE,
+            debug=True, headless=True,
+        )
+        await app_inst.main()
+
+    elif platform_key == "shipinhao":
+        from uploader.tencent_uploader.main import TENCENT_PUBLISH_STRATEGY_IMMEDIATE
+        app_inst = VideoClass(
+            title=title, file_path=str(file_path), tags=tags or [],
+            publish_date=publish_date or 0, account_file=str(account_file),
+            desc=description or "",
+            publish_strategy=TENCENT_PUBLISH_STRATEGY_IMMEDIATE,
+            debug=True, headless=True,
+        )
+        await app_inst.tencent_upload_video()
+
+    elif platform_key == "kuaishou":
+        from uploader.ks_uploader.main import KUAISHOU_PUBLISH_STRATEGY_IMMEDIATE
+        app_inst = VideoClass(
+            title=title, file_path=str(file_path), desc=description or "",
+            tags=tags or [], publish_date=publish_date or 0,
+            account_file=str(account_file),
+            publish_strategy=KUAISHOU_PUBLISH_STRATEGY_IMMEDIATE,
+            debug=True, headless=True,
+        )
+        await app_inst.main()
+
+    elif platform_key == "baijiahao":
+        app_inst = VideoClass(
+            title=title, file_path=str(file_path), tags=tags or [],
+            publish_date=publish_date or 0, account_file=str(account_file),
+        )
+        await app_inst.main()
+
+    else:
+        raise ValueError(f"Unsupported platform: {platform_key}")
+
+
+def execute_publish_task(task, file_path, title, tags, description, scheduled_at, material_id=None, callback_url=None):
+    """Runs in a background thread: executes upload and updates task."""
+    try:
+        update_task(task["task_id"], status="running", material_id=material_id, callback_url=callback_url)
+        platform_key = task["platform_key"]
+        account_name = _find_default_account_name(platform_key)
+        account_file = _resolve_account_file(platform_key, account_name)
+
+        # Parse scheduled_at
+        publish_date = 0
+        if scheduled_at:
+            try:
+                publish_date = datetime.fromisoformat(scheduled_at)
+            except (ValueError, TypeError):
+                publish_date = 0
+
+        # Create a new event loop for this thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(
+                _run_upload(platform_key, account_file, title, file_path, tags, description, publish_date)
+            )
+        finally:
+            loop.close()
+
+        update_task(task["task_id"], status="success")
+        print(f"[v2] Task {task['task_id']} ({platform_key}) succeeded.")
+    except Exception as e:
+        print(f"[v2] Task {task['task_id']} failed: {e}")
+        update_task(task["task_id"], status="failed", error=str(e))
+    finally:
+        # Reload task for callback
+        current = get_task(task["task_id"])
+        if current:
+            send_callback(current)
+
+
+def execute_login_task(task, platform_key, account_name):
+    """Runs in a background thread: executes login flow."""
+    try:
+        update_task(task["task_id"], status="running")
+        account_file = _resolve_account_file(platform_key, account_name)
+        account_file.parent.mkdir(parents=True, exist_ok=True)
+
+        if platform_key == "bilibili":
+            # bilibili login requires interactive terminal, just mark as needing manual action
+            update_task(task["task_id"], status="failed",
+                        error="Bilibili login requires interactive terminal. "
+                              "Run `sau bilibili login --account {}` manually.".format(account_name))
+            return
+
+        mods = _import_uploader(platform_key)
+        if mods is None or mods.get("setup") is None:
+            update_task(task["task_id"], status="failed", error=f"Unsupported platform: {platform_key}")
+            return
+
+        setup_fn = mods["setup"]
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            result = loop.run_until_complete(
+                setup_fn(str(account_file), handle=True, return_detail=True, headless=True)
+            )
+        finally:
+            loop.close()
+
+        if isinstance(result, dict) and result.get("success"):
+            update_task(task["task_id"], status="success")
+        elif isinstance(result, dict) and not result.get("success"):
+            update_task(task["task_id"], status="failed", error=result.get("message", "Login failed"))
+        else:
+            # setup returned True/non-dict — treat as success
+            update_task(task["task_id"], status="success")
+
+        print(f"[v2] Login task {task['task_id']} ({platform_key}) completed.")
+    except Exception as e:
+        print(f"[v2] Login task {task['task_id']} failed: {e}")
+        update_task(task["task_id"], status="failed", error=str(e))
+
+
+# ============================================================
+# v2 API Endpoints
+# ============================================================
+
+@app.route('/api/v2/accounts', methods=['GET'])
+def v2_accounts():
+    """List all accounts by scanning cookies/ directory."""
+    accounts = []
+    if not V2_COOKIES_DIR.exists():
+        return jsonify({"code": 200, "msg": None, "data": {"accounts": []}}), 200
+
+    # Reverse map: cookie prefix -> platform_key
+    prefix_to_platform = {}
+    for pk, prefix in V2_PLATFORM_COOKIE_PREFIX.items():
+        prefix_to_platform.setdefault(prefix, []).append(pk)
+
+    for f in V2_COOKIES_DIR.iterdir():
+        if not f.name.endswith('..json') and f.suffix == '.json':
+            # Parse filename: {prefix}_{account_name}.json
+            stem = f.stem  # e.g. "douyin_default"
+            parts = stem.split('_', 1)
+            if len(parts) != 2:
+                continue
+            prefix, account_name = parts
+            platforms = prefix_to_platform.get(prefix, [prefix])
+            stat = f.stat()
+            for pk in platforms:
+                accounts.append({
+                    "platform_key": pk,
+                    "account_name": account_name,
+                    "cookie_file": str(f),
+                    "is_valid": None,  # not checked (too slow)
+                    "last_modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                })
+
+    return jsonify({"code": 200, "msg": None, "data": {"accounts": accounts}}), 200
+
+
+@app.route('/api/v2/login/<platform_key>', methods=['POST'])
+def v2_login(platform_key):
+    """Start a login flow for the given platform."""
+    valid_platforms = list(V2_PLATFORM_COOKIE_PREFIX.keys())
+    if platform_key not in valid_platforms:
+        return jsonify({"code": 400, "msg": f"不支持的平台: {platform_key}，可选: {valid_platforms}"}), 400
+
+    data = request.get_json(silent=True) or {}
+    account_name = data.get('account_name', 'default')
+
+    task = create_task(platform_key)
+    t = threading.Thread(
+        target=execute_login_task,
+        args=(task, platform_key, account_name),
+        daemon=True,
+    )
+    t.start()
+
+    return jsonify({"code": 200, "msg": "登录流程已启动", "data": {"task_id": task["task_id"], "status": "login_started"}}), 200
+
+
+@app.route('/api/v2/callback', methods=['POST'])
+def v2_callback():
+    """Receive task result callback from opcgeo server or external agent."""
+    data = request.get_json(silent=True)
+    if not data:
+        return jsonify({"code": 400, "msg": "请求数据不能为空"}), 400
+
+    task_id = data.get('task_id')
+    status = data.get('status')
+    if not task_id or not status:
+        return jsonify({"code": 400, "msg": "缺少 task_id 或 status"}), 400
+
+    task = get_task(task_id)
+    if not task:
+        return jsonify({"code": 404, "msg": "任务不存在"}), 404
+
+    update_fields = {"status": status}
+    if data.get('error'):
+        update_fields["error"] = data["error"]
+    if data.get('publish_url'):
+        update_fields["publish_url"] = data["publish_url"]
+
+    update_task(task_id, **update_fields)
+    return jsonify({"code": 200, "msg": "回调已接收", "data": {"task_id": task_id}}), 200
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0' ,port=5409)

@@ -4,7 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "social-auto-upload"
-version = "0.1.0"
+# 运行时版本以 sau_agent_pkg/version.py 为单一事实源，此处保持对齐
+version = "1.0.0"
 description = "Social media auto uploader"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
@@ -19,22 +20,28 @@ dependencies = [
 
 [project.scripts]
 sau = "sau_cli:main"
+sau-agent = "sau_agent:main"
 
 [project.optional-dependencies]
 web = [
   "Flask[async]==3.1.1",
   "flask-cors==6.0.0",
 ]
+agent = [
+  "websockets>=12.0",
+  "aiohttp>=3.9",
+]
 
 [tool.uv]
 package = true
 
 [tool.setuptools]
-py-modules = ["cli_main", "conf", "sau_cli"]
+py-modules = ["cli_main", "conf", "sau_cli", "sau_agent"]
 include-package-data = true
 
 [tool.setuptools.packages.find]
-include = ["uploader*", "utils*", "myUtils*"]
+# sau_agent_pkg 为 sau_agent.py 的版本号事实源，需一并打包
+include = ["uploader*", "utils*", "myUtils*", "sau_agent_pkg*"]
 
 [tool.setuptools.package-data]
 utils = ["stealth.min.js"]

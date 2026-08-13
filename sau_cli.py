@@ -8,6 +8,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Sequence
 
+# Windows GBK 控制台/重定向环境下，避免特殊字符（✓ 等）导致输出崩溃
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            pass
+
 from conf import BASE_DIR
 from uploader.bilibili_uploader.runtime import run_biliup_command
 from uploader.douyin_uploader.main import (
