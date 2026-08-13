@@ -10,6 +10,17 @@ sau_tray.views.dialogs
 所有 Win32 MessageBoxW 都统一调度到 GUI 线程（带 Tk mainloop），
 并安装 WH_CBT 钩子让弹框默认落在「屏幕右下角靠近托盘/任务栏的位置」
 （这是用户偏好，和 Settings 窗口默认位置保持一致的视觉习惯）。
+
+ctypes 类型说明：
+- Win32 中 WPARAM = UINT_PTR、LPARAM = LONG_PTR、LRESULT = LONG_PTR
+  都是「指针大小的整数」，32 位 Windows 上占 4 字节，64 位上占 8 字节。
+- 标准库 ctypes.wintypes 的 WPARAM/LPARAM 在某些 Python 版本里被错误地
+  声明成 c_ulong/c_long（永远 4 字节），导致 64 位 Windows 上传入大于 2^31
+  的值时抛出 `OverflowError: int too long to convert`。
+- 所以本文件**不使用 wintypes.WPARAM / wintypes.LPARAM**，统一用
+  ctypes.c_size_t（对应 UINT_PTR，无符号指针大小）和
+  ctypes.c_ssize_t（对应 LONG_PTR，有符号指针大小），
+  它们会随平台自动切换 4/8 字节宽度，是真正安全的做法。
 """
 from __future__ import annotations
 
@@ -24,6 +35,34 @@ from sau_tray.core import gui_thread
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# 显式 Win32 类型声明（平台安全宽度）
+# ---------------------------------------------------------------------------
+# UINT_PTR / WPARAM（无符号指针大小） → c_size_t
+_WPARAM_T = ctypes.c_size_t
+# LONG_PTR / LPARAM / LRESULT（有符号指针大小） → c_ssize_t
+_LPARAM_T = ctypes.c_ssize_t
+_LRESULT_T = ctypes.c_ssize_t
+# HANDLE / HHOOK（指针大小） → wintypes.HANDLE，平台自动适配
+_HHOOK_T = wintypes.HANDLE
+_HWND_T = wintypes.HWND
+_HINSTANCE_T = wintypes.HINSTANCE
+_DWORD_T = wintypes.DWORD
+_BOOL_T = wintypes.BOOL
+_LPCWSTR_T = wintypes.LPCWSTR
+_LPVOID_T = wintypes.LPVOID
+_UINT_T = wintypes.UINT
+
+# Win32 RECT 结构（和 user32 API 对齐）
+class _RECT(ctypes.Structure):
+    _fields_ = [
+        ("left", ctypes.c_long),
+        ("top", ctypes.c_long),
+        ("right", ctypes.c_long),
+        ("bottom", ctypes.c_long),
+    ]
+_LPRECT_T = ctypes.POINTER(_RECT)
+
+# ---------------------------------------------------------------------------
 # Win32 常量声明
 # ---------------------------------------------------------------------------
 _HCBT_ACTIVATE = 5
@@ -33,11 +72,77 @@ _MB_OK = 0x0
 _MB_YESNO = 0x4
 _MB_ICONINFORMATION = 0x40
 _MB_ICONQUESTION = 0x20
-_MB_SYSTEMMODAL = 0x1000  # 模态级别更高，保证不会被其他窗口挡住（不影响关闭）
+_MB_SYSTEMMODAL = 0x1000
 
 _IDOK = 1
 _IDYES = 6
 _IDNO = 7
+
+SPI_GETWORKAREA = 0x0030
+
+# ---------------------------------------------------------------------------
+# user32 / kernel32 DLL 句柄 + 所有用到函数的 argtypes/restype 显式声明
+# ---------------------------------------------------------------------------
+# 为什么必须显式声明：
+# ctypes 默认会"猜"参数的 C 类型（int 默认成 32 位 c_int），
+# 在 64 位 Windows 上会截断指针大小的整数（HWND、WPARAM、LPARAM 等），
+# 从而抛出 OverflowError。显式声明是 ctypes 调用 Win32 API 的唯一可靠方式。
+_user32 = ctypes.WinDLL("user32", use_last_error=True)
+_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+# --- SetWindowsHookExW ---
+_user32.SetWindowsHookExW.restype = _HHOOK_T
+# 参数: (int idHook, HOOKPROC lpfn, HINSTANCE hMod, DWORD dwThreadId)
+# HOOKPROC 的回调签名在下面 _HOOKPROC 处声明
+_user32.SetWindowsHookExW.argtypes = (ctypes.c_int, ctypes.c_void_p, _HINSTANCE_T, _DWORD_T)
+
+# --- UnhookWindowsHookEx ---
+_user32.UnhookWindowsHookEx.restype = _BOOL_T
+_user32.UnhookWindowsHookEx.argtypes = (_HHOOK_T,)
+
+# --- CallNextHookEx ---
+_user32.CallNextHookEx.restype = _LRESULT_T
+# 参数: (HHOOK hhk, int nCode, WPARAM wParam, LPARAM lParam)
+_user32.CallNextHookEx.argtypes = (_HHOOK_T, ctypes.c_int, _WPARAM_T, _LPARAM_T)
+
+# --- GetCurrentThreadId (kernel32) ---
+_kernel32.GetCurrentThreadId.restype = _DWORD_T
+_kernel32.GetCurrentThreadId.argtypes = ()
+
+# --- GetWindowRect ---
+_user32.GetWindowRect.restype = _BOOL_T
+_user32.GetWindowRect.argtypes = (_HWND_T, _LPRECT_T)
+
+# --- SetWindowPos ---
+_user32.SetWindowPos.restype = _BOOL_T
+# 参数: (HWND hWnd, HWND hWndInsertAfter, int X, int Y, int cx, int cy, UINT uFlags)
+_user32.SetWindowPos.argtypes = (_HWND_T, _HWND_T, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, _UINT_T)
+
+# --- SystemParametersInfoW ---
+_user32.SystemParametersInfoW.restype = _BOOL_T
+_user32.SystemParametersInfoW.argtypes = (_UINT_T, _UINT_T, _LPVOID_T, _UINT_T)
+
+# --- MessageBoxW ---
+_user32.MessageBoxW.restype = ctypes.c_int
+_user32.MessageBoxW.argtypes = (_HWND_T, _LPCWSTR_T, _LPCWSTR_T, _UINT_T)
+
+# --- GetSystemMetrics ---
+_user32.GetSystemMetrics.restype = ctypes.c_int
+_user32.GetSystemMetrics.argtypes = (ctypes.c_int,)
+
+# ---------------------------------------------------------------------------
+# WH_CBT HOOKPROC 回调签名（显式平台安全类型）
+# ---------------------------------------------------------------------------
+# 返回值 LRESULT = c_ssize_t（指针大小的有符号整数）
+# 参数 nCode = int（WH_CBT 操作码，本身是小整数，不用扩宽）
+# wParam = WPARAM = c_size_t（无符号指针大小，64 位上是 8 字节，不会溢出）
+# lParam = LPARAM = c_ssize_t（有符号指针大小，64 位上是 8 字节，不会溢出）
+_HOOKPROC = ctypes.WINFUNCTYPE(
+    _LRESULT_T,   # LRESULT 返回值
+    ctypes.c_int, # nCode
+    _WPARAM_T,    # WPARAM wParam
+    _LPARAM_T,    # LPARAM lParam
+)
 
 # ---------------------------------------------------------------------------
 # 全局 icon 引用（由 tray_app.run_tray() 初始化）
@@ -73,13 +178,7 @@ def get_icon() -> Any:
 #
 # 钩子必须装在"显示 MessageBoxW 的那根线程"上（我们调度到 GUI 线程，就装在 GUI 线程），
 # HHOOK 是线程相关的，装钩子的线程和被拦截的线程必须是同一根，这里刚好匹配。
-_HOOKPROC = ctypes.WINFUNCTYPE(
-    ctypes.c_int,      # 返回值 LRESULT
-    ctypes.c_int,      # nCode
-    wintypes.WPARAM,   # wParam（HCBT_ACTIVATE 时是 HWND）
-    wintypes.LPARAM,   # lParam
-)
-_position_hook_handle: Any = None
+_position_hook_handle: _HHOOK_T | None = None
 _position_hook_lock = threading.Lock()
 
 
@@ -95,20 +194,20 @@ def _get_primary_screen_bottom_right(width_px: int, height_px: int) -> tuple[int
       使用 SPI_GETWORKAREA 时已经排除了任务栏，所以 margin 可以更小，
       但为了保持和 SettingsView 的视觉位置一致，这里还是用 16/56。
     """
-    class RECT(ctypes.Structure):
-        _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
-                    ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
-    SPI_GETWORKAREA = 0x0030
-    work = RECT()
+    work = _RECT()
     try:
-        ctypes.windll.user32.SystemParametersInfoW(SPI_GETWORKAREA, ctypes.sizeof(work), ctypes.byref(work), 0)
+        # uiParam = sizeof(RECT)，fWinIni = 0（不需要更新用户配置）
+        _user32.SystemParametersInfoW(
+            SPI_GETWORKAREA, ctypes.sizeof(_RECT), ctypes.byref(work), 0,
+        )
         area_w = work.right - work.left
         area_h = work.bottom - work.top
     except Exception:
         # 兜底：按主屏分辨率（不排除任务栏）
-        area_w = ctypes.windll.user32.GetSystemMetrics(0)   # SM_CXSCREEN
-        area_h = ctypes.windll.user32.GetSystemMetrics(1)   # SM_CYSCREEN
-        work = RECT()
+        SM_CXSCREEN = 0
+        SM_CYSCREEN = 1
+        area_w = _user32.GetSystemMetrics(SM_CXSCREEN)
+        area_h = _user32.GetSystemMetrics(SM_CYSCREEN)
         work.left = 0
         work.top = 0
         work.right = area_w
@@ -123,64 +222,85 @@ def _get_primary_screen_bottom_right(width_px: int, height_px: int) -> tuple[int
 
 
 def _cbt_position_proc(nCode: int, wParam: int, lParam: int) -> int:
-    """WH_CBT 钩子回调：在弹框激活时把它移到屏幕右下角（任务栏旁）。"""
-    global _position_hook_handle
+    """WH_CBT 钩子回调：在弹框激活时把它移到屏幕右下角（任务栏旁）。
+
+    为什么最外层再包 try/except：
+      Win32 钩子回调一旦抛出异常，会直接导致系统消息分发链路中断，
+      轻则当前 MessageBoxW 卡死，重则整个桌面 GUI 冻结。
+      我们必须保证"无论任何异常都不向系统层抛出"，最坏情况
+      只是弹框位置不移动，但仍能正常点击关闭。
+    """
+    # 先给默认返回值：CallNextHookEx 的返回（系统希望我们转发给下一个钩子）
+    default_ret: int = 0
     try:
+        # 先计算默认转发值（钩子链必须继续走，即使我们逻辑出错）
+        try:
+            hhk = _position_hook_handle or _HHOOK_T(0)
+            default_ret = int(_user32.CallNextHookEx(hhk, nCode, _WPARAM_T(wParam), _LPARAM_T(lParam)))
+        except Exception as cne:
+            logger.debug("dialogs._cbt_position_proc: CallNextHookEx 转发异常（忽略，但弹框可能不接收后续消息）: %s", cne)
+            default_ret = 0
+
         if nCode == _HCBT_ACTIVATE and wParam:
-            hwnd = wParam
-            # 取当前窗口尺寸（使用 Client 会漏掉标题栏，用 GetWindowRect 取完整外框）
-            class RECT(ctypes.Structure):
-                _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
-                            ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
-            rc = RECT()
-            ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rc))
-            w = rc.right - rc.left
-            h = rc.bottom - rc.top
-            if w and h:
-                x, y = _get_primary_screen_bottom_right(w, h)
-                # SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE（保持尺寸/层级/不让自己抢激活态——HCBT 还在激活流程中，避免重入）
-                SWP_NOSIZE = 0x0001
-                SWP_NOZORDER = 0x0004
-                SWP_NOACTIVATE = 0x0010
-                ctypes.windll.user32.SetWindowPos(
-                    hwnd, 0, x, y, 0, 0,
-                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
-                )
-                logger.debug("dialogs._cbt_position_proc: 弹框定位(右下) hwnd=%s size=%dx%d pos=(%d,%d)", hwnd, w, h, x, y)
+            hwnd = _HWND_T(wParam)
+            rc = _RECT()
+            ok = _user32.GetWindowRect(hwnd, ctypes.byref(rc))
+            if ok:
+                w = rc.right - rc.left
+                h = rc.bottom - rc.top
+                if w and h:
+                    x, y = _get_primary_screen_bottom_right(w, h)
+                    # SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+                    # （保持尺寸/层级/不在 HCBT 激活流程中重新抢激活态，避免重入）
+                    SWP_NOSIZE = 0x0001
+                    SWP_NOZORDER = 0x0004
+                    SWP_NOACTIVATE = 0x0010
+                    flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE
+                    _user32.SetWindowPos(hwnd, _HWND_T(0), int(x), int(y), 0, 0, _UINT_T(flags))
+                    logger.debug("dialogs._cbt_position_proc: 弹框定位(右下) hwnd=%s size=%dx%d pos=(%d,%d)", wParam, w, h, x, y)
     except Exception as e:
-        logger.debug("dialogs._cbt_position_proc: 钩子回调异常（不影响弹框显示）: %s", e)
-    # 钩子正常返回：CallNextHookEx
-    return ctypes.windll.user32.CallNextHookEx(_position_hook_handle, nCode, wParam, lParam)
+        # 最外层兜底：任何异常都吞掉，弹框位置失败没关系，不能把异常抛到系统层
+        logger.debug("dialogs._cbt_position_proc: 钩子回调异常（已吞，不影响弹框显示和关闭）: %s", e)
+    return default_ret
 
 
-_cbt_position_proc_ref = _HOOKPROC(_cbt_position_proc)  # 保存引用防止 GC 回收
+_cbt_position_proc_ref = _HOOKPROC(_cbt_position_proc)  # 保存引用防止 GC 回收钩子回调
 
 
 def _install_position_hook() -> None:
     """在当前线程安装 WH_CBT 钩子（仅用于将弹框放到右下角）。"""
     global _position_hook_handle
     with _position_hook_lock:
-        if _position_hook_handle is None:
-            kernel32 = ctypes.windll.kernel32
-            kernel32.GetCurrentThreadId.restype = wintypes.DWORD
-            tid = kernel32.GetCurrentThreadId()
-            user32 = ctypes.windll.user32
-            user32.SetWindowsHookExW.restype = wintypes.HHOOK
-            user32.SetWindowsHookExW.argtypes = (ctypes.c_int, _HOOKPROC, wintypes.HINSTANCE, wintypes.DWORD)
-            _position_hook_handle = user32.SetWindowsHookExW(
-                _WH_CBT, _cbt_position_proc_ref, 0, tid,
+        if _position_hook_handle is None or _position_hook_handle.value == 0:
+            tid = _kernel32.GetCurrentThreadId()
+            # SetWindowsHookExW 的 argtypes[1] 是 c_void_p，把回调转成 c_void_p 传给它
+            lpfn = ctypes.cast(_cbt_position_proc_ref, ctypes.c_void_p)
+            handle = _user32.SetWindowsHookExW(
+                _WH_CBT, lpfn.value, _HINSTANCE_T(0), tid,
             )
-            logger.debug("dialogs._install_position_hook: 已安装 WH_CBT 钩子 handle=%s tid=%d", _position_hook_handle, tid)
+            if handle and handle.value != 0:
+                _position_hook_handle = handle
+                logger.debug("dialogs._install_position_hook: 已安装 WH_CBT 钩子 handle=%s tid=%d", handle.value, tid)
+            else:
+                last_err = ctypes.get_last_error()
+                logger.warning("dialogs._install_position_hook: SetWindowsHookExW 失败，last_error=%s（弹框将保留默认位置，不影响使用）", last_err)
+                _position_hook_handle = None
 
 
 def _uninstall_position_hook() -> None:
     """卸载 WH_CBT 钩子（弹框关闭后立即卸载，避免影响其他普通窗口）。"""
     global _position_hook_handle
     with _position_hook_lock:
-        if _position_hook_handle is not None:
+        if _position_hook_handle is not None and _position_hook_handle.value != 0:
             try:
-                ctypes.windll.user32.UnhookWindowsHookEx(_position_hook_handle)
-                logger.debug("dialogs._uninstall_position_hook: 已卸载 WH_CBT 钩子 handle=%s", _position_hook_handle)
+                ok = _user32.UnhookWindowsHookEx(_position_hook_handle)
+                if not ok:
+                    last_err = ctypes.get_last_error()
+                    logger.debug("dialogs._uninstall_position_hook: UnhookWindowsHookEx 非致命失败 last_error=%s", last_err)
+                else:
+                    logger.debug("dialogs._uninstall_position_hook: 已卸载 WH_CBT 钩子 handle=%s", _position_hook_handle.value)
+            except Exception as e:
+                logger.debug("dialogs._uninstall_position_hook: 卸载钩子异常（忽略）: %s", e)
             finally:
                 _position_hook_handle = None
 
@@ -203,12 +323,12 @@ def _msgbox_on_gui_thread(message: str, title: str, flags: int) -> int:
         # 为什么不用 Tk 根窗口的 hwnd：Tk 根窗口是隐藏的，作为 MessageBoxW 所有者
         # 在某些 Windows 版本上会让弹框也不可见或 z-order 异常。0 = 桌面窗口，最稳妥。
         try:
-            ret = ctypes.windll.user32.MessageBoxW(0, message, title, flags)
+            ret = int(_user32.MessageBoxW(_HWND_T(0), message, title, _UINT_T(flags)))
         except Exception as e:
             logger.warning("dialogs._msgbox_on_gui_thread: MessageBoxW 异常: %s", e)
             ret = 0
         logger.debug("dialogs._msgbox_on_gui_thread: MessageBoxW 返回值=%d", ret)
-        return int(ret or 0)
+        return ret or 0
     finally:
         _uninstall_position_hook()
 
