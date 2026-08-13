@@ -39,7 +39,7 @@ sau bilibili --help
 Windows 下推荐先指定镜像，再安装 Chromium：
 
 ```powershell
-$env:PLAYWRIGHT_DOWNLOAD_HOST="https://npmmirror.com/mirrors/playwright"; patchright install chromium
+$env:PLAYWRIGHT_DOWNLOAD_HOST="https://registry.npmmirror.com/-/binary/playwright"; patchright install chromium
 ```
 
 ## 抖音 CLI 子命令

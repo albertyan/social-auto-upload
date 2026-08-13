@@ -190,4 +190,4 @@ videoFile
 
 /uploader/bilibili_uploader/qrcode.png
 dist/
-packaging/
+packaging/installer/

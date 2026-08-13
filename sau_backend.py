@@ -14,6 +14,7 @@ from myUtils.auth import check_cookie
 from flask import Flask, request, jsonify, Response, render_template, send_from_directory
 from werkzeug.utils import secure_filename
 from conf import BASE_DIR
+from sau_agent_pkg.db_init import DB_PATH
 from myUtils.login import get_tencent_cookie, douyin_cookie_gen, get_ks_cookie, xiaohongshu_cookie_gen
 from myUtils.postVideo import post_video_tencent, post_video_DouYin, post_video_ks, post_video_xhs
 
@@ -133,7 +134,7 @@ def upload_save():
         # 保存文件
         file.save(filepath)
 
-        with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
+        with sqlite3.connect(str(DB_PATH)) as conn:
             cursor = conn.cursor()
             cursor.execute('''
                                 INSERT INTO file_records (filename, filesize, file_path)
@@ -163,7 +164,7 @@ def upload_save():
 def get_all_files():
     try:
         # 使用 with 自动管理数据库连接
-        with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
+        with sqlite3.connect(str(DB_PATH)) as conn:
             conn.row_factory = sqlite3.Row  # 允许通过列名访问结果
             cursor = conn.cursor()
 
@@ -203,7 +204,7 @@ def get_all_files():
 def getAccounts():
     """快速获取所有账号信息，不进行cookie验证"""
     try:
-        with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
+        with sqlite3.connect(str(DB_PATH)) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute('''
@@ -232,7 +233,14 @@ def getAccounts():
 
 @app.route("/getValidAccounts",methods=['GET'])
 async def getValidAccounts():
-    with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
+    """获取所有账号并验证cookie有效性，带异常保护和有效状态更新。
+    
+    为什么要加 try/except 包裹单账号检查：
+    - 每个平台的 check_cookie 会启动独立浏览器进程，可能因环境问题抛异常
+    - 某一个账号检查失败不能影响其他账号的结果返回，否则前端会看到 N-1 个状态
+    - 异常的账号按"无效（0）"处理，并打印错误信息便于排障
+    """
+    with sqlite3.connect(str(DB_PATH)) as conn:
         cursor = conn.cursor()
         cursor.execute('''
         SELECT * FROM user_info''')
@@ -242,17 +250,34 @@ async def getValidAccounts():
         for row in rows:
             print(row)
         for row in rows_list:
-            flag = await check_cookie(row[1],row[2])
-            if not flag:
+            try:
+                flag = await check_cookie(row[1], row[2])
+            except Exception as e:
+                # 单账号检查异常：打印错误 + 按无效处理，避免整个接口抛 500
+                print(f"⚠️  检查账号 {row[3]} (type={row[1]}) 时异常: {str(e)}")
+                flag = False
+            if flag:
+                # cookie 有效：更新状态为 1，并写库（前端才能显示"正常"）
+                row[4] = 1
+                cursor.execute('''
+                UPDATE user_info 
+                SET status = ? 
+                WHERE id = ?
+                ''', (1, row[0]))
+                conn.commit()
+                print(f"✅ 账号 {row[3]} cookie 有效，状态已更新")
+            else:
+                # cookie 无效：更新状态为 0，并写库
                 row[4] = 0
                 cursor.execute('''
                 UPDATE user_info 
                 SET status = ? 
                 WHERE id = ?
-                ''', (0,row[0]))
+                ''', (0, row[0]))
                 conn.commit()
-                print("✅ 用户状态已更新")
-        for row in rows:
+                print(f"❌ 账号 {row[3]} cookie 无效，状态已更新")
+        print("📋 验证后账号状态：")
+        for row in rows_list:
             print(row)
         return jsonify(
                         {
@@ -274,7 +299,7 @@ def delete_file():
 
     try:
         # 获取数据库连接
-        with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
+        with sqlite3.connect(str(DB_PATH)) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
 
@@ -338,7 +363,7 @@ def delete_account():
 
     try:
         # 获取数据库连接
-        with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
+        with sqlite3.connect(str(DB_PATH)) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
 
@@ -493,7 +518,7 @@ def updateUserinfo():
     userName = data.get('userName')
     try:
         # 获取数据库连接
-        with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
+        with sqlite3.connect(str(DB_PATH)) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
 
@@ -605,7 +630,7 @@ def upload_cookie():
             }), 400
 
         # 从数据库获取账号的文件路径
-        with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
+        with sqlite3.connect(str(DB_PATH)) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.cursor()
             cursor.execute('SELECT filePath FROM user_info WHERE id = ?', (account_id,))

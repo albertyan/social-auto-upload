@@ -8,13 +8,18 @@ SQLite 数据库初始化模块。
 表结构：
 - local_tasks：本地任务记录（断线补发、定时调度持久化）
 - result_queue：结果队列（断线期间暂存 task_result，重连后补发）
+- user_info：账号信息（Web 端登录产生，原 database.db 迁移）
+- file_records：文件上传记录（原 database.db 迁移）
 """
 from __future__ import annotations
 
+import logging
 import sqlite3
 from pathlib import Path
 
 from sau_agent_pkg.config import SAU_HOME
+
+logger = logging.getLogger(__name__)
 
 
 # 数据库路径
@@ -46,6 +51,26 @@ CREATE TABLE IF NOT EXISTS result_queue (
 );
 """
 
+_CREATE_USER_INFO = """
+CREATE TABLE IF NOT EXISTS user_info (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    type INTEGER NOT NULL,
+    filePath TEXT NOT NULL,
+    userName TEXT NOT NULL,
+    status INTEGER DEFAULT 0
+);
+"""
+
+_CREATE_FILE_RECORDS = """
+CREATE TABLE IF NOT EXISTS file_records (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    filename TEXT NOT NULL,
+    filesize REAL,
+    upload_time DATETIME DEFAULT CURRENT_TIMESTAMP,
+    file_path TEXT
+);
+"""
+
 # 索引：按状态查询任务、按 task_id 查询结果
 _CREATE_INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_local_tasks_status ON local_tasks(status);
@@ -61,8 +86,12 @@ def init_db() -> Path:
     Returns:
         数据库文件路径。
     """
+    existed_before = DB_PATH.exists()
     # 确保目录存在
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    # info 记路径+新建/已存在：启动时确认 DB 文件位置，首次运行 vs 重启场景从日志一眼区分
+    logger.info("init_db: db_path=%s existed_before=%s", DB_PATH, existed_before)
 
     # 连接并建表
     conn = sqlite3.connect(str(DB_PATH))
@@ -70,8 +99,12 @@ def init_db() -> Path:
         cursor = conn.cursor()
         cursor.execute(_CREATE_LOCAL_TASKS)
         cursor.execute(_CREATE_RESULT_QUEUE)
+        cursor.execute(_CREATE_USER_INFO)
+        cursor.execute(_CREATE_FILE_RECORDS)
         cursor.executescript(_CREATE_INDEXES)
         conn.commit()
+        # 创建表成功：确认 DDL 没报错，不会出现"表不存在"的运行时错误
+        logger.info("init_db: tables/indexes created/applied successfully")
     finally:
         conn.close()
 
@@ -85,7 +118,12 @@ def get_connection() -> sqlite3.Connection:
     """
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(DB_PATH), timeout=10)
-    conn.execute("PRAGMA journal_mode=WAL")
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError as e:
+        # WAL 设置失败 warning：并发写入性能会退化，
+        # 但 DB 还能用（默认 DELETE 模式），打 warning 提醒后续优化权限/磁盘
+        logger.warning("get_connection: failed to set WAL mode, error=%s", e)
     conn.row_factory = sqlite3.Row
     return conn
 

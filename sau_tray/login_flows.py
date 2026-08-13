@@ -55,7 +55,8 @@ def do_login(platform_key: str, account_name: str = "default") -> None:
         account_name: 账号名（默认 "default"）
     """
     platform_name = _PLATFORM_NAMES.get(platform_key, platform_key)
-    logger.info("Starting login for %s (account: %s)", platform_name, account_name)
+    logger.info("do_login 入口: platform=%s (%s), account=%s",  # 为什么打这条日志：记录登录流程入口，确认平台和账号
+                platform_key, platform_name, account_name)
 
     # B 站特殊处理
     if platform_key == "bilibili":
@@ -79,7 +80,8 @@ def _login_generic(platform_key: str, account_name: str) -> None:
         )
 
     platform_name = _PLATFORM_NAMES.get(platform_key, platform_key)
-    logger.info("Launching headed browser for %s login...", platform_name)
+    logger.info("_login_generic: 启动 Playwright 有头浏览器用于 %s 登录（浏览器启动/关闭由 upstream login_fn 内部处理）",  # 为什么打这条日志：确认 Playwright 启动节点（内部细节由 upstream 封装）
+                platform_name)
 
     # 登录函数是 async 的，需要 asyncio.run
     try:
@@ -87,14 +89,31 @@ def _login_generic(platform_key: str, account_name: str) -> None:
         asyncio.set_event_loop(loop)
         try:
             # 大多数 login_* 函数签名：login_xxx_account(account_name, headless=False, ...)
+            logger.info("_login_generic: 执行 upstream %s login_fn (headless=False，会弹出浏览器引导用户登录/扫码)", platform_name)  # 为什么打这条日志：标记扫码/交互登录阶段起点
             result = loop.run_until_complete(
                 login_fn(account_name, headless=False)
             )
-            logger.info("Login completed for %s: %s", platform_name, result)
+            # 记录 cookie 写入（登录成功后 cookie 会保存到 SAU_HOME/cookies/）
+            try:
+                from sau_tray.home_shim import SAU_HOME
+                cookie_dir = SAU_HOME / "cookies"
+                cookie_files = list(cookie_dir.glob(f"*{platform_key}*")) if cookie_dir.exists() else []
+                if cookie_files:
+                    latest = max(cookie_files, key=lambda p: p.stat().st_mtime)
+                    logger.info("cookie 写入: 平台=%s, cookie 文件路径=%s",  # 为什么打这条日志：记录登录成功后 cookie 落盘位置（排障登录态丢失）
+                                platform_name, latest)
+                else:
+                    logger.info("cookie 写入: 平台=%s（未扫描到 cookie 文件，可能由上游默认路径保存）", platform_name)  # 为什么打这条日志：未找到 cookie 文件时的记录，方便排查路径问题
+            except Exception as ce:
+                logger.info("cookie 写入记录异常（不影响登录结果）: %s", ce)
+
+            logger.info("登录成功: platform=%s (%s), result=%s", platform_key, platform_name, result)  # 为什么打这条日志：info 级确认登录成功
         finally:
             loop.close()
+            logger.info("_login_generic: Playwright 会话关闭，asyncio loop 已关闭")  # 为什么打这条日志：确认 Playwright 关闭和资源清理
     except Exception as e:
-        logger.exception("Login failed for %s", platform_name)
+        logger.error("登录失败: platform=%s (%s), error_type=%s: %s",  # 为什么打这条日志：error 级记录登录失败（平台+异常类型+信息）
+                     platform_key, platform_name, type(e).__name__, e)
         raise RuntimeError(f"{platform_name} 登录失败: {e}") from e
 
 
@@ -108,7 +127,7 @@ def _login_bilibili_with_qr(account_name: str) -> None:
     if login_fn is None:
         raise RuntimeError("B 站登录功能不可用")
 
-    logger.info("Launching Bilibili QR code login...")
+    logger.info("_login_bilibili_with_qr: 启动 Playwright 浏览器（二维码扫码阶段）")  # 为什么打这条日志：标记 B 站特殊扫码登录启动
 
     try:
         loop = asyncio.new_event_loop()
@@ -118,16 +137,28 @@ def _login_bilibili_with_qr(account_name: str) -> None:
             print("\n" + "=" * 50)
             print("  B 站登录 — 请在浏览器中扫描二维码")
             print("=" * 50 + "\n")
-
+            logger.info("扫码阶段: B 站二维码登录等待用户扫码")  # 为什么打这条日志：标记扫码交互阶段
             result = loop.run_until_complete(
                 login_fn(account_name, headless=False)
             )
-            logger.info("Bilibili login completed: %s", result)
+            # 记录 cookie 写入
+            try:
+                from sau_tray.home_shim import SAU_HOME
+                cookie_dir = SAU_HOME / "cookies"
+                cookie_files = list(cookie_dir.glob("*bilibili*")) if cookie_dir.exists() else []
+                if cookie_files:
+                    latest = max(cookie_files, key=lambda p: p.stat().st_mtime)
+                    logger.info("cookie 写入: 平台=B 站, cookie 文件路径=%s", latest)  # 为什么打这条日志：记录 B 站 cookie 落盘
+            except Exception as ce:
+                logger.info("cookie 写入记录异常（不影响登录结果）: %s", ce)
+
+            logger.info("Bilibili 登录成功: result=%s", result)  # 为什么打这条日志：确认 B 站登录成功
             print("\n  B 站登录成功！\n")
         finally:
             loop.close()
+            logger.info("_login_bilibili_with_qr: Playwright 会话关闭，asyncio loop 已关闭")  # 为什么打这条日志：确认 Playwright 关闭
     except Exception as e:
-        logger.exception("Bilibili login failed")
+        logger.error("Bilibili 登录失败: error_type=%s: %s", type(e).__name__, e)  # 为什么打这条日志：error 级记录 B 站登录失败
         raise RuntimeError(f"B 站登录失败: {e}") from e
 
 

@@ -8,10 +8,13 @@ sau_tray.views.settings_view
 """
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable
 
 from sau_tray.core import gui_thread
 from sau_tray.views.base import BaseView
+
+logger = logging.getLogger(__name__)
 
 
 class SettingsView(BaseView):
@@ -33,6 +36,7 @@ class SettingsView(BaseView):
         on_save_config: Callable,
     ):
         super().__init__()
+        logger.info("SettingsView 初始化完成")  # 为什么打这条日志：追踪 SettingsView 生命周期
         self._on_test_connection = on_test_connection
         self._on_save_config = on_save_config
         # tkinter 变量（在 _create 中初始化）
@@ -42,6 +46,16 @@ class SettingsView(BaseView):
         self._token_entry = None
         self._show_token_btn = None
         self._copy_btn = None
+
+    def show(self) -> None:
+        """显示设置窗口。"""
+        logger.info("SettingsView.show: 打开设置窗口")  # 为什么打这条日志：追踪设置窗口打开时机
+        super().show()
+
+    def close(self) -> None:
+        """关闭设置窗口。"""
+        logger.info("SettingsView.close: 关闭设置窗口")  # 为什么打这条日志：追踪设置窗口关闭时机
+        super().close()
 
     # ------------------------------------------------------------------
     # 公开 API（供 Controller 调用）
@@ -58,6 +72,7 @@ class SettingsView(BaseView):
     # ------------------------------------------------------------------
     def _create(self, root: Any) -> None:
         """在 GUI 线程中创建设置窗口（由 gui_thread.schedule 调度）。"""
+        logger.info("SettingsView._create: GUI 线程开始创建设置窗口")  # 为什么打这条日志：确认 _create 在 GUI 线程中被调用
         import tkinter as tk
         from tkinter import messagebox
         from sau_agent_pkg.config import load_config
@@ -74,9 +89,16 @@ class SettingsView(BaseView):
 
         # ── 数据准备 ──
         machine_code = machine_id.get_machine_code()
+        logger.info("SettingsView._create: 显示机器码（前 8 位）: %s", str(machine_code)[:8])  # 为什么打这条日志：记录机器码显示前缀，帮助核对 Agent 创建时填入的机器码是否匹配
         cfg = load_config()
         current_server_url = cfg.get("server_url", "")
-        current_token = cfg.get("token", "")
+        # 优先从 credential.bin 读取（明文可信度最高），其次回退到 config.json
+        # 为什么双路：config.json 里保存的 token 可能是占位符 "******"（不回显明文）
+        try:
+            from sau_agent_pkg.config import load_token
+            current_token = load_token() or cfg.get("token", "") or ""
+        except Exception:
+            current_token = cfg.get("token", "") or ""
 
         # ── 构建对话框 ──
         win = tk.Toplevel(root)
@@ -209,6 +231,7 @@ class SettingsView(BaseView):
     # ------------------------------------------------------------------
     def _on_close(self) -> None:
         """窗口关闭回调。"""
+        logger.info("SettingsView._on_close: 用户点击取消/关闭按钮")  # 为什么打这条日志：追踪设置窗口取消/关闭操作
         if self._window is not None:
             try:
                 if self._window.winfo_exists():
@@ -219,6 +242,7 @@ class SettingsView(BaseView):
 
     def _copy_machine_code(self, win: Any, machine_code: str) -> None:
         """复制机器码到剪贴板。"""
+        logger.info("SettingsView._copy_machine_code: 用户点击复制机器码（前 8 位）: %s", str(machine_code)[:8])  # 为什么打这条日志：追踪机器码复制操作
         win.clipboard_clear()
         win.clipboard_append(machine_code)
         self._copy_btn.config(text="已复制!", state="disabled")
@@ -227,9 +251,11 @@ class SettingsView(BaseView):
     def _toggle_token_visibility(self) -> None:
         """切换 Token 显示/隐藏。"""
         if self._token_entry.cget("show") == "*":
+            logger.info("SettingsView: 用户切换 Token 为显示状态")  # 为什么打这条日志：记录 Token 显示操作（安全审计点）
             self._token_entry.config(show="")
             self._show_token_btn.config(text="隐藏")
         else:
+            logger.info("SettingsView: 用户切换 Token 为隐藏状态")  # 为什么打这条日志：记录 Token 隐藏操作
             self._token_entry.config(show="*")
             self._show_token_btn.config(text="显示")
 
@@ -239,15 +265,19 @@ class SettingsView(BaseView):
         token = self._token_var.get().strip()
 
         if not server_url:
+            logger.warning("SettingsView 测试连接: 输入校验失败，服务器地址为空")  # 为什么打这条日志：记录用户输入校验失败
             self._status_var.set("请先填写服务器地址")
             return
         if not token:
+            logger.warning("SettingsView 测试连接: 输入校验失败，Token 为空")  # 为什么打这条日志：记录用户输入校验失败
             self._status_var.set("请先填写 Token")
             return
         if not (server_url.startswith("ws://") or server_url.startswith("wss://")):
+            logger.warning("SettingsView 测试连接: 输入校验失败，地址非 ws(s):// 开头: %s", server_url)  # 为什么打这条日志：记录地址格式校验失败
             self._status_var.set("地址应以 ws:// 或 wss:// 开头")
             return
 
+        logger.info("SettingsView: 提交测试连接请求，server_url=%s, token_len=%d", server_url, len(token))  # 为什么打这条日志：记录测试连接提交（token 仅记长度）
         self._status_var.set("正在测试连接...")
         self._on_test_connection(server_url, token, self.set_status)
 
@@ -255,14 +285,17 @@ class SettingsView(BaseView):
         """保存按钮点击（在 GUI 线程中执行格式校验）。"""
         from tkinter import messagebox
 
+        logger.info("SettingsView._on_save_clicked: 用户点击保存按钮")  # 为什么打这条日志：追踪保存按钮点击
         new_url = self._url_var.get().strip()
         new_token = self._token_var.get().strip()
 
         if new_url and not (new_url.startswith("ws://") or new_url.startswith("wss://")):
+            logger.warning("SettingsView 保存: 输入校验失败，地址非 ws(s):// 开头: %s", new_url)  # 为什么打这条日志：记录保存时格式校验失败
             messagebox.showwarning(
                 "格式错误", "服务器地址应以 ws:// 或 wss:// 开头",
                 parent=self._window,
             )
             return
 
+        logger.info("SettingsView: 提交保存配置，server_url=%s, token_len=%d", new_url, len(new_token))  # 为什么打这条日志：记录保存提交参数（token 仅记长度）
         self._on_save_config(new_url, new_token)

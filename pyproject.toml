@@ -11,11 +11,17 @@ readme = "README.md"
 requires-python = ">=3.10,<3.13"
 dependencies = [
   "loguru==0.7.3",
+  "nuitka>=4.1.3",
   "opencv-python>=4.13.0.92",
+  "ordered-set>=4.1.0",
   "patchright==1.58.2",
+  "pillow>=12.3.0",
+  "pystray>=0.19.5",
+  "pywin32>=312",
   "qrcode==8.2",
   "requests==2.32.3",
   "segno>=1.6.6",
+  "zstandard>=0.25.0",
 ]
 
 [project.scripts]
@@ -31,17 +37,28 @@ agent = [
   "websockets>=12.0",
   "aiohttp>=3.9",
 ]
+tray = [
+  "pystray>=0.19.5",
+  "Pillow>=12.0",
+  "pywin32>=311; platform_system == 'Windows'",
+]
+build = [
+  "nuitka>=4.0",
+  "ordered-set>=4.1",
+  "zstandard>=0.22",
+]
 
 [tool.uv]
 package = true
 
 [tool.setuptools]
-py-modules = ["cli_main", "conf", "sau_cli", "sau_agent"]
+py-modules = ["cli_main", "conf", "sau_cli", "sau_agent", "sau_backend", "sau_ops"]
 include-package-data = true
 
 [tool.setuptools.packages.find]
 # sau_agent_pkg 为 sau_agent.py 的版本号事实源，需一并打包
-include = ["uploader*", "utils*", "myUtils*", "sau_agent_pkg*"]
+# sau_tray / sau_service 是新入口，也要打包
+include = ["uploader*", "utils*", "myUtils*", "sau_agent_pkg*", "sau_tray*", "sau_service*"]
 
 [tool.setuptools.package-data]
 utils = ["stealth.min.js"]

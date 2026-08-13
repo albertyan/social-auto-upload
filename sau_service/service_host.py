@@ -42,9 +42,25 @@ def _crash_log_write(msg: str) -> None:
 def _global_except_hook(exc_type, exc_value, exc_tb):
     """全局未捕获异常钩子 → 写崩溃日志后调用默认处理器。"""
     import traceback
+    # 计算崩溃日志路径（保留已写崩溃文件路径的记录）
+    _crash_path = None
+    try:
+        _exe = sys.executable if sys.executable.lower().endswith(".exe") else None
+        if _exe:
+            _crash_path = Path(_exe).resolve().parent / "sau-service-crash.log"
+        else:
+            _crash_path = Path(os.environ.get("TEMP", ".")) / "sau-service-crash.log"
+    except Exception:
+        pass
     _crash_log_write("=== UNCAUGHT EXCEPTION (module-level) ===")
     for line in traceback.format_exception(exc_type, exc_value, exc_tb):
         _crash_log_write(line.rstrip())
+    # 为什么：崩溃文件路径需要同时进入 logger（如果日志系统可用），方便排障人员直接去对应文件
+    try:
+        logger.error("Uncaught module-level exception — crash written to: %s", _crash_path,
+                     exc_info=(exc_type, exc_value, exc_tb))
+    except Exception:
+        pass
     # 同时输出到 stderr（开发环境可见）
     traceback.print_exception(exc_type, exc_value, exc_tb)
 
@@ -170,7 +186,10 @@ if _HAS_PYWIN32:
         def SvcDoRun(self) -> None:
             """服务启动入口：初始化日志 → 启动 asyncio 主循环。"""
             _setup_logging()
-            logger.info("SAUAgentService starting (SAU_HOME=%s)", SAU_HOME)
+            from sau_agent_pkg.version import APP_VERSION
+            # 为什么：服务启动第一条日志，确认"是哪个服务实例/版本/在哪跑"，服务排障第一入口
+            logger.info("SvcDoRun start: service=%s display=%s version=%s SAU_HOME=%s",
+                        self._svc_name_, self._svc_display_name_, APP_VERSION, SAU_HOME)
 
             try:
                 servicemanager.LogMsg(
@@ -188,17 +207,19 @@ if _HAS_PYWIN32:
             try:
                 db_path = init_db()
                 logger.info("Database initialized at: %s", db_path)
-            except Exception:
-                logger.exception("Database initialization failed")
+            except Exception as e:  # 为什么：DB 失败后续读写全部会挂，明确 error + 根因
+                logger.error("init_db failed in SvcDoRun: %s", e, exc_info=True)
 
             # 生成 local_token（供托盘进程读取）
             from sau_agent_pkg.config import generate_local_token
             try:
                 token = generate_local_token()
-                logger.info("Local token generated")
-            except Exception:
-                logger.exception("Failed to generate local token")
+                logger.info("Local token generated: length=%d", len(token) if token else 0)
+            except Exception as e:  # 为什么：token 生成失败托盘无法连本地 API，需明确 error
+                logger.error("generate_local_token failed in SvcDoRun: %s", e, exc_info=True)
 
+            # 为什么：_main 启动是 asyncio 生命周期起点，与退出日志配对可计算服务 uptime
+            logger.info("About to enter _main asyncio loop (asyncio.run)")
             # 运行 asyncio 主循环
             try:
                 asyncio.run(self._main(self._stop_event))
@@ -217,12 +238,15 @@ if _HAS_PYWIN32:
             from sau_agent_pkg.local_api import LocalApiServer
             from sau_agent_pkg import updater
 
+            # 为什么：_main 进入日志，可计算 asyncio 初始化耗时
+            logger.info("_main entered: loading config and constructing core objects")
             config = load_config()
             agent = SauAgentCore(config=config)
             api = LocalApiServer(core=agent)
 
             # 半自动更新接线（M5）：upgrade_notice → 下载/校验/状态
             agent.on_upgrade_notice = updater.handle_upgrade_notice
+            logger.info("Upgrade notice callback wired (agent.on_upgrade_notice → updater.handle_upgrade_notice)")
             try:
                 updater.cleanup_expired()
             except Exception:
@@ -233,6 +257,8 @@ if _HAS_PYWIN32:
 
             # 监听 threading.Event → asyncio.Event 的桥接
             def _on_thread_stop() -> None:
+                # 为什么：SvcStop 置位 stop_event → watch_thread 唤醒 → 此处触发 async_stop，记录 stop 推进到 asyncio 侧的节点
+                logger.info("watch_thread: threading.Event fired, async_stop will be set (service stop propagation)")
                 async_stop.set()
 
             # 启动监听线程
@@ -241,6 +267,9 @@ if _HAS_PYWIN32:
                 daemon=True,
             )
             watch_thread.start()
+            # 为什么：确认 watch_thread 已就绪（未启动 stop 会丢失），同时输出线程标识方便死锁排查
+            logger.info("watch_thread started (daemon=%s, ident=%s) to bridge SvcStop → async_stop",
+                        watch_thread.daemon, watch_thread.ident)
 
             logger.info("Starting agent core and local API server")
             try:
@@ -249,15 +278,24 @@ if _HAS_PYWIN32:
                     api.run(stop_event=async_stop),
                 )
             except asyncio.CancelledError:
-                logger.info("Service main tasks cancelled")
+                # 为什么：CancelledError 是正常 stop 路径，info 级别让用户知道是"被 cancel"而非异常退出
+                logger.info("Service main tasks cancelled (gather CancelledError, expected during stop)")
+            except Exception as e:
+                # 为什么：非 CancelledError 的异常都意味着某子任务崩溃，error 带 trace 排障
+                logger.error("_main asyncio.gather failed: %s", e, exc_info=True)
+                raise
             finally:
-                logger.info("SAUAgentService stopped")
+                # 为什么：不管成功/失败，记录 stop_event 是否已被置位，区分"主动 stop"与"异常崩溃"
+                logger.info("SAUAgentService stopped (stop_event.is_set=%s)",
+                            stop_event.is_set() if stop_event else "N/A")
 
         # ------------------------------------------------------------------
         # SvcStop：服务停止
         # ------------------------------------------------------------------
         def SvcStop(self) -> None:
             """服务停止：通知 SCM 正在停止 → 置停止标志 → 等待清理完成。"""
+            # 为什么：SCM 要求服务立即响应，第一条日志确认 SvcStop 确实被回调到了（某些情况下服务会卡死在 SCM 层面）
+            logger.info("SvcStop called by SCM, about to report SERVICE_STOP_PENDING")
             # 报告 SERVICE_STOP_PENDING 并告知 SCM 预计需要 30 秒完成清理
             # 注意：参数名是 waitHint（非 wait_hint），否则控制线程抛 TypeError 被吞掉导致 stop 无效
             self.ReportServiceStatus(
@@ -266,7 +304,11 @@ if _HAS_PYWIN32:
             )
             logger.info("SAUAgentService stop requested")
             if self._stop_event is not None:
+                # 为什么：stop_event 被置位是服务真正"开始关闭"的信号，明确记录避免怀疑 stop 没生效
+                logger.info("stop_event.set() called, watch_thread should wake up soon")
                 self._stop_event.set()
+            else:
+                logger.warning("SvcStop: self._stop_event is None (SvcDoRun may not have completed init)")
 
 else:
     # ---------------------------------------------------------------------------
@@ -292,44 +334,87 @@ else:
 # ---------------------------------------------------------------------------
 def install_service() -> None:
     """安装 SAUAgentService。"""
+    import subprocess
     if not _HAS_PYWIN32:
         raise RuntimeError("pywin32 is required to install the service")
     _exe = str(Path(sys.argv[0]).resolve()) if sys.argv and sys.argv[0].lower().endswith(".exe") else sys.executable
     exe_path = str(Path(_exe).resolve().parent / "sau-service.exe")
-    import subprocess
-    subprocess.check_call([exe_path, "install"])
-    print(f"Service '{SAUAgentService._svc_name_}' installed.")
+    cmd = [exe_path, "install"]
+    # 为什么：记录调用方、命令行，便于复现安装命令并查权限问题
+    logger.info("install_service: executing cmd=%s (exe_path=%s)", cmd, exe_path)
+    try:
+        subprocess.check_call(cmd)
+        # 为什么：子进程无异常即视为安装成功，打印并打 info 配对
+        logger.info("install_service: succeeded via subprocess (exit 0)")
+        print(f"Service '{SAUAgentService._svc_name_}' installed.")
+    except subprocess.CalledProcessError as e:
+        # 为什么：安装失败最常见是权限/UAC，记录退出码让用户快速对应 Windows Installer 错误
+        logger.error("install_service failed: cmd=%s, exitcode=%s", cmd, e.returncode, exc_info=True)
+        raise
+    except Exception as e:
+        logger.error("install_service failed with unexpected error: %s", e, exc_info=True)
+        raise
 
 
 def uninstall_service() -> None:
     """停止并卸载 SAUAgentService。"""
+    import subprocess
     if not _HAS_PYWIN32:
         raise RuntimeError("pywin32 is required to uninstall the service")
     _exe = str(Path(sys.argv[0]).resolve()) if sys.argv and sys.argv[0].lower().endswith(".exe") else sys.executable
     exe_path = str(Path(_exe).resolve().parent / "sau-service.exe")
-    import subprocess
-    subprocess.check_call([exe_path, "remove"])
-    print(f"Service '{SAUAgentService._svc_name_}' uninstalled.")
+    cmd = [exe_path, "remove"]
+    # 为什么：卸载命令需要 SCM 权限，记录命令行便于排障与审计
+    logger.info("uninstall_service: executing cmd=%s (exe_path=%s)", cmd, exe_path)
+    try:
+        subprocess.check_call(cmd)
+        logger.info("uninstall_service: succeeded via subprocess (exit 0)")
+        print(f"Service '{SAUAgentService._svc_name_}' uninstalled.")
+    except subprocess.CalledProcessError as e:
+        logger.error("uninstall_service failed: cmd=%s, exitcode=%s", cmd, e.returncode, exc_info=True)
+        raise
+    except Exception as e:
+        logger.error("uninstall_service failed with unexpected error: %s", e, exc_info=True)
+        raise
 
 
 def start_service() -> None:
     """启动服务（直接调用 win32serviceutil，兼容 Nuitka 编译环境）。"""
     if not _HAS_PYWIN32:
         raise RuntimeError("pywin32 is required")
-    win32serviceutil.StartService(SAUAgentService._svc_name_)
+    # 为什么：启动前打日志，确认"谁发起的 start"（sau-ops 还是托盘），避免多源启动互相干扰
+    logger.info("start_service: calling win32serviceutil.StartService(%s)", SAUAgentService._svc_name_)
+    try:
+        win32serviceutil.StartService(SAUAgentService._svc_name_)
+        logger.info("start_service: SCM accepted start request (service may still be START_PENDING)")
+    except Exception as e:
+        # 为什么：start 失败典型原因 1056/1058/权限不足，记录完整异常
+        logger.error("start_service failed: %s", e, exc_info=True)
+        raise
 
 
 def stop_service() -> None:
     """停止服务（直接调用 win32serviceutil，兼容 Nuitka 编译环境）。"""
     if not _HAS_PYWIN32:
         raise RuntimeError("pywin32 is required")
-    win32serviceutil.StopService(SAUAgentService._svc_name_)
+    # 为什么：stop 通常在升级/卸载前触发，记录时间点可用来校验"升级前服务确实已停"
+    logger.info("stop_service: calling win32serviceutil.StopService(%s)", SAUAgentService._svc_name_)
+    try:
+        win32serviceutil.StopService(SAUAgentService._svc_name_)
+        logger.info("stop_service: SCM accepted stop request (service may still be STOP_PENDING)")
+    except Exception as e:
+        logger.error("stop_service failed: %s", e, exc_info=True)
+        raise
 
 
 def restart_service() -> None:
     """重启服务。"""
+    # 为什么：restart 是 stop+start 组合，拆成两步记录，失败时知道卡在哪步
+    logger.info("restart_service: step 1/2 stop_service")
     stop_service()
+    logger.info("restart_service: step 2/2 start_service")
     start_service()
+    logger.info("restart_service: both steps completed (requests accepted by SCM)")
 
 
 def get_service_status() -> str:
@@ -349,8 +434,14 @@ def get_service_status() -> str:
             win32service.SERVICE_CONTINUE_PENDING: "resuming",
             win32service.SERVICE_STOP_PENDING: "stopping",
         }
-        return status_map.get(status_code, f"unknown({status_code})")
+        status_str = status_map.get(status_code, f"unknown({status_code})")
+        # 为什么：频繁查询服务状态（tray 轮询）时可确认状态是否抖动，info 级别方便留痕
+        logger.info("get_service_status: service=%s status_code=%d → %s",
+                    SAUAgentService._svc_name_, status_code, status_str)
+        return status_str
     except Exception as e:
+        # 为什么：查询失败通常意味着"服务未安装"或"权限不足"，warning 不阻塞调用方但提示排障
+        logger.warning("get_service_status query failed: %s", e)
         return f"not installed ({e})"
 
 
@@ -363,11 +454,17 @@ def _early_log(msg: str) -> None:
         import datetime
         exe_dir = Path(sys.executable if sys.executable.lower().endswith(".exe") else __file__).resolve().parent
         log_file = exe_dir / "sau-service-crash.log"
+        # 为什么：保留崩溃文件路径的记录（全局变量缓存），以便后续 logger 可用时上报
+        global _EARLY_LOG_PATH  # noqa: PLW0603
+        _EARLY_LOG_PATH = str(log_file)
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(f"[{ts}] {msg}\n")
     except Exception:
         pass  # 极端情况：连日志都写不了，放弃
+
+
+_EARLY_LOG_PATH: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -384,13 +481,26 @@ if __name__ == "__main__":
         _early_log(f"SAU_HOME = {SAU_HOME}")
         _early_log(f"python path = {sys.path[:5]}")
 
+        # 为什么：一旦 SAU_HOME 可用就立刻初始化标准 logger，后续流程用 logger 代替 _early_log
+        try:
+            _setup_logging()
+            logger.info("__main__: logger initialized (early_log_path=%s, _LOG_FILE=%s)",
+                        _EARLY_LOG_PATH, _LOG_FILE)
+        except Exception as _e:
+            _early_log(f"__main__: _setup_logging failed: {_e!r}")
+
         if not _HAS_PYWIN32:
             _early_log("ERROR: pywin32 is NOT available!")
+            try:
+                logger.error("__main__: pywin32 is NOT available, cannot run as Windows service")
+            except Exception:
+                pass
             print("pywin32 is not installed. Cannot run as Windows service.")
             sys.exit(1)
 
         # ── 解析命令 ──
         _cmd = sys.argv[1].lower() if len(sys.argv) > 1 else ""
+        logger.info("__main__: parsed command=%s, argv=%s", _cmd or "(empty/SCM dispatcher)", sys.argv[1:])
 
         # ── install: 直接用 win32service API 注册服务（绕过 HandleCommandLine）──
         #    HandleCommandLine("install") 内部调用 LocatePythonServiceExe() 查找
@@ -401,6 +511,8 @@ if __name__ == "__main__":
             # install/uninstall 的 subprocess 调用不受影响。
             _exe_path = f'"{Path(sys.argv[0]).resolve()}"'
             _early_log(f"Direct install: binary={_exe_path}")
+            # 为什么：install 是最容易因权限失败的 SCM 操作，第一行 info 记录 binary path 便于复现
+            logger.info("SCM install branch: binary_path=%s, service=%s", _exe_path, SAUAgentService._svc_name_)
 
             def _apply_service_config(_svc) -> None:
                 """写入启动类型/路径/显示名/描述（新建与 1073 回退更新共用）。"""
@@ -424,6 +536,7 @@ if __name__ == "__main__":
             try:
                 import win32service
                 import winerror
+                logger.info("SCM install: OpenSCManager + CreateService attempting...")
                 scm = win32service.OpenSCManager(None, None, win32service.SC_MANAGER_ALL_ACCESS)
                 try:
                     svc = win32service.CreateService(
@@ -448,6 +561,8 @@ if __name__ == "__main__":
                     # install 幂等回退：服务已存在（1073）时改为更新配置
                     # （对齐 pywin32 HandleCommandLine install→update 行为）
                     _early_log(f"Service already exists (1073), falling back to update: {e}")
+                    # 为什么：幂等特判 1073 是修复安装/重复 install 的关键路径，必须 info 留痕
+                    logger.info("SCM install: idempotent fallback — ERROR_SERVICE_EXISTS (1073) → open+update instead of create")
                     svc = win32service.OpenService(
                         scm, SAUAgentService._svc_name_, win32service.SERVICE_ALL_ACCESS,
                     )
@@ -455,16 +570,23 @@ if __name__ == "__main__":
                 _apply_service_config(svc)
                 win32service.CloseServiceHandle(svc)
                 win32service.CloseServiceHandle(scm)
-                _early_log(f"Service '{SAUAgentService._svc_name_}' {'installed' if _created else 'updated'} successfully")
+                _result = 'installed' if _created else 'updated'
+                _early_log(f"Service '{SAUAgentService._svc_name_}' {_result} successfully")
+                # 为什么：SCM 操作成功，记录最终结果（install vs update）供审计
+                logger.info("SCM install: success — service=%s action=%s", SAUAgentService._svc_name_, _result)
                 print(f"{'Installing' if _created else 'Updating'} service {SAUAgentService._svc_name_}")
                 print(f"Service {'installed' if _created else 'updated'} successfully.")
             except Exception as e:
                 _early_log(f"Direct install failed: {e!r}")
+                # 为什么：install 失败通常是权限/目录问题，error 带 trace 便于定位
+                logger.error("SCM install failed: %s", e, exc_info=True)
                 raise
 
         # ── remove: 直接用 win32service API 删除服务 ──
         elif _cmd == "remove":
             _early_log("Direct remove")
+            # 为什么：remove 是破坏性操作，必须 info 留痕审计
+            logger.info("SCM remove branch: service=%s", SAUAgentService._svc_name_)
             try:
                 import win32service
                 scm = win32service.OpenSCManager(None, None, win32service.SC_MANAGER_ALL_ACCESS)
@@ -476,14 +598,19 @@ if __name__ == "__main__":
                     win32service.DeleteService(svc)
                     win32service.CloseServiceHandle(svc)
                     _early_log(f"Service '{SAUAgentService._svc_name_}' removed")
+                    logger.info("SCM remove: success — service=%s deleted from SCM", SAUAgentService._svc_name_)
                     print(f"Service '{SAUAgentService._svc_name_}' removed.")
                 except win32service.error as e:
                     _early_log(f"Service not found (already removed): {e}")
+                    # 为什么：remove 幂等——服务不存在不算失败，warning 提示即可
+                    logger.warning("SCM remove: service not found (already removed?), winerror=%s — treated as success",
+                                   getattr(e, "winerror", "N/A"))
                     print(f"Service '{SAUAgentService._svc_name_}' not found.")
                 finally:
                     win32service.CloseServiceHandle(scm)
             except Exception as e:
                 _early_log(f"Direct remove failed: {e!r}")
+                logger.error("SCM remove failed: %s", e, exc_info=True)
                 raise
 
         # ── 无参数: SCM 拉起服务进程，直接进入服务控制 dispatcher ──
@@ -491,13 +618,18 @@ if __name__ == "__main__":
         #    不会进入 StartServiceCtrlDispatcher，导致服务启动超时（事件 7009/7000）。
         elif _cmd == "":
             _early_log("Service dispatcher mode (launched by SCM)")
+            # 为什么：SCM 拉起路径最容易出"启动超时"问题，进入 dispatcher 前后打 info 可算耗时
+            logger.info("SCM dispatcher branch (empty cmd): entering StartServiceCtrlDispatcher...")
             try:
                 servicemanager.Initialize()
                 servicemanager.PrepareToHostSingle(SAUAgentService)
                 servicemanager.StartServiceCtrlDispatcher()
                 _early_log("Service dispatcher exited")
+                logger.info("SCM dispatcher: StartServiceCtrlDispatcher returned (service process about to exit)")
             except Exception as e:
                 _early_log(f"Service dispatcher failed: {e!r}")
+                # 为什么：dispatcher 失败服务就起不来，error 带 trace 是排障关键
+                logger.error("SCM dispatcher failed: %s", e, exc_info=True)
                 raise
 
         # ── start/stop/update 等: 使用 HandleCommandLine ──
@@ -506,30 +638,45 @@ if __name__ == "__main__":
         #    必须接收返回值并在非零时 exit(1)，否则失败会被误判为成功。
         else:
             _early_log(f"Running HandleCommandLine with args: {sys.argv[1:]}")
+            # 为什么：HandleCommandLine 负责 start/stop 等，记录命令行便于复现
+            logger.info("HandleCommandLine branch: cmd=%s, args=%s", _cmd, sys.argv[1:])
             try:
                 import winerror
                 _err = win32serviceutil.HandleCommandLine(SAUAgentService)
+                # 为什么：HandleCommandLine 返回 winerror（不抛异常），必须 info 留痕返回值
+                logger.info("HandleCommandLine returned raw winerror=%s (cmd=%s)", _err, _cmd)
                 # 幂等特判（重装/修复安装与卸载链路需要）：
                 #   start 已运行的服务 → 1056；stop 已停止的服务 → 1062，均按成功处理
                 if _cmd == "start" and _err == winerror.ERROR_SERVICE_ALREADY_RUNNING:
                     _early_log("Service already running (1056), treating start as success")
+                    # 为什么：1056 幂等特判（服务已运行），避免安装脚本误判失败
+                    logger.info("HandleCommandLine idempotent rule 1056: start already running service → success (err reset 0)")
                     _err = 0
                 elif _cmd == "stop" and _err == winerror.ERROR_SERVICE_NOT_ACTIVE:
                     _early_log("Service not active (1062), treating stop as success")
+                    # 为什么：1062 幂等特判（服务已停止），避免卸载脚本误判失败
+                    logger.info("HandleCommandLine idempotent rule 1062: stop already stopped service → success (err reset 0)")
                     _err = 0
                 if _err:
                     _early_log(f"HandleCommandLine failed with winerror: {_err}")
+                    # 为什么：非幂等范围内的失败，error 带码值
+                    logger.error("HandleCommandLine failed: winerror=%s cmd=%s → will exit(1)", _err, _cmd)
                     sys.exit(1)
                 _early_log("HandleCommandLine completed successfully")
+                logger.info("HandleCommandLine completed successfully (cmd=%s)", _cmd)
             except SystemExit as e:
                 _code = e.code if isinstance(e.code, int) else (1 if e.code else 0)
                 _early_log(f"HandleCommandLine exited with code: {_code}")
+                # 为什么：HandleCommandLine 内部可能 sys.exit，记录退出码区分"正常 0"和"失败非 0"
+                logger.info("HandleCommandLine raised SystemExit: code=%s", _code)
                 if _code:
                     sys.exit(_code)  # 非零退出码必须传播，不得静默降为 0
             except Exception as e:
                 _early_log(f"HandleCommandLine crashed: {e!r}")
                 import traceback
                 _early_log(traceback.format_exc())
+                # 为什么：完全意料外的崩溃，error 带 trace 便于 pywin32 版本/兼容性排障
+                logger.error("HandleCommandLine crashed with unexpected exception: %s", e, exc_info=True)
                 raise
     except Exception:
         # 兜底：即使 _early_log 本身出问题，也尝试写崩溃日志
@@ -537,9 +684,15 @@ if __name__ == "__main__":
             import datetime as _dt
             import traceback as _tb
             _exe_dir = Path(sys.executable if sys.executable.lower().endswith(".exe") else __file__).resolve().parent
-            with open(_exe_dir / "sau-service-crash.log", "a", encoding="utf-8") as _f:
+            _crash_file = _exe_dir / "sau-service-crash.log"
+            with open(_crash_file, "a", encoding="utf-8") as _f:
                 _f.write(f"\n[{_dt.datetime.now():%Y-%m-%d %H:%M:%S}] !!! UNCAUGHT EXCEPTION !!!\n")
                 _f.write(_tb.format_exc())
+            # 为什么：最后兜底也要把崩溃文件路径报给 logger（如可用）
+            try:
+                logger.error("__main__ uncaught exception — crash dump written to: %s", _crash_file, exc_info=True)
+            except Exception:
+                pass
         except Exception:
             pass
         # 失败必须以非零退出码结束，否则安装脚本（post-install.bat）会误判为成功

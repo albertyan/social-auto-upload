@@ -1,3 +1,9 @@
+"""
+DEPRECATED: 此脚本已废弃。
+建表已迁移到 sau_agent_pkg/db_init.py 的 init_db() 自动初始化。
+启动应用时会自动执行 CREATE TABLE IF NOT EXISTS，无需手动运行此脚本。
+"""
+
 import sqlite3
 import json
 import os

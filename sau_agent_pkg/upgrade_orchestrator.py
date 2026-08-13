@@ -65,9 +65,12 @@ def is_admin() -> bool:
     """当前进程是否管理员权限。"""
     try:
         import ctypes
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        result = bool(ctypes.windll.shell32.IsUserAnAdmin())
     except Exception:
-        return False
+        result = False
+    # 检查结果 info：升级编排要求管理员，失败时从日志一眼看出是权限问题（不用猜 net stop 为什么拒绝访问）
+    logger.info("is_admin: admin_check_result=%s", result)
+    return result
 
 
 def get_install_dir() -> Path:
@@ -76,6 +79,7 @@ def get_install_dir() -> Path:
     优先从服务注册表 ImagePath 推导（sau-service.exe 所在目录），
     回退 %ProgramFiles%\\SAU。
     """
+    source = "registry"
     try:
         import winreg
         with winreg.OpenKey(
@@ -85,10 +89,16 @@ def get_install_dir() -> Path:
             image_path, _ = winreg.QueryValueEx(key, "ImagePath")
         exe = Path(image_path.strip().strip('"'))
         if exe.parent.exists():
+            # 推导路径 info 带来源：registry 成功说明服务已注册；
+            # 若走 ProgramFiles 回退说明服务未注册/注册表损坏，升级路径可能错
+            logger.info("get_install_dir: derived from %s, path=%s", source, exe.parent)
             return exe.parent
     except Exception:
-        pass
-    return Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "SAU"
+        source = "ProgramFiles_fallback"
+    result = Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "SAU"
+    # 回退来源 info：让运维知道服务注册表读不到，后续安装目录错也能从日志追溯
+    logger.info("get_install_dir: derived from %s, path=%s", source, result)
+    return result
 
 
 def _read_installed_version(install_dir: Path) -> str:
@@ -101,8 +111,10 @@ def _read_installed_version(install_dir: Path) -> str:
 
 def _run(cmd: list[str], timeout: Optional[float] = None) -> subprocess.CompletedProcess:
     """执行子进程（无控制台窗口、捕获输出）。"""
-    logger.info("Exec: %s", " ".join(cmd))
-    return subprocess.run(
+    cmd_str = " ".join(cmd)
+    # 开始 info：记录哪条命令、参数，便于复盘升级脚本"在哪一步挂了"
+    logger.info("_run: start cmd=[%s]", cmd_str)
+    result = subprocess.run(
         cmd,
         capture_output=True,
         text=True,
@@ -110,6 +122,19 @@ def _run(cmd: list[str], timeout: Optional[float] = None) -> subprocess.Complete
         timeout=timeout,
         creationflags=_NO_WINDOW,
     )
+    # 结束 info + 非 0 error：正常退出码让运维知道命令跑完了；
+    # 非 0 时把 stdout 尾部贴出来（避免翻 install.log 才知道失败原因）
+    if result.returncode == 0:
+        logger.info("_run: done cmd=[%s] returncode=0", cmd_str)
+    else:
+        tail_stdout = (result.stdout or "").strip()[-500:]
+        tail_stderr = (result.stderr or "").strip()[-500:]
+        # 非 0 退出码 error 带 stdout 尾部：子进程失败时日志里直接有原因，不用再登机器查事件
+        logger.error(
+            "_run: failed cmd=[%s] returncode=%d stdout_tail=%s stderr_tail=%s",
+            cmd_str, result.returncode, tail_stdout, tail_stderr,
+        )
+    return result
 
 
 def _api_get_status() -> Optional[dict[str, Any]]:
@@ -289,6 +314,8 @@ def rollback() -> bool:
 
     回滚失败时打 ERROR 并输出人工处理指引。
     """
+    # 回滚 info：升级失败触发回滚，是编排流程中高风险的一步，必须打日志留痕
+    logger.info("rollback: start rollback sequence")
     _log("=" * 60)
     _log("开始回滚 ...")
 
@@ -358,6 +385,8 @@ def rollback() -> bool:
 
     save_upgrade_state(phase="rolled_back")
     _log(f"[回滚] 完成，已恢复到旧版本 {old_version or '(未知)'}")
+    # 回滚 info：确认回滚成功，后续和 start_backup 日志对应
+    logger.info("rollback: rollback completed, old_version=%s", old_version or "unknown")
     return True
 
 
@@ -420,45 +449,83 @@ def run_upgrade(installer_path: Path, target_version: str) -> bool:
 
     try:
         # 1. 停服（先停服后备份：规避运行中文件句柄问题）
+        # stop_service 开始 info：对应"每步开始结束 info"要求，
+        # 让日志里能清楚看到 6 步各自的起止时间点
+        logger.info("run_upgrade: [1/6] stop_service start")
         _log("[1/6] 停止服务 ...")
         if not stop_service_and_wait():
+            # 失败 error 带原因：停服失败是升级高风险前置，必须 error 高亮
+            logger.error(
+                "run_upgrade: [1/6] stop_service failed after %ds, status=%s",
+                _STOP_TIMEOUT, _get_service_status(),
+            )
             _log(f"错误: 服务未能在 {_STOP_TIMEOUT}s 内停止（当前: {_get_service_status()}），放弃升级（不动安装）")
             save_upgrade_state(phase="failed")
             # net stop 已发出，服务可能随后真正停止且无人拉起 → 尽力恢复
             _run(["net", "start", SERVICE_NAME])
             return False
+        # stop_service 结束 info
+        logger.info("run_upgrade: [1/6] stop_service done")
         _log("[1/6] 服务已停止")
 
-        # 2. 备份
+        # 2. 备份 — start_backup 开始 info
+        logger.info("run_upgrade: [2/6] start_backup start")
         _log("[2/6] 备份当前版本 ...")
         if not _backup(install_dir):
+            # 失败 error 带原因：备份失败意味着后续无法回滚，必须终止
+            logger.error("run_upgrade: [2/6] start_backup failed, aborting upgrade")
             _log("错误: 备份失败，放弃升级（不动安装）")
             save_upgrade_state(phase="failed")
             # 尽力恢复服务
             _run(["net", "start", SERVICE_NAME])
             return False
+        # start_backup 结束 info
+        logger.info("run_upgrade: [2/6] start_backup done")
 
         # 3. 终止托盘
+        logger.info("run_upgrade: [3/6] kill_tray start")
         _log("[3/6] 终止托盘进程 ...")
         _kill_tray()
+        logger.info("run_upgrade: [3/6] kill_tray done")
 
-        # 4. 运行安装包
+        # 4. 运行安装包 — install 开始 info
+        logger.info("run_upgrade: [4/6] install start, installer=%s", installer_path)
         _log("[4/6] 运行安装包（静默）...")
         if not _run_installer(installer_path):
+            # 失败 error 带原因：安装包非 0 退出码，触发回滚
+            logger.error("run_upgrade: [4/6] install failed (installer returned non-zero)")
             _log("错误: 安装包执行失败，开始回滚 ...")
             return rollback()
+        # install 结束 info
+        logger.info("run_upgrade: [4/6] install done")
 
-        # 5. 幂等启动服务
+        # 5. 幂等启动服务 — start 开始 info
+        logger.info("run_upgrade: [5/6] start_service start")
         _log("[5/6] 确认服务运行 ...")
         if not _ensure_service_running():
+            # 失败 error 带原因：启动超时，触发回滚
+            logger.error(
+                "run_upgrade: [5/6] start_service failed after %ds, status=%s",
+                _START_TIMEOUT, _get_service_status(),
+            )
             _log(f"错误: 服务未能在 {_START_TIMEOUT}s 内运行，开始回滚 ...")
             return rollback()
+        # start 结束 info
+        logger.info("run_upgrade: [5/6] start_service done")
 
-        # 6. 校验新版本
+        # 6. 校验新版本 — verify 开始 info
+        logger.info("run_upgrade: [6/6] verify start, target_version=%s", target_version)
         _log(f"[6/6] 校验 /status（{_VERIFY_TIMEOUT}s 窗口，期望版本 {target_version}）...")
         if not _verify_status(target_version):
+            # 失败 error 带原因：版本不匹配或 /status 无响应，触发回滚
+            logger.error(
+                "run_upgrade: [6/6] verify failed after %ds (target_version=%s)",
+                _VERIFY_TIMEOUT, target_version,
+            )
             _log("错误: 新版本校验失败（/status 无响应或版本不匹配），开始回滚 ...")
             return rollback()
+        # verify 结束 info
+        logger.info("run_upgrade: [6/6] verify done, version=%s", target_version)
 
         save_upgrade_state(phase="success")
         _restore_tray(install_dir)
@@ -468,7 +535,9 @@ def run_upgrade(installer_path: Path, target_version: str) -> bool:
         _log("=" * 60)
         return True
 
-    except Exception:
+    except Exception as e:
+        # 全流程异常 error 带原因：兜底所有未捕获异常，随后触发 rollback
+        logger.error("run_upgrade: orchestration crashed, error=%s: %s", type(e).__name__, e)
         logger.exception("Upgrade orchestration crashed")
         _log("错误: 编排过程异常，开始回滚 ...")
         return rollback()

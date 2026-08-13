@@ -13,11 +13,14 @@ sau_agent_pkg.upstream_adapter
 """
 from __future__ import annotations
 
+import logging
 import os
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, NamedTuple
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # 从 sau_cli 导入 Dataclass（上游 API 面）
@@ -120,10 +123,19 @@ async def upload_baijiahao_video(request: BaijiahaoVideoUploadRequest) -> Path:
     account_file = resolve_account_file("baijiahao", request.account_name)
     is_ready = await baijiahao_setup(str(account_file), handle=False)
     if not is_ready:
+        # cookie 缺失 info：百家号 setup 返回 False 时直接抛错，
+        # info 日志让运维确认是百家号 cookie 问题（不是其他平台通用问题）
+        logger.info(
+            "upload_baijiahao_video: baijiahao_setup not ready, cookie missing/expired account=%s file=%s",
+            request.account_name, account_file,
+        )
         raise RuntimeError(
             f"Baijiahao cookie is missing or expired: {account_file}. "
             f"Run `sau baijiahao login --account {request.account_name}` first."
         )
+
+    # 开始 info：百家号作为特殊适配分支，需要独立日志区分和抖音/快手等通用路径的差异
+    logger.info("upload_baijiahao_video: start account=%s title=%s", request.account_name, request.title[:40] if request.title else "")
 
     app = BaiJiaHaoVideo(
         title=request.title,
@@ -134,6 +146,8 @@ async def upload_baijiahao_video(request: BaijiahaoVideoUploadRequest) -> Path:
     )
     # BaiJiaHaoVideo 使用 LOCAL_CHROME_HEADLESS 默认值，如需 headless 需额外处理
     await app.main()
+    # 结束 info：确认百家号上传主流程走完（成功分支）
+    logger.info("upload_baijiahao_video: done account=%s", request.account_name)
     return account_file
 
 
@@ -142,10 +156,18 @@ async def upload_baijiahao_video(request: BaijiahaoVideoUploadRequest) -> Path:
 # ---------------------------------------------------------------------------
 async def check_baijiahao_account(account_name: str) -> bool:
     """检查百家号账号 cookie 有效性。"""
+    # debug 开始：检查启动记录，排查"检查没跑起来"时确认调用链
+    logger.debug("check_baijiahao_account: start account=%s", account_name)
     account_file = resolve_account_file("baijiahao", account_name)
     if not account_file.exists():
+        # 文件不存在 warning：百家号 cookie 文件路径约定不符合预期，
+        # 比单纯返回 False 多一层信息，便于排查文件名/路径问题
+        logger.warning("check_baijiahao_account: account file not exists account=%s file=%s", account_name, account_file)
         return False
-    return await baijiahao_cookie_auth(str(account_file))
+    result = await baijiahao_cookie_auth(str(account_file))
+    # 返回 bool info：百家号检查结果，配合 check_validity 中的耗时日志定位问题
+    logger.info("check_baijiahao_account: result=%s account=%s", result, account_name)
+    return result
 
 
 # ---------------------------------------------------------------------------

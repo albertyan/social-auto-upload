@@ -1,4 +1,4 @@
-"""
+r"""
 sau_tray.home_shim
 ~~~~~~~~~~~~~~~~~~
 SAU_HOME 运行时垫片。
@@ -44,10 +44,15 @@ def apply_home_shim() -> None:
         return
 
     # 1. 改写 conf.BASE_DIR
+    before_base_dir = None
+    after_base_dir = None
     try:
         import conf  # type: ignore[import-untyped]  # 上游模块
+        before_base_dir = getattr(conf, "BASE_DIR", None)
         conf.BASE_DIR = SAU_HOME
-        logger.debug("conf.BASE_DIR → %s", SAU_HOME)
+        after_base_dir = conf.BASE_DIR
+        logger.info("apply_home_shim: SAU_HOME 重写 conf.BASE_DIR，之前=%s，之后=%s",  # 为什么打这条日志：入口记录 BASE_DIR 改写前后对比，确认路径垫片生效
+                    before_base_dir, after_base_dir)
     except ImportError:
         # conf.py 不存在时（极早期环境）只创建目录，不中断
         logger.warning("conf module not found; home_shim skipped BASE_DIR rewrite")
@@ -55,12 +60,15 @@ def apply_home_shim() -> None:
     # 2. 创建所有必需子目录
     for sub in ("cookies", "downloads", "logs", "db", "logs/tasks"):
         try:
-            (SAU_HOME / sub).mkdir(parents=True, exist_ok=True)
+            target = SAU_HOME / sub
+            if not target.exists():
+                logger.info("apply_home_shim: 子目录不存在，创建目录: %s", target)  # 为什么打这条日志：记录首次创建的子目录（不存在时才记）
+            target.mkdir(parents=True, exist_ok=True)
         except OSError as e:
             logger.warning("Cannot create directory %s: %s", SAU_HOME / sub, e)
 
     _applied = True
-    logger.info("home_shim applied: SAU_HOME = %s", SAU_HOME)
+    logger.info("apply_home_shim: 垫片应用完成，SAU_HOME=%s", SAU_HOME)  # 为什么打这条日志：入口 info，确认垫片已应用
 
 
 def is_applied() -> bool:

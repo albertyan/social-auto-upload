@@ -46,6 +46,7 @@ def _gui_thread_main() -> None:
     import tkinter as tk
 
     global _gui_root
+    logger.info("_gui_thread_main: 在 GUI 线程内创建 Tk 根窗口实例")  # 为什么打这条日志：确认 Tk 主窗口在专用线程中创建成功
     root = tk.Tk()
     _gui_root = root
 
@@ -86,6 +87,8 @@ def _gui_thread_main() -> None:
         root.mainloop()
     except Exception as e:
         logger.error("GUI mainloop 异常退出: %s", e)
+    finally:
+        logger.info("_gui_thread_main: GUI 线程退出")  # 为什么打这条日志：确认 GUI 线程正常结束
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +97,7 @@ def _gui_thread_main() -> None:
 def start() -> None:
     """启动专用 GUI 线程并等待其就绪。"""
     global _gui_thread, _gui_queue
+    logger.info("gui_thread.start: 启动 GUI 线程")  # 为什么打这条日志：追踪 GUI 线程启动流程
     _gui_queue = queue.Queue()
     _gui_ready.clear()
     _gui_thread = threading.Thread(
@@ -103,6 +107,8 @@ def start() -> None:
     # 等待 GUI 线程完成初始化（最多 5 秒）
     if not _gui_ready.wait(timeout=5.0):
         logger.error("GUI 线程启动超时")
+    else:
+        logger.info("gui_thread.start: GUI 线程就绪 (_gui_ready.set)")  # 为什么打这条日志：确认 GUI 线程初始化完成
 
 
 def stop() -> None:
@@ -112,15 +118,17 @@ def stop() -> None:
     使用 Win32 PostMessageW 作为兜底（Windows 官方推荐的跨线程窗口操作方式）。
     """
     global _gui_root, _gui_thread
-
+    logger.info("gui_thread.stop: 开始停止 GUI 线程（步骤 1/3：队列调度 quit）")  # 为什么打这条日志：追踪 GUI 停止步骤顺序
     # 优先通过队列调度（线程安全）
     if _gui_queue is not None and _gui_thread is not None and _gui_thread.is_alive():
+        logger.info("gui_thread.stop: 向队列 put root.quit()，等待 3s")  # 为什么打这条日志：确认 quit 已入队
         _gui_queue.put(lambda root: root.quit())
         if _gui_thread is not None:
             _gui_thread.join(timeout=3.0)
 
     # 如果队列方式未生效，使用 PostMessageW 兜底
     if _gui_thread is not None and _gui_thread.is_alive() and _gui_root is not None:
+        logger.info("gui_thread.stop: 队列方式未生效（步骤 2/3：PostMessageW 兜底 WM_CLOSE）")  # 为什么打这条日志：记录兜底步骤触发
         try:
             import ctypes
             user32 = ctypes.windll.user32
@@ -151,6 +159,7 @@ def stop() -> None:
         except Exception:
             logger.warning("GUI 线程 PostMessageW 兜底失败", exc_info=True)
 
+    logger.info("gui_thread.stop: 步骤 3/3：清空引用 _gui_root/_gui_thread = None")  # 为什么打这条日志：确认 GUI 停止清理步骤完成
     _gui_root = None
     _gui_thread = None
 
@@ -190,16 +199,19 @@ def set_cleanup_done(value: bool = True) -> None:
     """标记退出清理已完成。"""
     global _cleanup_done
     with _cleanup_lock:
+        logger.debug("gui_thread.set_cleanup_done: 标记清理完成=%s", value)  # 为什么打这条日志：debug 追踪清理标记变化
         _cleanup_done = value
 
 
 def get_cleanup_lock() -> threading.Lock:
     """返回清理锁（供外部 with 块使用）。"""
+    logger.debug("gui_thread.get_cleanup_lock: 外部请求获取清理锁")  # 为什么打这条日志：debug 追踪清理锁获取时机（避免重复清理）
     return _cleanup_lock
 
 
 def add_login_thread(t: threading.Thread) -> None:
     """注册一个登录线程引用。"""
+    logger.info("gui_thread.add_login_thread: 注册登录线程 name=%s, id=%d", t.name, t.ident or 0)  # 为什么打这条日志：追踪登录线程注册，排查退出时等待的线程列表
     with _login_threads_lock:
         _login_threads.append(t)
 

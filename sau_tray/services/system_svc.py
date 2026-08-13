@@ -34,6 +34,19 @@ def acquire_single_instance() -> bool:
     返回 True 表示成功（首次启动），False 表示已有实例在运行。
     """
     global _single_instance_handle
+    # 幂等保护：为什么必须加这个判断：
+    # tray_app.py 会调用两次 acquire_single_instance：
+    #   1) main() L313  — 入口处拦截重复启动（已存在就 MessageBoxW + 直接退出）
+    #   2) run()  L244  — 启动关键日志快照（要把锁状态打到启动 banner 里）
+    # 如果不加幂等，第二次调用对同一个互斥体名字 CreateMutexW 时，
+    # GetLastError() 会返回 183 (ERROR_ALREADY_EXISTS) —— 这不是"其他实例在运行"，
+    # 而是"同进程里同名互斥体已存在"。但原来代码把 183 一律当成"已有其他实例"，
+    # 结果就会 CloseHandle + 把 _single_instance_handle 置 None，
+    # 把第一次调用正确持有的句柄冲掉（release_single_instance 就失效了），
+    # 同时日志里还会误报"检测到已有实例运行"，启动 banner 里 single_instance_lock=False。
+    if _single_instance_handle is not None:
+        logger.debug("acquire_single_instance: 已持有互斥锁句柄，跳过重复创建（幂等保护命中）")  # 为什么打 debug：幂等保护正常命中时无需用户关心，只在 debug 追踪时看
+        return True
     try:
         _single_instance_handle = ctypes.windll.kernel32.CreateMutexW(
             None,  # 默认安全描述符
@@ -41,14 +54,18 @@ def acquire_single_instance() -> bool:
             _SINGLE_INSTANCE_MUTEX_NAME,
         )
         if not _single_instance_handle:
+            logger.info("acquire_single_instance: 创建互斥锁句柄失败，返回 False")  # 为什么打这条日志：记录互斥锁创建失败
             return False
         last_error = ctypes.windll.kernel32.GetLastError()
         if last_error == 183:  # ERROR_ALREADY_EXISTS
             ctypes.windll.kernel32.CloseHandle(_single_instance_handle)
             _single_instance_handle = None
+            logger.info("acquire_single_instance: 失败，检测到已有实例运行 (ERROR_ALREADY_EXISTS=183)")  # 为什么打这条日志：确认已有实例导致启动被拦截
             return False
+        logger.info("acquire_single_instance: 成功获取单实例互斥锁")  # 为什么打这条日志：确认互斥锁获取成功，启动是首次
         return True
-    except Exception:
+    except Exception as e:
+        logger.info("acquire_single_instance: 互斥锁 API 异常，放行启动: %s", e)  # 为什么打这条日志：记录互斥锁异常但不阻止启动的场景
         return True  # 互斥锁失败时不阻止启动
 
 
@@ -80,7 +97,10 @@ def elevated_service_control(action: str) -> None:
     result = ctypes.windll.shell32.ShellExecuteW(
         None, "runas", exe_path, action, None, 0,  # SW_HIDE
     )
+    logger.info("elevated_service_control: ShellExecuteW action=%s, result=%d", action, result)  # 为什么打这条日志：记录 ShellExecute 结果（含提权情况）
     if result <= 32:
+        logger.error("elevated_service_control: ShellExecuteW 失败 action=%s, code=%d（≤32 表示失败）",  # 为什么打这条日志：≤32 为失败码，error 级记录带 code
+                     action, result)
         raise RuntimeError(f"ShellExecute 失败 (code={result})")
 
 
@@ -100,7 +120,7 @@ def _get_pids_by_name(name: str) -> list[int]:
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
     except Exception as e:
-        logger.warning("kill_sau: tasklist 查询 %s 异常: %s", name, e)
+        logger.error("kill_sau: tasklist 查询 %s 异常: %s", name, e)
         return []
     pids: list[int] = []
     # CSV 格式: "sau-tray.exe","1234","Console","1","1,234 K"
@@ -155,10 +175,10 @@ def _kill_pid(name: str, pid: int) -> bool:
     """
     match = _verify_process_image(pid, name)
     if match is False:
-        logger.warning("kill_sau: PID=%d 映像名已不是 %s（PID 被复用），跳过误杀", pid, name)
+        logger.debug("kill_sau: PID=%d 映像名已不是 %s（PID 被复用），跳过误杀", pid, name)
         return True
     if match is None:
-        logger.info("kill_sau: PID=%d 已无法查询（视为已退出），跳过", pid)
+        logger.debug("kill_sau: PID=%d 已无法查询（视为已退出），跳过", pid)
         return True
     try:
         r = subprocess.run(
@@ -167,7 +187,7 @@ def _kill_pid(name: str, pid: int) -> bool:
             creationflags=subprocess.CREATE_NO_WINDOW,
         )
     except Exception as e:
-        logger.warning("kill_sau: taskkill %s (PID=%d) 异常: %s", name, pid, e)
+        logger.error("kill_sau: taskkill %s (PID=%d) 异常: %s", name, pid, e)
         return False
     if r.returncode in (0, 128):  # 128 = 进程已不存在（正在退出）
         return True
@@ -197,19 +217,29 @@ def kill_sau_processes() -> None:
     killed: list[tuple[str, int]] = []
     failed: list[tuple[str, int]] = []
 
-    def _sweep() -> None:
+    def _sweep(sweep_index: int) -> None:
+        sweep_killed_before = len(killed)
+        sweep_failed_before = len(failed)
+        logger.info("kill_sau: 第 %d 轮执行开始，待扫描进程名 %d 个", sweep_index, len(sau_names))  # 为什么打这条日志：追踪两轮清理的执行顺序
         for name in sau_names:
-            for pid in _get_pids_by_name(name):
+            pids = _get_pids_by_name(name)
+            if pids:
+                logger.debug("kill_sau: 第 %d 轮发现进程 %s: PIDs=%s", sweep_index, name, pids)
+            for pid in pids:
                 if pid == self_pid:
-                    logger.info("kill_sau: 跳过自身进程 %s (PID=%d)", name, pid)
+                    logger.info("kill_sau: 第 %d 轮跳过自身进程（误杀跳过） %s (PID=%d)", sweep_index, name, pid)  # 为什么打这条日志：明确自身进程被跳过的轮次
                     continue
                 if _kill_pid(name, pid):
                     killed.append((name, pid))
                 else:
                     failed.append((name, pid))
+        round_killed = len(killed) - sweep_killed_before
+        round_failed = len(failed) - sweep_failed_before
+        logger.info("kill_sau: 第 %d 轮执行结束，本论 success=%d, failed=%d", sweep_index, round_killed, round_failed)  # 为什么打这条日志：每轮汇总成功/失败数
 
-    _sweep()
+    _sweep(1)
     # 第二轮：短暂等待后补刀（处理第一轮中正在退出但尚未完全终止的进程）
     time.sleep(0.5)
-    _sweep()
-    logger.info("kill_sau: 清理完成，成功 %d 个，失败 %d 个 %s", len(killed), len(failed), failed or "")
+    _sweep(2)
+    logger.info("kill_sau: 两轮清理全部完成，累计 success=%d, failed=%d，失败列表: %s",  # 为什么打这条日志：两轮汇总最终结果
+                len(killed), len(failed), failed or "[]")

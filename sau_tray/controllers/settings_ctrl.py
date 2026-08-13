@@ -102,25 +102,65 @@ class SettingsController:
     # 保存配置
     # ------------------------------------------------------------------
     def save_config(self, server_url: str, token: str) -> None:
-        """保存设置到配置文件。"""
-        from sau_agent_pkg.config import load_config, save_config
+        """保存设置到配置文件。
+
+        为什么同时写 config.json 与 credential.bin：
+        - SauAgentCore 读取 token 走 load_token()（读 credential.bin，DPAPI 加密机器级保护）
+        - SettingsView 显示「当前已配置的 token」读 config.json / load_token 双路
+        两边必须同步写入，否则保存后服务仍会报 No token bound。
+        """
+        from sau_agent_pkg.config import load_config, save_config, save_token, delete_token, get_agent_id
+
+        token_len = len(token)
+        logger.info("save_config 开始: server_url=%s, token_len=%d", server_url, token_len)  # 为什么打这条日志：记录保存参数（token 仅记长度，脱敏），排查配置保存问题
 
         if server_url and not (server_url.startswith("ws://") or server_url.startswith("wss://")):
-            def _show_warn() -> None:
-                from tkinter import messagebox
-                messagebox.showwarning(
-                    "格式错误", "服务器地址应以 ws:// 或 wss:// 开头",
-                    parent=self._view.window,
-                )
-            gui_thread.schedule(lambda root: _show_warn())
+            logger.warning("save_config: 服务器地址格式错误，非 ws(s):// 开头: %s", server_url)  # 为什么打这条日志：记录地址格式校验失败，排查配置错误
+            # 为什么用 show_info 而不是 tkinter.messagebox.showwarning(parent=self._view.window)：
+            # 1. save_config 可能从非 GUI 线程调用（虽然 Settings 保存按钮当前在 GUI 线程），
+            #    show_info 内部自动切 GUI 线程，不受调用方线程影响。
+            # 2. show_info 自动屏幕居中，tk 原生 messagebox 默认偏右下角，视觉不一致。
+            # 3. 样式统一，所有"警告/信息型"弹框统一走 show_info。
+            from sau_tray.views.dialogs import show_info
+            logger.info("save_config: 弹窗提示格式错误（show_info）")  # 为什么打这条日志：确认格式错误弹窗已触发
+            threading.Thread(
+                target=show_info,
+                args=("服务器地址应以 ws:// 或 wss:// 开头", "格式错误"),
+                daemon=True, name="SAU-FormatWarning",
+            ).start()
             return
 
         cfg_new = load_config()
+        changed = False
         if server_url:
             cfg_new["server_url"] = server_url
+            changed = True
         if token:
-            cfg_new["token"] = token
-        save_config(cfg_new)
+            # 1) 同步写 DPAPI 加密的 credential.bin（SauAgentCore 会读这里）
+            try:
+                save_token(token)
+                logger.info("save_config: DPAPI save_token 成功，token 已写入 credential.bin")  # 为什么打这条日志：确认 DPAPI 加密保存成功
+            except Exception as e:
+                logger.error("save_config: DPAPI save_token 失败: %s", e)  # 为什么打这条日志：记录 DPAPI 保存失败，排查凭据保存问题
+            # 2) config.json 里只存占位符，避免两份明文不一致的迷惑，同时保持 View 读取逻辑兼容
+            cfg_new["token"] = "******"
+            changed = True
+        # 若提供了 server_url/token 但没有 agent_id，自动生成并持久化
+        if changed and not cfg_new.get("agent_id"):
+            new_agent_id = get_agent_id()
+            logger.info("save_config: 自动生成 agent_id，前缀前 8 位: %s", str(new_agent_id)[:8])  # 为什么打这条日志：记录 agent_id 自动生成（仅记前缀，脱敏）
+            cfg_new["agent_id"] = new_agent_id
+            changed = True
+
+        if changed:
+            save_config(cfg_new)
+            logger.info("save_config: 配置已成功保存到 config.json")  # 为什么打这条日志：确认 config.json 保存成功
+        elif token == "" and "token" in cfg_new:
+            # 用户清空了 token → 删除 credential.bin 解绑本机
+            logger.info("save_config: 用户清空 token，删除 credential.bin 解绑本机")  # 为什么打这条日志：记录 token 清空解绑操作
+            delete_token()
+            cfg_new.pop("token", None)
+            save_config(cfg_new)
 
         show_notify("设置已保存", "SAU 设置")
         self._view.close()

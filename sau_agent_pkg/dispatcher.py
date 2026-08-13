@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import shutil
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -32,6 +33,10 @@ from sau_agent_pkg.upstream_adapter import PLATFORMS, get_request_class, get_upl
 logger = logging.getLogger(__name__)
 
 _DOWNLOADS_DIR = SAU_HOME / "downloads"
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
 
 
 class Dispatcher:
@@ -90,6 +95,10 @@ class Dispatcher:
         若同一 task_id 已有活跃任务（如 file_renewed 场景），先取消旧任务。
         """
         task_id = task["task_id"]
+        platform_key = task.get("platform_key", "")
+        account_name = task.get("account_name", "")
+        # info 记录 task_id+平台+账号：服务端下发任务后本地能对应上是哪条账号跑哪条任务
+        logger.info("submit: task_id=%s platform=%s account=%s", task_id, platform_key, account_name)
         # 取消已存在的同名任务（e.g. file_renewed 替换正在运行的任务）
         existing = self._active_tasks.pop(task_id, None)
         if existing and not existing.done():
@@ -119,50 +128,105 @@ class Dispatcher:
         task_id = task["task_id"]
         platform_key = task["platform_key"]
         content_type = task.get("content_type", "video")
+        start_ms = _now_ms()
+        # 开始 info：任务真正进入执行阶段，便于和 submit 入队日志区分
+        logger.info("_execute: start task_id=%s platform=%s content_type=%s", task_id, platform_key, content_type)
 
         # 更新状态为 running
         self._update_task_status(task_id, "running")
         await self._report_progress(task_id, "downloading", 0, "Starting download")
 
         try:
+            phase_start_ms = _now_ms()
             # 1. 解析账号
             account_name = task.get("account_name") or await accounts.first_valid(platform_key)
             if not account_name:
+                # 账号解析失败 info：不是 cookie 过期，而是连可用账号都找不到（平台无账号导入或全失效）
+                logger.info(
+                    "_execute: account resolve failed task_id=%s platform=%s elapsed=%dms",
+                    task_id, platform_key, _now_ms() - phase_start_ms,
+                )
                 await self._report_result(task_id, "failed", "cookie missing/expired", None)
                 self._update_task_status(task_id, "failed")
                 return
+            # 阶段结束 info：账号解析成功，带耗时
+            logger.info(
+                "_execute: stage [account_resolve] done task_id=%s account=%s elapsed=%dms",
+                task_id, account_name, _now_ms() - phase_start_ms,
+            )
 
             # 2. 检查 cookie 有效性
+            phase_start_ms = _now_ms()
             caps = PLATFORMS.get(platform_key)
             if not caps:
+                # 未知平台 info：平台名在注册表中找不到，一般是服务端下发了新平台但本地 agent 版本旧
+                logger.warning(
+                    "_execute: unknown platform task_id=%s platform=%s elapsed=%dms",
+                    task_id, platform_key, _now_ms() - phase_start_ms,
+                )
                 await self._report_result(task_id, "failed", f"Unknown platform: {platform_key}", None)
                 self._update_task_status(task_id, "failed")
                 return
 
             if not await accounts.check_validity(platform_key, account_name):
+                # cookie 无效 warning：账号存在但登录态失效，提示用户去重新扫码/导入 cookie
+                logger.warning(
+                    "_execute: cookie invalid task_id=%s platform=%s account=%s elapsed=%dms",
+                    task_id, platform_key, account_name, _now_ms() - phase_start_ms,
+                )
                 await self._report_result(task_id, "failed", "cookie missing/expired", None)
                 self._update_task_status(task_id, "failed")
                 return
+            # 阶段结束 info：cookie 校验通过，带耗时
+            logger.info(
+                "_execute: stage [cookie_check] done task_id=%s account=%s elapsed=%dms",
+                task_id, account_name, _now_ms() - phase_start_ms,
+            )
 
             # 3. 下载素材
+            phase_start_ms = _now_ms()
             dest_dir = _DOWNLOADS_DIR / task_id
             dest_dir.mkdir(parents=True, exist_ok=True)
 
             try:
                 files = await self._download_materials(task, dest_dir)
             except FileRenewNeeded:
+                # file_renew 请求 info 记 task_id：签名 URL 过期需要服务端重签，
+                # 打 info 让运维知道任务不是失败，而是在等重签后重跑
+                logger.info(
+                    "_execute: file_renew requested task_id=%s elapsed=%dms",
+                    task_id, _now_ms() - phase_start_ms,
+                )
                 # 签名 URL 过期，请求重签
                 if self._file_renew_cb:
                     await self._file_renew_cb(task_id)
                 await self._report_progress(task_id, "downloading", 0, "Waiting for file renew")
                 return
+            except Exception as e:
+                # 下载失败 warning：网络/CDN/磁盘写问题，带 task_id 定位具体素材
+                logger.warning(
+                    "_execute: download failed task_id=%s error=%s: %s elapsed=%dms",
+                    task_id, type(e).__name__, e, _now_ms() - phase_start_ms,
+                )
+                raise
+            # 阶段结束 info：下载成功，带文件数量和耗时
+            logger.info(
+                "_execute: stage [download] done task_id=%s files=%d elapsed=%dms",
+                task_id, len(files), _now_ms() - phase_start_ms,
+            )
 
             await self._report_progress(task_id, "uploading", 50, "Upload starting")
 
             # 4. 构建 UploadRequest
+            phase_start_ms = _now_ms()
             req_cls = get_request_class(platform_key, content_type)
             upload_fn = get_upload_fn(platform_key, content_type)
             if not req_cls or not upload_fn:
+                # 不支持 contentType info：该平台不支持视频/图文这种类型，一般是服务端配置错
+                logger.info(
+                    "_execute: unsupported content_type task_id=%s platform=%s content_type=%s elapsed=%dms",
+                    task_id, platform_key, content_type, _now_ms() - phase_start_ms,
+                )
                 await self._report_result(
                     task_id, "failed",
                     f"Platform {platform_key} does not support {content_type}",
@@ -170,21 +234,42 @@ class Dispatcher:
                 )
                 self._update_task_status(task_id, "failed")
                 return
+            # 阶段结束 info：Request 构建完成
+            logger.info(
+                "_execute: stage [build_request] done task_id=%s elapsed=%dms",
+                task_id, _now_ms() - phase_start_ms,
+            )
 
             req = self._build_request(req_cls, content_type, account_name, task, files)
 
             # 5. 执行上传
+            phase_start_ms = _now_ms()
             await self._report_progress(task_id, "publishing", 70, "Uploading to platform")
             await upload_fn(req)
+            # 阶段结束 info：上传调用返回（成功分支）
+            logger.info(
+                "_execute: stage [upload_fn] done task_id=%s elapsed=%dms",
+                task_id, _now_ms() - phase_start_ms,
+            )
 
             # 6. 成功
             await self._report_progress(task_id, "publishing", 100, "Upload complete")
             await self._report_result(task_id, "success", None, None)
             self._update_task_status(task_id, "success")
-            logger.info("Task %s completed successfully", task_id)
+            # 上传成功 info 带整体耗时：统计端到端 RT，便于容量评估
+            logger.info(
+                "Task %s completed successfully, total elapsed=%dms",
+                task_id, _now_ms() - start_ms,
+            )
 
         except Exception as e:
             error_msg = str(e)
+            elapsed_ms = _now_ms() - start_ms
+            # 失败分支 warning：统一兜底所有未被分类捕获的异常
+            logger.warning(
+                "_execute: task failed task_id=%s error=%s: %s total_elapsed=%dms",
+                task_id, type(e).__name__, error_msg, elapsed_ms,
+            )
             logger.exception("Task %s failed: %s", task_id, error_msg)
             # 异常分类
             if self._is_cookie_error(e):
@@ -236,17 +321,28 @@ class Dispatcher:
         self, session: aiohttp.ClientSession, url: str, dest_dir: Path, filename: str
     ) -> Path:
         """下载单个文件，返回本地路径。"""
+        url_prefix = url[:80] if len(url) > 80 else url
+        # 开始 debug：排查下载卡住时能看到是哪条 URL 慢
+        logger.debug("_download_file: start url_prefix=%s filename=%s", url_prefix, filename)
         dest = dest_dir / filename
         try:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=600)) as resp:
                 if resp.status == 403:
+                    # 403 warning 记 url 前缀：签名过期最常见，让运维快速判断是签名问题还是资源被删
+                    logger.warning("_download_file: 403 Forbidden url_prefix=%s", url_prefix)
                     # 签名 URL 过期
                     raise FileRenewNeeded(url)
                 resp.raise_for_status()
                 with open(dest, "wb") as f:
                     async for chunk in resp.content.iter_chunked(8192):
                         f.write(chunk)
+        except asyncio.TimeoutError:
+            # 超时 warning 记 url 前缀：CDN 抖动/带宽打满时会触发，定位是哪条素材慢
+            logger.warning("_download_file: timeout url_prefix=%s", url_prefix)
+            raise
         except aiohttp.ClientError as e:
+            # 网络异常 warning 记 url 前缀：DNS/连接重置/SSL 问题，区分 403 和超时
+            logger.warning("_download_file: client error url_prefix=%s error=%s: %s", url_prefix, type(e).__name__, e)
             raise NetworkError(f"Download failed: {e}") from e
         return dest
 
@@ -301,6 +397,10 @@ class Dispatcher:
             rows = conn.execute(
                 "SELECT payload FROM local_tasks WHERE status IN ('queued', 'running') ORDER BY created_at"
             ).fetchall()
+            row_count = len(rows)
+            # 开始 info 行数：服务重启后能直观看到有多少任务需要恢复，0 条就跳过后面
+            logger.info("recover_pending: start, pending rows=%d", row_count)
+            recovered = 0
             for row in rows:
                 task = json.loads(row["payload"])
                 task_id = task["task_id"]
@@ -308,6 +408,9 @@ class Dispatcher:
                 # 重置为 queued
                 self._update_task_status(task_id, "queued")
                 self.submit(task)
+                recovered += 1
+            # 结束 info 已恢复多少：和开始行数对比，确认没有任务在 submit 阶段抛错被漏掉
+            logger.info("recover_pending: done, recovered=%d / %d", recovered, row_count)
         finally:
             conn.close()
 
@@ -318,6 +421,10 @@ class Dispatcher:
             rows = conn.execute(
                 "SELECT payload FROM local_tasks WHERE status = 'queued' ORDER BY created_at"
             ).fetchall()
+            row_count = len(rows)
+            # 开始 info 行数：暂停恢复后触发的 queued 扫描，和 recover_pending 区分开
+            logger.info("_recover_queued: start, queued rows=%d", row_count)
+            recovered = 0
             for row in rows:
                 task = json.loads(row["payload"])
                 task_id = task["task_id"]
@@ -329,6 +436,9 @@ class Dispatcher:
                 aio_task = asyncio.create_task(self._run_with_semaphore(task))
                 self._active_tasks[task_id] = aio_task
                 aio_task.add_done_callback(lambda t: self._active_tasks.pop(task_id, None))
+                recovered += 1
+            # 结束 info 已恢复多少：确认 resume 过程没丢任务
+            logger.info("_recover_queued: done, resumed=%d / %d", recovered, row_count)
         finally:
             conn.close()
 
@@ -385,8 +495,12 @@ class Dispatcher:
         if dest_dir.exists():
             try:
                 shutil.rmtree(dest_dir)
+                # 成功 info：带 task_id，确认磁盘空间已释放
+                logger.info("_cleanup_downloads: success task_id=%s dir=%s", task_id, dest_dir)
                 logger.debug("Cleaned up downloads for task %s", task_id)
-            except OSError:
+            except OSError as e:
+                # 失败 info：文件被锁/权限问题，可能导致磁盘泄漏需要人工处理
+                logger.info("_cleanup_downloads: failed task_id=%s dir=%s error=%s", task_id, dest_dir, e)
                 logger.warning("Failed to clean up downloads for task %s", task_id)
 
     # ------------------------------------------------------------------

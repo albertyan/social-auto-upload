@@ -10,10 +10,13 @@ from __future__ import annotations
 
 import ctypes
 import hashlib
+import logging
 import subprocess
 import winreg
 from ctypes import wintypes
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 
 def _get_machine_guid() -> str:
@@ -27,7 +30,9 @@ def _get_machine_guid() -> str:
         guid, _ = winreg.QueryValueEx(key, "MachineGuid")
         winreg.CloseKey(key)
         return str(guid)
-    except OSError:
+    except OSError as e:
+        # 失败 warning：便于区分哪个组件挂了——是注册表权限/项缺失，还是卷标/CPU 的问题
+        logger.warning("_get_machine_guid: failed, error=%s: %s", type(e).__name__, e)
         return ""
 
 
@@ -52,6 +57,8 @@ def _get_volume_serial(drive: str = "C:\\") -> int:
     )
     if result:
         return serial_number.value
+    # 失败 warning：区分是 MachineGuid/卷标/CPU 哪个环节出错，不用对着 RuntimeError 盲猜
+    logger.warning("_get_volume_serial: failed (drive=%s), GetVolumeInformationW returned 0", drive)
     return 0
 
 
@@ -72,8 +79,9 @@ def _get_cpu_id_via_wmic() -> str:
             line = line.strip()
             if line:
                 return line
-    except (subprocess.SubprocessError, OSError):
-        pass
+    except (subprocess.SubprocessError, OSError) as e:
+        # wmic 失败 warning：Win11 新镜像移除 wmic 是常见情况，warning 提示后续靠 PowerShell 兜底
+        logger.warning("_get_cpu_id_via_wmic: failed, error=%s: %s", type(e).__name__, e)
     return ""
 
 
@@ -95,8 +103,10 @@ def _get_cpu_id_via_powershell() -> str:
             line = line.strip()
             if line:
                 return line
-    except (subprocess.SubprocessError, OSError):
-        pass
+    except (subprocess.SubprocessError, OSError) as e:
+        # PowerShell 失败 warning：wmic 和 PS 都失败说明 CPU ID 彻底拿不到，
+        # 和 MachineGuid/卷标失败一起能定位问题
+        logger.warning("_get_cpu_id_via_powershell: failed, error=%s: %s", type(e).__name__, e)
     return ""
 
 
@@ -128,19 +138,28 @@ def get_machine_code() -> str:
     """
     guid = _get_machine_guid()
     if not guid:
+        # 失败 error 说明具体原因：绑定 token 报错时能直接定位"MachineGuid 拿不到"
+        logger.error("get_machine_code: MachineGuid component unavailable")
         raise RuntimeError("机器指纹采集失败：MachineGuid 组件不可用")
 
     serial = _get_volume_serial()
     if serial == 0:
+        # 失败 error 说明具体原因：区分是卷标/CPU/注册表哪个组件问题
+        logger.error("get_machine_code: VolumeSerial component unavailable (got 0)")
         raise RuntimeError("机器指纹采集失败：系统盘卷序列号组件不可用")
 
     cpu_id = _get_cpu_id()
     if not cpu_id:
+        # 失败 error 说明具体原因：三个组件都有 warning 前置，这里再 error 汇总
+        logger.error("get_machine_code: CPU ID component unavailable")
         raise RuntimeError("机器指纹采集失败：CPU ID 组件不可用")
 
     # 组合三个标识，用 | 分隔
     fingerprint = f"{guid}|{serial}|{cpu_id}"
-    return hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:32]
+    code = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:32]
+    # 成功 info 记前 8 位：既方便绑定/解绑时确认机器身份，又不把完整 32 位哈希打爆日志
+    logger.info("get_machine_code: success, prefix=%s", code[:8])
+    return code
 
 
 if __name__ == "__main__":

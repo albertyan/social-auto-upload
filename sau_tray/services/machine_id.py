@@ -7,7 +7,10 @@ sau_tray.services.machine_id
 """
 from __future__ import annotations
 
+import logging
 import threading
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -29,14 +32,28 @@ def get_machine_code() -> str:
         try:
             from sau_agent_pkg.machine import get_machine_code as _real_get
             _machine_code_cache = _real_get()
-        except Exception:
+        except Exception as e:
+            err_str = str(e).lower()
+            # 采集失败分类：根据异常信息判断来源（guid / serial / cpu）
+            if "guid" in err_str or "uuid" in err_str or "machineguid" in err_str:
+                logger.error("机器码采集失败[guid类]: %s", e)  # 为什么打这条日志：区分机器码 GUID 采集失败类别
+            elif "serial" in err_str or "bios" in err_str or "baseboard" in err_str:
+                logger.error("机器码采集失败[serial类]: %s", e)  # 为什么打这条日志：区分 BIOS/序列号采集失败类别
+            elif "cpu" in err_str or "processor" in err_str or "cpuid" in err_str:
+                logger.error("机器码采集失败[cpu类]: %s", e)  # 为什么打这条日志：区分 CPU 信息采集失败类别
+            else:
+                logger.error("机器码采集失败[其他]: %s", e)  # 为什么打这条日志：记录其他未分类的采集失败
             _machine_code_cache = "N/A"
         return _machine_code_cache
 
 
 def preload() -> None:
     """在应用启动时预加载机器码（后台线程调用，避免阻塞主流程）。"""
+    logger.info("machine_id.preload: 开始后台预加载机器码")  # 为什么打这条日志：确认后台预加载线程已启动
     try:
-        get_machine_code()
-    except Exception:
+        code = get_machine_code()
+        prefix = str(code)[:8]
+        logger.info("machine_id.preload: 机器码预加载完成，缓存前 8 位: %s", prefix)  # 为什么打这条日志：确认机器码预加载成功（仅记前缀，脱敏）
+    except Exception as e:
+        logger.error("machine_id.preload: 预加载异常: %s", e)  # 为什么打这条日志：记录预加载阶段的异常
         pass

@@ -1,13 +1,14 @@
 import asyncio
 import sqlite3
 
-from playwright.async_api import async_playwright
+from patchright.async_api import async_playwright
 
 from myUtils.auth import check_cookie
 from utils.base_social_media import set_init_script
 import uuid
 from pathlib import Path
 from conf import BASE_DIR, LOCAL_CHROME_HEADLESS, LOCAL_CHROME_PATH
+from sau_agent_pkg.db_init import DB_PATH
 
 # 统一获取浏览器启动配置（防风控+引入本地浏览器）
 def get_browser_options():
@@ -79,7 +80,7 @@ async def douyin_cookie_gen(id,status_queue):
         await page.close()
         await context.close()
         await browser.close()
-        with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
+        with sqlite3.connect(str(DB_PATH)) as conn:
             cursor = conn.cursor()
             cursor.execute('''
                                 INSERT INTO user_info (type, filePath, userName, status)
@@ -158,7 +159,7 @@ async def get_tencent_cookie(id,status_queue):
         await context.close()
         await browser.close()
 
-        with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
+        with sqlite3.connect(str(DB_PATH)) as conn:
             cursor = conn.cursor()
             cursor.execute('''
                                 INSERT INTO user_info (type, filePath, userName, status)
@@ -232,7 +233,7 @@ async def get_ks_cookie(id,status_queue):
         await context.close()
         await browser.close()
 
-        with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
+        with sqlite3.connect(str(DB_PATH)) as conn:
             cursor = conn.cursor()
             cursor.execute('''
                                         INSERT INTO user_info (type, filePath, userName, status)
@@ -306,7 +307,7 @@ async def xiaohongshu_cookie_gen(id,status_queue):
         await context.close()
         await browser.close()
 
-        with sqlite3.connect(Path(BASE_DIR / "db" / "database.db")) as conn:
+        with sqlite3.connect(str(DB_PATH)) as conn:
             cursor = conn.cursor()
             cursor.execute('''
                            INSERT INTO user_info (type, filePath, userName, status)

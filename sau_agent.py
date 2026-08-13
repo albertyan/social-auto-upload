@@ -12,14 +12,17 @@ Usage:
     # or with env vars:
     SAU_SERVER_WS=ws://host:8888/opcgeo/agent/ws SAU_AGENT_TOKEN=xxx python sau_agent.py
 """
+from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import uuid
 import os
 import sys
 import requests as http_requests
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 try:
@@ -31,6 +34,45 @@ except ImportError:
 from websockets.exceptions import ConnectionClosed, InvalidStatus, InvalidHandshake
 
 from sau_agent_pkg.version import APP_VERSION
+
+
+# ---------------------------------------------------------------------------
+# 日志（sau_agent.py 旧版入口独立日志）
+# ---------------------------------------------------------------------------
+logger = logging.getLogger(__name__)
+
+
+def _setup_agent_logging() -> None:
+    """初始化 sau_agent 的日志（与 sau_agent_pkg.core 语义对齐）。"""
+    try:
+        root = logging.getLogger()
+        if root.handlers:
+            return
+        root.setLevel(logging.INFO)
+
+        ch = logging.StreamHandler()
+        ch.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%H:%M:%S",
+        ))
+        root.addHandler(ch)
+
+        try:
+            log_dir = Path(__file__).resolve().parent / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            fh = RotatingFileHandler(
+                str(log_dir / "sau-agent-legacy.log"),
+                maxBytes=10 * 1024 * 1024, backupCount=3, encoding="utf-8",
+            )
+            fh.setFormatter(logging.Formatter(
+                "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+                datefmt="%Y-%m-%d %H:%M:%S",
+            ))
+            root.addHandler(fh)
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +211,8 @@ async def _run_upload(platform_key: str, account_file: Path, title: str,
 # ---------------------------------------------------------------------------
 
 async def _upload_douyin(account_file, title, file_path, tags, description, publish_date):
+    # 为什么：每个平台上传函数入口 debug 留痕，多路复用时知道走的是哪条路径
+    logger.debug("_upload_douyin entry: account_file=%s title_len=%d", account_file, len(title) if title else 0)
     from uploader.douyin_uploader.main import (
         douyin_setup, DouYinVideo, DOUYIN_PUBLISH_STRATEGY_IMMEDIATE,
     )
@@ -186,6 +230,7 @@ async def _upload_douyin(account_file, title, file_path, tags, description, publ
 
 
 async def _upload_xiaohongshu(account_file, title, file_path, tags, description, publish_date):
+    logger.debug("_upload_xiaohongshu entry: account_file=%s title_len=%d", account_file, len(title) if title else 0)
     from uploader.xiaohongshu_uploader.main import (
         xiaohongshu_setup, XiaoHongShuVideo, XIAOHONGSHU_PUBLISH_STRATEGY_IMMEDIATE,
     )
@@ -203,6 +248,7 @@ async def _upload_xiaohongshu(account_file, title, file_path, tags, description,
 
 
 async def _upload_shipinhao(account_file, title, file_path, tags, description, publish_date):
+    logger.debug("_upload_shipinhao entry: account_file=%s title_len=%d", account_file, len(title) if title else 0)
     from uploader.tencent_uploader.main import (
         tencent_setup, TencentVideo, TENCENT_PUBLISH_STRATEGY_IMMEDIATE,
     )
@@ -220,6 +266,7 @@ async def _upload_shipinhao(account_file, title, file_path, tags, description, p
 
 
 async def _upload_kuaishou(account_file, title, file_path, tags, description, publish_date):
+    logger.debug("_upload_kuaishou entry: account_file=%s title_len=%d", account_file, len(title) if title else 0)
     from uploader.ks_uploader.main import (
         ks_setup, KSVideo, KUAISHOU_PUBLISH_STRATEGY_IMMEDIATE,
     )
@@ -237,6 +284,7 @@ async def _upload_kuaishou(account_file, title, file_path, tags, description, pu
 
 
 async def _upload_baijiahao(account_file, title, file_path, tags, description, publish_date):
+    logger.debug("_upload_baijiahao entry: account_file=%s title_len=%d", account_file, len(title) if title else 0)
     from uploader.baijiahao_uploader.main import (
         baijiahao_setup, BaiJiaHaoVideo,
     )
@@ -291,9 +339,12 @@ async def _run_upload_dynamic(platform_key: str, account_file: Path, title: str,
 
     # Try to import the module
     module_name = f"uploader.{target_dir}.main"
+    # 为什么：动态 fallback 的第一步——模块能否导入决定路径是否正确，debug 记录被试的模块名
+    logger.debug("_run_upload_dynamic: importing module=%s for platform=%s", module_name, platform_key)
     try:
         mod = importlib.import_module(module_name)
     except ImportError as e:
+        logger.warning("_run_upload_dynamic: module import failed for %s: %s", module_name, e)
         raise ValueError(f"Cannot import {module_name}: {e}")
 
     # Look for setup function: try {platform_key}_setup, or any *_setup
@@ -304,6 +355,9 @@ async def _run_upload_dynamic(platform_key: str, account_file: Path, title: str,
             break
 
     if setup_fn:
+        # 为什么：找到 setup 函数意味着动态发现成功了一半，info 记录便于确认路径
+        logger.info("_run_upload_dynamic: found setup_fn=%s for platform=%s",
+                    getattr(setup_fn, "__name__", repr(setup_fn)), platform_key)
         is_ready = await setup_fn(str(account_file), handle=False)
         if not is_ready:
             raise RuntimeError(
@@ -322,6 +376,9 @@ async def _run_upload_dynamic(platform_key: str, account_file: Path, title: str,
             f"No Video class found in {module_name}. "
             f"Cannot determine how to upload for {platform_key}."
         )
+    # 为什么：找到 Video 类是动态发现的关键节点，info 记录便于排查"找不到 Video 类"
+    logger.info("_run_upload_dynamic: found Video class=%s for platform=%s",
+                video_cls.__name__, platform_key)
 
     # Try to instantiate with common kwargs
     try:
@@ -338,6 +395,8 @@ async def _run_upload_dynamic(platform_key: str, account_file: Path, title: str,
                 publish_date=publish_date or 0, account_file=str(account_file),
             )
         except TypeError:
+            logger.warning("_run_upload_dynamic: cannot instantiate %s (signature mismatch)",
+                           video_cls.__name__)
             raise ValueError(
                 f"Cannot instantiate {video_cls.__name__} for {platform_key}. "
                 f"Constructor signature not compatible."
@@ -352,11 +411,19 @@ async def _run_upload_dynamic(platform_key: str, account_file: Path, title: str,
             break
 
     if not upload_method:
+        logger.warning("_run_upload_dynamic: no upload method found on %s", video_cls.__name__)
         raise ValueError(
             f"No upload method found on {video_cls.__name__} for {platform_key}."
         )
-
-    await upload_method()
+    logger.info("_run_upload_dynamic: calling upload method=%s on %s",
+                getattr(upload_method, "__name__", repr(upload_method)), video_cls.__name__)
+    try:
+        await upload_method()
+    except Exception as e:
+        # 为什么：dynamic fallback 比静态 handler 更容易失败，warning 分类（但不吞异常）
+        logger.warning("_run_upload_dynamic: upload failed for platform=%s via %s: %s",
+                       platform_key, upload_method.__name__, e)
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -373,6 +440,10 @@ class SAUAgent:
 
     async def start(self):
         """Main loop: connect to opcgeo, register, listen for tasks. Auto-reconnect."""
+        # 为什么：connect loop 进入前 info 标记，统计重连次数
+        logger.info("SAUAgent.start: connect loop starting (agent_id prefix=%s...)",
+                    self.agent_id[:8] if self.agent_id else "(none)")
+        _reconnect_backoff = 5
         while self.running:
             try:
                 url = self.config["server_url"]
@@ -380,18 +451,25 @@ class SAUAgent:
                 # 仅附 agentId（服务端握手对 machine 为空有容忍）
                 sep = "&" if "?" in url else "?"
                 url = f"{url}{sep}agentId={self.agent_id}"
-                print(f"[Agent] Connecting to {url} ...")
                 token = self.config["agent_token"]
+                # 为什么：每次 WebSocket 连接尝试打 info（URL 脱敏+token 长度）
+                logger.info("SAUAgent.start: connecting WS url=%s (agent_token_len=%d)",
+                            url, len(token) if token else 0)
                 async with websockets.connect(
                     url, ping_interval=20, ping_timeout=60,
                     # token 改经 Authorization header 传递（新后端握手协议）
                     additional_headers={"Authorization": f"Bearer {token}"},
                 ) as ws:
                     self.ws = ws
-                    print("[Agent] Connected!")
+                    # 为什么：连接成功打 info，确认握手通过
+                    logger.info("SAUAgent.start: WS connected (backoff reset to 5s)")
+                    _reconnect_backoff = 5
 
                     # Register with server — report all available platforms
                     available = discover_available_platforms()
+                    # 为什么：register 是服务端识别这个 agent 的第一步，info 留痕
+                    logger.info("SAUAgent.start: sending register — version=%s platforms=%s",
+                                APP_VERSION, available)
                     await self._send("register", {
                         "agent_id": self.agent_id,
                         "agent_token": self.config["agent_token"],
@@ -408,32 +486,38 @@ class SAUAgent:
                             msg = json.loads(raw)
                             await self._handle_message(msg)
                         except json.JSONDecodeError:
-                            print(f"[Agent] Invalid JSON received: {raw[:200]}")
+                            logger.warning("SAUAgent.start: invalid JSON from server — prefix=%s", raw[:200])
 
             except ConnectionClosed as e:
                 code = getattr(e, "code", None)
+                reason = getattr(e, "reason", "")
                 if code in (4401, 4403, 4409, 4410):
-                    # 凭证类关闭：停止重连，避免对新后端的互踢风暴
-                    print(f"[Agent] ERROR: credential rejected by server "
-                          f"(close code {code}), stop reconnecting. "
-                          f"Please check token / use sau-service instead.")
+                    # 为什么：4401/4403 是凭证类拒绝码（与 sau_agent_pkg/core.py 语义一致），停止重连避免互踢
+                    logger.warning("ConnectionClosed credential rejected (code=%s reason=%s) — stop reconnecting",
+                                   code, reason)
                     self.ws = None
                     return
-                print(f"[Agent] Connection lost ({e}). Reconnecting in 5s...")
+                # 为什么：普通断连 warning 带 code/reason+回退秒数
+                logger.warning("ConnectionClosed code=%s reason=%s — reconnecting backoff=%ss",
+                               code, reason, _reconnect_backoff)
                 self.ws = None
-                await asyncio.sleep(5)
+                await asyncio.sleep(_reconnect_backoff)
+                _reconnect_backoff = min(_reconnect_backoff * 2, 60)
             except (InvalidStatus, InvalidHandshake) as e:
-                # 握手被拒（通常 token 无效/过期）：停止重连
-                print(f"[Agent] ERROR: WebSocket handshake rejected ({e}), "
-                      f"stop reconnecting. Please check SAU_AGENT_TOKEN.")
+                # 为什么：握手失败（HTTP 4xx/升级失败）通常 token 无效，warning 与 core.py 语义一致
+                logger.warning("WS handshake rejected: %s — stop reconnecting (check SAU_AGENT_TOKEN)", e)
                 self.ws = None
                 return
             except (ConnectionRefusedError, OSError) as e:
-                print(f"[Agent] Connection lost ({e}). Reconnecting in 5s...")
+                # 为什么：网络层错误（服务未监听/断网），warning 记录类型+回退
+                logger.warning("Connection refused/OS error (%s) — reconnecting backoff=%ss",
+                               type(e).__name__, _reconnect_backoff)
                 self.ws = None
-                await asyncio.sleep(5)
+                await asyncio.sleep(_reconnect_backoff)
+                _reconnect_backoff = min(_reconnect_backoff * 2, 60)
             except Exception as e:
-                print(f"[Agent] Unexpected error: {e}. Reconnecting in 10s...")
+                # 为什么：意料外异常统一 warning，10s 回退（较慢以避免日志风暴）
+                logger.warning("SAUAgent.start unexpected error: %s — reconnecting in 10s", e, exc_info=True)
                 await asyncio.sleep(10)
 
     async def _heartbeat_loop(self):
@@ -452,15 +536,22 @@ class SAUAgent:
         """Route incoming server messages."""
         msg_type = msg.get("type")
         data = msg.get("data", {})
+        # 为什么：WS 消息路由入口 info 留痕（只记录 type，不记录敏感 data），排障时看"服务端发了什么指令"
+        logger.info("_handle_message routing: msg_type=%s", msg_type)
 
         if msg_type == "registered":
-            print(f"[Agent] Registered: {data.get('message', 'OK')}")
+            logger.info("_handle_message: server registered OK — message=%s", data.get("message", "OK"))
         elif msg_type == "heartbeat_ack":
             pass  # server acknowledged heartbeat
         elif msg_type == "publish_task":
+            # 为什么：收到任务是核心业务事件，info 记 task_id+平台（不记 title/内容等敏感字段）
+            task_id = data.get("task_id", "unknown")
+            platform = data.get("platform_key", "")
+            logger.info("_handle_message: received publish_task task_id=%s platform=%s — spawning executor",
+                        task_id, platform)
             asyncio.create_task(self._execute_publish(data))
         else:
-            print(f"[Agent] Unknown message type: {msg_type}")
+            logger.warning("_handle_message: unknown msg_type=%s — ignoring", msg_type)
 
     async def _execute_publish(self, task_data: dict):
         """Execute a publish task received from the server."""
@@ -469,11 +560,14 @@ class SAUAgent:
         material_id = task_data.get("material_id")
         callback_url = task_data.get("callback_url")
         self.active_tasks += 1
-        print(f"[Agent] Executing publish task {task_id} for {platform_key}"
-              f" (material_id={material_id})")
+        # 为什么：upload 各阶段 info 留痕，可追踪任务从开始到完成的生命周期
+        logger.info("[task_id=%s] _execute_publish start: platform=%s material_id=%s active_tasks=%d",
+                    task_id, platform_key, material_id, self.active_tasks)
 
         try:
             result = await self._do_upload(platform_key, task_data)
+            # 为什么：上传成功 info，确认走到了最终回调前
+            logger.info("[task_id=%s] _execute_publish upload succeeded, sending task_result success", task_id)
             await self._send("task_result", {
                 "task_id": task_id,
                 "material_id": material_id,
@@ -482,8 +576,10 @@ class SAUAgent:
                 "error": None,
                 "publish_url": result.get("publish_url"),
             })
-            print(f"[Agent] Task {task_id} succeeded")
+            logger.info("[task_id=%s] task succeeded", task_id)
         except Exception as e:
+            # 为什么：失败 warning 分类（异常类型名+msg），同时带 trace 便于定位
+            logger.warning("[task_id=%s] task failed (%s): %s", task_id, type(e).__name__, e, exc_info=True)
             await self._send("task_result", {
                 "task_id": task_id,
                 "material_id": material_id,
@@ -492,15 +588,17 @@ class SAUAgent:
                 "error": str(e),
                 "publish_url": None,
             })
-            print(f"[Agent] Task {task_id} failed: {e}")
         finally:
             self.active_tasks -= 1
+            logger.info("[task_id=%s] _execute_publish finished (active_tasks=%d)",
+                        task_id, self.active_tasks)
 
     async def _do_upload(self, platform_key: str, task_data: dict) -> dict:
         """
         Prepare and execute upload using the uploader/ system.
         Mirrors the exact patterns from sau_cli.py.
         """
+        task_id = task_data.get("task_id", "unknown")
         title = task_data.get("title", "")
         tags = task_data.get("tags", [])
         description = task_data.get("description", "")
@@ -508,9 +606,13 @@ class SAUAgent:
         file_url = task_data.get("file_url", "")
         scheduled_at = task_data.get("scheduled_at")
         account_name = task_data.get("account_name")
+        # 为什么：_do_upload 入口 info，确认解析和调度已完成
+        logger.info("[task_id=%s] _do_upload start: platform=%s title_len=%d tags=%d scheduled=%s",
+                    task_id, platform_key, len(title) if title else 0, len(tags), bool(scheduled_at))
 
         # Download file if URL provided and no local path
         if file_url and not file_path:
+            logger.info("[task_id=%s] _do_upload: need download file_url, calling _download_file", task_id)
             file_path = self._download_file(file_url)
 
         if not file_path or not Path(file_path).exists():
@@ -519,13 +621,20 @@ class SAUAgent:
         # Resolve account (cookie) file
         if not account_name:
             account_name = _find_default_account_name(platform_key)
+        # 为什么：账号解析 info（只记账号名+平台，不记 cookie 内容）
+        logger.info("[task_id=%s] _do_upload: account resolved platform=%s account=%s",
+                    task_id, platform_key, account_name)
         account_file = _resolve_account_file(platform_key, account_name)
 
         if not account_file.exists():
+            # 为什么：cookie 不存在是用户态常见错误（未登录），warning 提示路径
+            logger.warning("[task_id=%s] _do_upload: cookie file not found: %s", task_id, account_file)
             raise Exception(
                 f"No cookie file for {platform_key}/{account_name}: {account_file}. "
                 f"Please login first."
             )
+        # 为什么：cookie 文件存在=已通过浏览器登录，info 确认前置条件满足
+        logger.info("[task_id=%s] _do_upload: cookie check passed (%s exists)", task_id, account_file)
 
         # Parse scheduled_at into publish_date
         publish_date = 0
@@ -535,11 +644,21 @@ class SAUAgent:
             except (ValueError, TypeError):
                 publish_date = 0
 
+        # 为什么：启动浏览器/上传前打 info，知道什么时候真正开始执行上传
+        logger.info("[task_id=%s] _do_upload: starting platform uploader (browser launch + upload)...", task_id)
         # Execute upload (same patterns as sau_cli.py)
-        await _run_upload(
-            platform_key, account_file, title, file_path,
-            tags, description, publish_date,
-        )
+        try:
+            await _run_upload(
+                platform_key, account_file, title, file_path,
+                tags, description, publish_date,
+            )
+        except Exception as e:
+            # 为什么：上传内部失败 warning 分类（区分 cookie/网络/平台风控）
+            logger.warning("[task_id=%s] _run_upload raised %s: %s",
+                           task_id, type(e).__name__, e)
+            raise
+        # 为什么：上传成功 info 配对"启动浏览器"日志
+        logger.info("[task_id=%s] _do_upload: upload flow completed successfully", task_id)
 
         return {"publish_url": None}
 
@@ -550,7 +669,7 @@ class SAUAgent:
         filename = url.split("/")[-1].split("?")[0] or f"file_{uuid.uuid4().hex[:8]}"
         local_path = temp_dir / filename
 
-        print(f"[Agent] Downloading {url} -> {local_path}")
+        logger.info("_download_file: url=%s -> local=%s", url, local_path)
         resp = http_requests.get(url, stream=True, timeout=300)
         resp.raise_for_status()
         with open(local_path, "wb") as f:
@@ -570,7 +689,10 @@ class SAUAgent:
 
 def main():
     """Entry point for the SAU WebSocket Agent."""
-    print("[Agent] WARNING: sau_agent.py is DEPRECATED. Please use sau-service instead.")
+    _setup_agent_logging()
+    # 为什么：解析命令行 info——虽然该入口主要靠环境变量，但留痕便于排障
+    logger.info("main: parsing CLI args (sau_agent.py legacy mode). argv=%s", sys.argv[1:])
+    logger.warning("main: sau_agent.py is DEPRECATED — users should prefer sau-service")
     config = {
         "server_url": os.environ.get(
             "SAU_SERVER_WS", "ws://127.0.0.1:8888/opcgeo/agent/ws"
@@ -582,18 +704,20 @@ def main():
     }
 
     if not config["agent_token"]:
-        print("[Agent] WARNING: No agent token set. Use SAU_AGENT_TOKEN env var.")
+        logger.warning("main: no SAU_AGENT_TOKEN env var set")
 
     available = discover_available_platforms()
-    print(f"[Agent] SAU Agent starting (id={config['agent_id']})")
-    print(f"[Agent] Server: {config['server_url']}")
-    print(f"[Agent] Available platforms: {available}")
+    # 为什么：main 启动 info（版本+URL+账号扫描数）——确认入口参数
+    logger.info("main: SAU Agent legacy starting — version=%s server_url=%s scanned_platforms=%d (agent_id_prefix=%s...)",
+                APP_VERSION, config["server_url"], len(available),
+                config["agent_id"][:8] if config["agent_id"] else "")
+    logger.info("main: available platforms=%s", available)
 
     agent = SAUAgent(config)
     try:
         asyncio.run(agent.start())
     except KeyboardInterrupt:
-        print("\n[Agent] Shutting down...")
+        logger.info("main: KeyboardInterrupt — shutting down gracefully")
         agent.running = False
 
 
