@@ -282,7 +282,13 @@ class ServiceController:
     # 退出清理
     # ------------------------------------------------------------------
     def on_exit(self, icon: object) -> None:
-        """退出清理：关闭 GUI/托盘 → 停止服务 → 终止进程 → 释放锁。"""
+        """退出清理：关闭 GUI/托盘 → 停止服务（带等待与超时保护） → 终止进程 → 释放锁。
+
+        关键约束：无论 UAC 是否确认、服务是否停得下来，托盘都必须能退出，
+        绝不永久挂起。
+        """
+        logger.info("on_exit: 开始退出清理")
+
         # 1. 停止后台线程
         self.stop_background_threads()
 
@@ -290,37 +296,93 @@ class ServiceController:
         try:
             gui_thread.stop()
         except Exception:
-            pass
+            logger.exception("on_exit: 停止 GUI 线程异常")
 
         # 3. 等待登录线程结束
         try:
             for t in gui_thread.get_login_threads():
                 t.join(timeout=2.0)
         except Exception:
-            pass
+            logger.exception("on_exit: 等待登录线程异常")
 
-        # 4. 服务控制 + 进程清理 + 释放锁
-        try:
+        # 4. 停服：elevated_service_control 会阻塞在 UAC 确认框，
+        #    故放入独立线程并 join(15) 防护；超时/UAC 拒绝均不阻塞退出。
+        stop_error: dict[str, Any] = {}
+
+        def _do_stop() -> None:
             try:
                 system_svc.elevated_service_control("stop")
-                time.sleep(1)
-            except Exception:
-                pass
+            except Exception as e:  # 含 UAC 拒绝（ShellExecute code=5）
+                stop_error["error"] = e
 
+        stop_thread = threading.Thread(
+            target=_do_stop, daemon=True, name="SAU-Exit-StopSvc",
+        )
+        stop_thread.start()
+        stop_thread.join(timeout=15)
+
+        if stop_thread.is_alive():
+            logger.warning("on_exit: 等待 UAC 确认停服超时(15s)，继续兜底清理")
+            try:
+                show_notify("UAC 未确认，服务可能未停止")
+            except Exception:
+                logger.exception("on_exit: UAC 超时提示发送失败")
+        elif stop_error.get("error") is not None:
+            logger.warning("on_exit: 停服请求失败（可能 UAC 拒绝）: %r", stop_error["error"])
+            try:
+                show_notify("UAC 未确认，服务可能未停止")
+            except Exception:
+                logger.exception("on_exit: UAC 拒绝提示发送失败")
+        else:
+            # stop 只发控制码立即返回，需轮询确认实际停机（与“停止服务”菜单一致）
+            # 先查一次状态：服务未安装/状态不可查/已停止时无需空等 30s
+            from sau_service.service_host import get_service_status
+            need_wait = True
+            try:
+                current = get_service_status()
+                if current == "stopped" or current.startswith("not installed") or current.startswith("unknown"):
+                    logger.info("on_exit: 服务当前状态 %s，无需等待停机", current)
+                    need_wait = False
+            except Exception:
+                logger.exception("on_exit: 停机前查询服务状态异常，按需要等待处理")
+            if need_wait:
+                logger.info("on_exit: 停服控制码已发出，轮询等待服务停止")
+                try:
+                    self._wait_for_status("stopped", timeout=30)
+                    logger.info("on_exit: 服务已确认停止")
+                except Exception as e:
+                    logger.warning("on_exit: 服务 30s 内未停止，继续兜底清理: %s", e)
+                    try:
+                        show_notify("服务未能在 30 秒内停止，继续退出清理")
+                    except Exception:
+                        logger.exception("on_exit: 停服超时提示发送失败")
+
+        # 5. 进程清理（互斥锁延后到 icon.stop() 之后释放，见步骤 7）
+        try:
             cleanup_lock = gui_thread.get_cleanup_lock()
             with cleanup_lock:
                 if not gui_thread.is_cleanup_done():
                     system_svc.kill_sau_processes()
-                    system_svc.release_single_instance()
                     gui_thread.set_cleanup_done()
+            logger.info("on_exit: 进程清理完成")
         except Exception:
-            pass
+            logger.exception("on_exit: 进程清理异常")
 
-        # 5. 停止托盘图标
+        # 6. 停止托盘图标
         try:
             icon.stop()
         except Exception:
-            pass
+            logger.exception("on_exit: 停止托盘图标异常")
+
+        # 7. 释放单实例互斥锁（尽量靠后：icon.stop() 异常时避免无锁窗口
+        #    导致用户重启出双实例）
+        try:
+            system_svc.release_single_instance()
+            logger.info("on_exit: 单实例互斥锁已释放")
+        except Exception:
+            logger.exception("on_exit: 释放互斥锁异常")
+
+        logger.info("on_exit: 退出清理完成")
 
     # ------------------------------------------------------------------
     # 内部：状态轮询

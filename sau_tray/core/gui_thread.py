@@ -123,11 +123,33 @@ def stop() -> None:
     if _gui_thread is not None and _gui_thread.is_alive() and _gui_root is not None:
         try:
             import ctypes
+            user32 = ctypes.windll.user32
+            # 声明类型避免 64 位下句柄被默认 c_int 截断
+            user32.GetParent.argtypes = (ctypes.c_void_p,)
+            user32.GetParent.restype = ctypes.c_void_p
+            user32.PostMessageW.argtypes = (
+                ctypes.c_void_p, ctypes.c_uint, ctypes.c_void_p, ctypes.c_long,
+            )
+            user32.PostMessageW.restype = ctypes.c_int
             hwnd = _gui_root.winfo_id()
+            # winfo_id() 可能返回子窗口句柄，WM_CLOSE 需发给 toplevel：
+            # 先取 GetParent，再回退 wm_frame（Tk 顶层窗口句柄）
+            parent = ctypes.windll.user32.GetParent(hwnd)
+            if parent:
+                hwnd = parent
+            else:
+                try:
+                    frame = _gui_root.wm_frame()
+                    hwnd = int(frame, 16)
+                except (TypeError, ValueError):
+                    try:
+                        hwnd = int(_gui_root.wm_frame())
+                    except (TypeError, ValueError):
+                        pass
             ctypes.windll.user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
             _gui_thread.join(timeout=2.0)
         except Exception:
-            pass
+            logger.warning("GUI 线程 PostMessageW 兜底失败", exc_info=True)
 
     _gui_root = None
     _gui_thread = None

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import os
 import sys
 import threading
 from pathlib import Path
@@ -63,6 +64,9 @@ _settings_ctrl: SettingsController | None = None
 _login_ctrl: LoginController | None = None
 _service_ctrl: ServiceController | None = None
 
+# 退出幂等闸门：退出清理进行中时重复点击“退出服务”直接忽略
+_exit_in_progress = threading.Event()
+
 
 # ---------------------------------------------------------------------------
 # 菜单回调（仅事件转发到 Controller）
@@ -77,7 +81,12 @@ def _on_settings(icon: Any, item: Any) -> None:
 
 
 def _on_exit_tray(icon: Any, item: Any) -> None:
-    """退出：委托给 ServiceController（异步执行）。"""
+    """退出：委托给 ServiceController（异步执行，重复点击忽略）。"""
+    if _exit_in_progress.is_set():
+        logger.info("退出清理已在进行中，忽略重复点击")
+        return
+    _exit_in_progress.set()
+
     def _do_exit() -> None:
         _service_ctrl.on_exit(icon)
     threading.Thread(target=_do_exit, daemon=True, name="SAU-Exit").start()
@@ -128,6 +137,49 @@ def _build_menu() -> Any:
 
 
 # ---------------------------------------------------------------------------
+# 文件日志（带轮转 + 权限回退）
+# ---------------------------------------------------------------------------
+def _setup_file_logging() -> None:
+    r"""为 root logger 追加 RotatingFileHandler（5MB × 3 份）。
+
+    首选 SAU_HOME\logs；%ProgramData%\SAU\logs 普通用户可能无写
+    权限，失败则回退 %LOCALAPPDATA%\SAU\logs；两级都失败时把告警
+    追加写到 exe 目录 sau-tray-crash.log（不阻断启动）。
+    """
+    from logging.handlers import RotatingFileHandler
+
+    candidates = [SAU_HOME / "logs"]
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if local_appdata:
+        candidates.append(Path(local_appdata) / "SAU" / "logs")
+
+    last_err: Exception | None = None
+    for log_dir in candidates:
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            logging.getLogger().addHandler(
+                RotatingFileHandler(
+                    log_dir / "sau-tray.log",
+                    maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8",
+                )
+            )
+            return
+        except Exception as e:
+            last_err = e
+            logging.warning("无法创建文件日志目录 %s: %s", log_dir, e)
+
+    # 两级都失败：把告警追加写到 exe 目录 sau-tray-crash.log
+    try:
+        import datetime
+        exe_dir = Path(sys.executable if sys.executable.lower().endswith(".exe") else __file__).resolve().parent
+        ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open(exe_dir / "sau-tray-crash.log", "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] 警告: 文件日志创建失败（SAU_HOME 与 LOCALAPPDATA 均不可写）: {last_err}\n")
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # 主入口
 # ---------------------------------------------------------------------------
 def run_tray() -> None:
@@ -140,6 +192,11 @@ def run_tray() -> None:
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    # 生产环境 --windows-console-mode=disable 导致 stderr 丢失，
+    # 必须追加文件日志供排障取证。首选 SAU_HOME\logs；普通用户
+    # 可能无写权限时回退 %LOCALAPPDATA%\SAU\logs；两级都失败时
+    # 把告警追加写到 exe 目录 sau-tray-crash.log。
+    _setup_file_logging()
     logger.info("SAU Tray starting (SAU_HOME=%s)", SAU_HOME)
 
     # 后台预加载机器码
@@ -179,7 +236,7 @@ def run_tray() -> None:
         try:
             gui_thread.stop()
         except Exception:
-            pass
+            logger.exception("run_tray: 停止 GUI 线程异常")
         # 安全网：确保 SAU 进程被清理
         cleanup_lock = gui_thread.get_cleanup_lock()
         with cleanup_lock:
@@ -187,7 +244,7 @@ def run_tray() -> None:
                 try:
                     system_svc.kill_sau_processes()
                 except Exception:
-                    pass
+                    logger.exception("run_tray: 兜底进程清理异常")
                 system_svc.release_single_instance()
                 gui_thread.set_cleanup_done()
         logger.info("SAU Tray stopped")
