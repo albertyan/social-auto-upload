@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import sqlite3
 import threading
@@ -17,6 +18,24 @@ from conf import BASE_DIR
 from sau_agent_pkg.db_init import DB_PATH
 from myUtils.login import get_tencent_cookie, douyin_cookie_gen, get_ks_cookie, xiaohongshu_cookie_gen
 from myUtils.postVideo import post_video_tencent, post_video_DouYin, post_video_ks, post_video_xhs
+
+# ---------------------------------------------------------------------------
+# 日志初始化（带时间戳）
+# ---------------------------------------------------------------------------
+# 为什么在 sau_backend.py 里显式初始化：该文件里历史遗留了大量 print(...) 裸输出，
+# 打包后排查"发布失败发生在几点"/"cookie 检查异常发生在几点"完全无从下手。
+# 把格式和其他入口（tray_app / runner.py / service_host.py）统一为 `YYYY-MM-DD HH:mm:ss`，
+# 跨模块 grep 排障时时间线能严格对齐。
+_BACKEND_FMT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+_BACKEND_DATEFMT = "%Y-%m-%d %H:%M:%S"
+logging.basicConfig(
+    level=logging.INFO,
+    format=_BACKEND_FMT,
+    datefmt=_BACKEND_DATEFMT,
+    force=True,  # 防止被 Nuitka/子进程预配置的空 handler 覆盖
+)
+# logger name = sau_backend，日志里一眼就能看出是旧 Web 端哪条链路
+logger = logging.getLogger("sau_backend")
 
 active_queues = {}
 app = Flask(__name__)
@@ -67,7 +86,7 @@ def upload_file():
     try:
         # 保存文件到指定位置
         uuid_v1 = uuid.uuid1()
-        print(f"UUID v1: {uuid_v1}")
+        logger.debug("upload_file UUID v1: %s", uuid_v1)  # 追踪视频文件时可用来关联上传时刻
         safe_name = secure_filename(file.filename)
         if not safe_name:
             return jsonify({"code": 400, "data": None, "msg": "Invalid filename"}), 400
@@ -125,7 +144,7 @@ def upload_save():
     try:
         # 生成 UUID v1
         uuid_v1 = uuid.uuid1()
-        print(f"UUID v1: {uuid_v1}")
+        logger.debug("upload_save UUID v1: %s original_filename=%s", uuid_v1, file.filename)
 
         # 构造文件名和路径
         final_filename = f"{uuid_v1}_{filename}"
@@ -141,7 +160,8 @@ def upload_save():
             VALUES (?, ?, ?)
                                 ''', (filename, round(float(os.path.getsize(filepath)) / (1024 * 1024),2), final_filename))
             conn.commit()
-            print("✅ 上传文件已记录")
+            logger.info("✅ 上传文件已记录到 file_records: %s (%.2f MB)", final_filename,
+                        round(float(os.path.getsize(filepath)) / (1024 * 1024),2))
 
         return jsonify({
             "code": 200,
@@ -153,7 +173,7 @@ def upload_save():
         }), 200
 
     except Exception as e:
-        print(f"Upload failed: {e}")
+        logger.error("upload_save 失败: %s", e, exc_info=True)  # 上传失败很容易被用户抱怨，需要完整堆栈+时间戳
         return jsonify({
             "code": 500,
             "msg": f"upload failed: {e}",
@@ -212,9 +232,13 @@ def getAccounts():
             rows = cursor.fetchall()
             rows_list = [list(row) for row in rows]
 
-            print("\n📋 当前数据表内容（快速获取）：")
-            for row in rows:
-                print(row)
+            print_rows = [list(row) for row in rows]
+
+            # 为什么把 print 替换为 logger.debug：
+            # 之前直接 print(📋 当前数据表内容) 属于纯调试输出，带时间戳后能知道什么时候发生的，
+            # 又因为每次 getAccounts 都会调用，调试量比较大，故用 debug 级别——
+            # 默认 INFO 级别下不会刷屏，用户要排障时才会开到 DEBUG 看。
+            logger.debug("📋 当前数据表内容（快速获取）: %s", print_rows)
 
             return jsonify(
                 {
@@ -223,7 +247,7 @@ def getAccounts():
                     "data": rows_list
                 }), 200
     except Exception as e:
-        print(f"获取账号列表时出错: {str(e)}")
+        logger.error("获取账号列表时出错: %s", str(e), exc_info=True)  # exc_info=True 留堆栈，便于排查 SQLite 连接/查询异常根因
         return jsonify({
             "code": 500,
             "msg": f"获取账号列表失败: {str(e)}",
@@ -246,15 +270,14 @@ async def getValidAccounts():
         SELECT * FROM user_info''')
         rows = cursor.fetchall()
         rows_list = [list(row) for row in rows]
-        print("\n📋 当前数据表内容：")
-        for row in rows:
-            print(row)
-        for row in rows_list:
+        # 调试信息：当前 user_info 原始行
+        logger.debug("📋 当前数据表内容（检查前）: %s", rows_list)
+        for i, row in enumerate(rows_list):
             try:
                 flag = await check_cookie(row[1], row[2])
             except Exception as e:
-                # 单账号检查异常：打印错误 + 按无效处理，避免整个接口抛 500
-                print(f"⚠️  检查账号 {row[3]} (type={row[1]}) 时异常: {str(e)}")
+                # 单账号检查异常：warning 级（因为 cookie 本身可能没问题，是环境/浏览器异常），并带堆栈方便定位是哪一个 check_cookie 抛错
+                logger.warning("⚠️  检查账号 %s (type=%s) 时异常: %s", row[3], row[1], str(e), exc_info=True)
                 flag = False
             if flag:
                 # cookie 有效：更新状态为 1，并写库（前端才能显示"正常"）
@@ -265,7 +288,7 @@ async def getValidAccounts():
                 WHERE id = ?
                 ''', (1, row[0]))
                 conn.commit()
-                print(f"✅ 账号 {row[3]} cookie 有效，状态已更新")
+                logger.info("✅ 账号 %s cookie 有效，状态已更新", row[3])
             else:
                 # cookie 无效：更新状态为 0，并写库
                 row[4] = 0
@@ -275,10 +298,8 @@ async def getValidAccounts():
                 WHERE id = ?
                 ''', (0, row[0]))
                 conn.commit()
-                print(f"❌ 账号 {row[3]} cookie 无效，状态已更新")
-        print("📋 验证后账号状态：")
-        for row in rows_list:
-            print(row)
+                logger.warning("❌ 账号 %s cookie 无效，状态已更新", row[3])
+        logger.debug("📋 验证后账号状态: %s", rows_list)
         return jsonify(
                         {
                             "code": 200,
@@ -321,12 +342,12 @@ def delete_file():
             if file_path.exists():
                 try:
                     file_path.unlink()  # 删除文件
-                    print(f"✅ 实际文件已删除: {file_path}")
+                    logger.info("✅ 实际文件已删除: %s", file_path)
                 except Exception as e:
-                    print(f"⚠️ 删除实际文件失败: {e}")
+                    logger.warning("⚠️ 删除实际文件失败: %s", e, exc_info=True)
                     # 即使删除文件失败，也要继续删除数据库记录，避免数据不一致
             else:
-                print(f"⚠️ 实际文件不存在: {file_path}")
+                logger.debug("⚠️ 实际文件不存在: %s", file_path)
 
             # 删除数据库记录
             cursor.execute("DELETE FROM file_records WHERE id = ?", (file_id,))
@@ -386,9 +407,9 @@ def delete_account():
                 if cookie_file_path.exists():
                     try:
                         cookie_file_path.unlink()
-                        print(f"✅ Cookie文件已删除: {cookie_file_path}")
+                        logger.info("✅ Cookie文件已删除: %s", cookie_file_path)
                     except Exception as e:
-                        print(f"⚠️ 删除Cookie文件失败: {e}")
+                        logger.warning("⚠️ 删除Cookie文件失败: %s", e, exc_info=True)
 
             # 删除数据库记录
             cursor.execute("DELETE FROM user_info WHERE id = ?", (account_id,))
@@ -421,7 +442,7 @@ def login():
     active_queues[id] = status_queue
 
     def on_close():
-        print(f"清理队列: {id}")
+        logger.info("SSE 连接关闭，清理队列: %s", id)  # 加时间戳后能知道某个登录 SSE 流断开发生在几点，排查用户反馈"登录卡住没反应"时非常有用
         del active_queues[id]
     # 启动异步任务线程
     thread = threading.Thread(target=run_async_function, args=(type,id,status_queue), daemon=True)
@@ -470,9 +491,12 @@ def postVideo():
     if not title:
         return jsonify({"code": 400, "msg": "标题不能为空", "data": None}), 400
 
-    # 打印获取到的数据（仅作为示例）
-    print("File List:", file_list)
-    print("Account List:", account_list)
+    # 为什么把 print 替换为 logger.debug：
+    # file_list/account_list 属于请求参数调试信息，每次发布都会输出，量比较大，
+    # 用 debug 级别避免 INFO 级别下刷屏；但一旦需要排障「用户到底传了什么账号/文件组合过来」，
+    # 切换到 DEBUG 就能看到带时间戳的完整记录。
+    logger.debug("File List: %s", file_list)
+    logger.debug("Account List: %s", account_list)
 
     try:
         match type:
@@ -499,7 +523,7 @@ def postVideo():
                 "data": None
             }), 200
     except Exception as e:
-        print(f"发布视频时出错: {str(e)}")
+        logger.error("发布视频时出错: %s", str(e), exc_info=True)  # 留堆栈：post_video_* 内部通常跑 Playwright，浏览器崩溃/超时最需要看堆栈
         return jsonify({
             "code": 500,
             "msg": f"发布失败: {str(e)}",
@@ -568,9 +592,8 @@ def postVideoBatch():
         videos_per_day = data.get('videosPerDay')
         daily_times = data.get('dailyTimes')
         start_days = data.get('startDays')
-        # 打印获取到的数据（仅作为示例）
-        print("File List:", file_list)
-        print("Account List:", account_list)
+        logger.debug("Batch - File List: %s", file_list)  # 批量发布场景下 file_list/account_list 输出较大，仍用 debug
+        logger.debug("Batch - Account List: %s", account_list)
         match type:
             case 1:
                 post_video_xhs(title, file_list, tags, account_list, category, enableTimer, videos_per_day, daily_times,
@@ -659,7 +682,7 @@ def upload_cookie():
         }), 200
 
     except Exception as e:
-        print(f"上传Cookie文件时出错: {str(e)}")
+        logger.error("上传Cookie文件时出错: %s", str(e), exc_info=True)  # 文件上传相关的异常（磁盘满/权限错/路径遍历攻击）必须留堆栈
         return jsonify({
             "code": 500,
             "msg": f"上传Cookie文件失败: {str(e)}",
@@ -705,7 +728,7 @@ def download_cookie():
         )
 
     except Exception as e:
-        print(f"下载Cookie文件时出错: {str(e)}")
+        logger.error("下载Cookie文件时出错: %s", str(e), exc_info=True)  # 留堆栈：定位到底是文件不存在、权限、还是路径遍历防护被触发
         return jsonify({
             "code": 500,
             "msg": f"下载Cookie文件失败: {str(e)}",
@@ -820,7 +843,12 @@ def send_callback(task):
             if resp.status_code < 300:
                 return
         except Exception as e:
-            print(f"[v2] Callback attempt {attempt + 1} failed: {e}")
+            # warning 级：偶尔 callback 失败（服务端短暂不可达）不致命，重试 3 次
+            # 但必须留时间戳（重试间隔是指数退避 1s/2s/4s，排障时需要准确知道每次是几点重试的）
+            logger.warning(
+                "[v2] Callback attempt %d/3 failed task_id=%s url=%s error=%s",
+                attempt + 1, task.get("task_id"), callback_url, str(e),
+            )
         time.sleep(2 ** attempt)
 
 
@@ -1002,9 +1030,16 @@ def execute_publish_task(task, file_path, title, tags, description, scheduled_at
             loop.close()
 
         update_task(task["task_id"], status="success")
-        print(f"[v2] Task {task['task_id']} ({platform_key}) succeeded.")
+        logger.info(
+            "[v2] Task %s (%s) succeeded. material_id=%s",
+            task.get("task_id"), platform_key, material_id,
+        )
     except Exception as e:
-        print(f"[v2] Task {task['task_id']} failed: {e}")
+        logger.error(
+            "[v2] Task %s (%s) failed: %s",
+            task.get("task_id"), task.get("platform_key"), str(e),
+            exc_info=True,  # 发布失败通常带浏览器异常，必须留堆栈
+        )
         update_task(task["task_id"], status="failed", error=str(e))
     finally:
         # Reload task for callback
@@ -1050,9 +1085,20 @@ def execute_login_task(task, platform_key, account_name):
             # setup returned True/non-dict — treat as success
             update_task(task["task_id"], status="success")
 
-        print(f"[v2] Login task {task['task_id']} ({platform_key}) completed.")
+        # 日志里明确打印 setup 返回的 success / message，定位「登录没拿到 cookie」问题
+        logger.info(
+            "[v2] Login task %s (%s) completed. account=%s result_type=%s success=%s message=%s",
+            task.get("task_id"), platform_key, account_name,
+            type(result).__name__,
+            (result.get("success") if isinstance(result, dict) else None),
+            (result.get("message") if isinstance(result, dict) else "N/A"),
+        )
     except Exception as e:
-        print(f"[v2] Login task {task['task_id']} failed: {e}")
+        logger.error(
+            "[v2] Login task %s (%s) failed: %s",
+            task.get("task_id"), platform_key, str(e),
+            exc_info=True,  # 登录流程经常是 Playwright 异常，必须留堆栈
+        )
         update_task(task["task_id"], status="failed", error=str(e))
 
 

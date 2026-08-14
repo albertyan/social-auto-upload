@@ -142,6 +142,11 @@ def build_common_args(name: str, version: str) -> list[str]:
         "--include-module=asyncio",
         "--include-module=ssl",
         "--include-module=_ssl",
+        # ── websockets 12.x 懒加载保护：
+        # websockets.imports.py 用 import_name() 动态加载 websockets.asyncio.*，
+        # Nuitka 静态扫描无法识别，必须显式 include 整个 websockets 包，
+        # 否则打包后报 ModuleNotFoundError: No module named 'websockets.asyncio'
+        "--include-package=websockets",
         # ── pywin32 依赖（win32serviceutil 间接需要）──
         "--include-module=win32timezone",
         "--include-module=win32con",

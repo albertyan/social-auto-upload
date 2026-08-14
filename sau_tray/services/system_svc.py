@@ -87,11 +87,57 @@ def release_single_instance() -> None:
 def elevated_service_control(action: str) -> None:
     """通过 ShellExecute "runas" 提权执行服务控制命令（触发 UAC）。
 
-    使用 SW_HIDE(0) 避免 CMD 窗口闪烁。
+    增强：如果 action in ('start', 'restart') 且服务未注册（1060），
+    会先提权跑 `sau-service.exe install` 自动完成注册，再执行用户
+    请求的 start/restart。为什么要这么做？
+
+        因为 post-install.bat Step 2（`sau-service.exe install`）的成功
+        并不总是可保证 —— 安装阶段可能因为权限 / Defender / 旧服务
+        进程还在占用等原因静默失败，bat 里虽然打了警告但不会阻断安装，
+        导致用户启动托盘 app 后看到反复的 1060 "指定的服务未安装"。
+        这里增加"按需自动注册"兜底，就是用户第一次点"启动服务"时
+        帮他把注册流程再跑一遍，既省用户手动跑命令，又能把 1060 自动
+        消灭掉（即便安装包阶段漏装了也不影响最终使用）。
     """
     exe_path = str(Path(sys.executable).resolve().parent / "sau-service.exe")
     if not Path(exe_path).is_file():
         raise FileNotFoundError(f"找不到服务程序: {exe_path}")
+
+    # 前置自动注册：start/restart 场景先检测服务是否存在
+    if action in ("start", "restart"):
+        try:
+            from sau_service.service_host import get_service_status
+            status_before = get_service_status()
+            logger.info(
+                "elevated_service_control: start/restart 前置检查 get_service_status = %s",
+                status_before,
+            )
+            if isinstance(status_before, str) and "not installed" in status_before.lower():
+                logger.warning(
+                    "elevated_service_control: 服务未安装（1060），先提权执行 %s install 自动注册",
+                    exe_path,
+                )
+                r_inst = ctypes.windll.shell32.ShellExecuteW(
+                    None, "runas", exe_path, "install", None, 0,  # SW_HIDE
+                )
+                logger.info(
+                    "elevated_service_control: 自动注册 install ShellExecuteW result=%d",
+                    r_inst,
+                )
+                # 注册成功（>32）后留 3s 给 SCM 写注册表/同步状态，
+                # 避免后面 start 立刻再报 1060
+                if r_inst > 32:
+                    time.sleep(3)
+                else:
+                    logger.error(
+                        "elevated_service_control: 自动注册 install 失败 ShellExecuteW code=%d",
+                        r_inst,
+                    )
+        except Exception as e:
+            logger.warning(
+                "elevated_service_control: 自动注册前置检查异常，跳过自动 install: %s",
+                e,
+            )
 
     # [修复 #2a] 使用 SW_HIDE(0) 替代 SW_SHOWNORMAL(1)，避免 CMD 窗口闪烁
     result = ctypes.windll.shell32.ShellExecuteW(

@@ -29,6 +29,15 @@ from typing import Any, Optional
 import websockets
 from websockets.exceptions import ConnectionClosed
 
+# 为什么要显式 import websockets.asyncio.client：
+# websockets 12.x 开始把 connect() 等 API 搬到了 websockets.asyncio.client，
+# 顶层的 websockets.connect() 实际是通过 websockets/imports.py 中的
+# 动态 import_name("websockets.asyncio.client") 进行懒加载的。
+# Nuitka 的静态依赖扫描无法追踪这种运行时字符串导入，会把 websockets/asyncio
+# 整个目录从打包产物中漏掉，导致打包后报 ModuleNotFoundError: No module named 'websockets.asyncio'。
+# 这里加一条显式 import 后，Nuitka 会静态识别并强制收集 websockets.asyncio.* 全部子模块。
+import websockets.asyncio.client  # noqa: F401 （此 import 用于打包依赖收集，不直接使用）
+
 from sau_agent_pkg import accounts
 from sau_agent_pkg.config import SAU_HOME, load_config, load_token, save_config, save_token
 from sau_agent_pkg.db_init import get_connection

@@ -17,6 +17,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -90,6 +91,25 @@ def _resolve_project_root() -> str:
 _PROJECT_ROOT = _resolve_project_root()
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
+
+# ---------------------------------------------------------------------------
+# 强制 WindowsSelectorEventLoopPolicy（Windows 平台）
+# ---------------------------------------------------------------------------
+# 为什么必须全局强制：
+#   Python 3.8+ Windows 默认使用 WindowsProactorEventLoopPolicy，
+#   它基于 I/O Completion Port 管理匿名管道 stdin/stdout/stderr 子进程。
+#   用户提供的报错日志显示了典型的 Proactor 竞态：
+#     _ProactorBasePipeTransport._call_connection_lost(None)
+#     → base_events._detach → _wakeup
+#     TypeError: 'NoneType' object is not iterable
+#   这是 WindowsProactorEventLoop 在快速关闭匿名管道 transport 时的已知问题，
+#   当 asyncio.run 退栈、事件循环被 close() 调用时，如果 pipe transport 的
+#   _protocol 之一已被置为 None，会在 _wakeup(writer, reader) 里迭代 None 抛异常。
+#   最干净的修复方案（不需要 monkey patch 私有属性）是：
+#   在所有 asyncio.run / get_event_loop 之前就直接切换到 SelectorEventLoopPolicy，
+#   让项目完全绕开 _ProactorBasePipeTransport 类的代码路径。
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())  # type: ignore[attr-defined]
 
 # 垫片：在一切 import sau_cli 前改写 conf.BASE_DIR
 from sau_tray.home_shim import SAU_HOME, apply_home_shim
@@ -293,7 +313,7 @@ if _HAS_PYWIN32:
         # SvcStop：服务停止
         # ------------------------------------------------------------------
         def SvcStop(self) -> None:
-            """服务停止：通知 SCM 正在停止 → 置停止标志 → 等待清理完成。"""
+            """服务停止：通知 SCM 正在停止 → 置停止标志 → 启动 watchdog 自杀线程 → 等待清理完成。"""
             # 为什么：SCM 要求服务立即响应，第一条日志确认 SvcStop 确实被回调到了（某些情况下服务会卡死在 SCM 层面）
             logger.info("SvcStop called by SCM, about to report SERVICE_STOP_PENDING")
             # 报告 SERVICE_STOP_PENDING 并告知 SCM 预计需要 30 秒完成清理
@@ -309,6 +329,43 @@ if _HAS_PYWIN32:
                 self._stop_event.set()
             else:
                 logger.warning("SvcStop: self._stop_event is None (SvcDoRun may not have completed init)")
+
+            # ------------------------------------------------------------------
+            # 服务端 watchdog 自杀线程（客户端 taskkill 的服务端双保险）
+            # ------------------------------------------------------------------
+            # 为什么必须加这个看门狗：
+            #   即使服务端设置了 WindowsSelectorEventLoopPolicy，
+            #   仍可能因用户写的 coroutine 卡死 / 第三方库 deadlock
+            #   导致 asyncio.run(self._main(...)) 根本退不出来 →
+            #   结果就是 SCM 一直显示 SERVICE_STOP_PENDING（stopping）
+            #   就是用户日志里出现的 35 条 status_code=3 stopping，持续 30s+。
+            #   这里起一条 daemon 线程（不阻塞 ServiceFrame 的 SvcStop 返回），
+            #   25s 后不管任何状态直接 os._exit(0) 强制杀自己，
+            #   进程退出 → SCM 立刻把服务切到 stopped（SCM 监控宿主进程句柄）。
+            #   选 25s：给 SCM waitHint=30000 留 5s 余量，又在客户端 30s 等待超时前。
+            def _watchdog_suicide() -> None:
+                try:
+                    time.sleep(25)
+                except Exception:
+                    pass
+                try:
+                    logger.error(
+                        "SvcStop watchdog: stop_event 下发已 25s 但宿主仍未退出，"
+                        "强制 os._exit(0) 自杀，避免 SCM 一直 stopping。"
+                    )
+                except Exception:
+                    pass
+                # 注意：用 os._exit 而不是 sys.exit —— sys.exit 只会抛 SystemExit
+                # 异常，若当前 asyncio.run 外被大 except 吞掉就不会真正退出。
+                # os._exit 直接调用 Windows ExitProcess，不会走清理钩子，
+                # 在 watchdog 这种"最后兜底"场景就是我们要的。
+                try:
+                    os._exit(0)
+                except Exception:
+                    pass
+
+            threading.Thread(target=_watchdog_suicide, daemon=True,
+                             name="SAU-SvcStop-Watchdog").start()
 
 else:
     # ---------------------------------------------------------------------------

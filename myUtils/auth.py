@@ -7,7 +7,7 @@ from xhs import XhsClient
 
 from conf import BASE_DIR, LOCAL_CHROME_HEADLESS
 from utils.base_social_media import set_init_script
-from utils.log import tencent_logger, kuaishou_logger, douyin_logger
+from utils.log import tencent_logger, kuaishou_logger, douyin_logger, xhs_logger
 from pathlib import Path
 from uploader.xhs_uploader.main import sign_local
 
@@ -101,15 +101,22 @@ async def cookie_auth_xhs(account_file):
                     "text=手机号登录, text=扫码登录",
                     timeout=5000,
                 )
-                print("[+] 小红书 cookie 失效，需要重新登录")
+                # 为什么把 print 替换为 xhs_logger.error：
+                # 之前的 print() 完全没有时间戳，打包后出问题时无法定位「cookie 失效是几点发生的」，
+                # 与其它三个平台（抖音/快手/视频号）的业务 logger 风格也不统一，跨模块 grep 排查非常混乱。
+                # 统一用 utils/log.py 里 xhs_logger 业务 log → 自带标准时间戳格式 `YYYY-MM-DD HH:mm:ss`，
+                # 且自动落盘到 logs/xhs.log（loguru create_logger 已配置轮转）。
+                xhs_logger.error("[+] 小红书 cookie 失效，需要重新登录")
                 return False
             except:
                 # 5 秒内没出现登录元素 → 认为 cookie 有效
-                print("[+] 小红书 cookie 有效")
+                xhs_logger.success("[+] 小红书 cookie 有效")
                 return True
         except Exception as e:
             # goto 或其他异常：按 cookie 失效处理，避免整个检查链路崩溃
-            print(f"[+] 小红书 cookie 校验异常: {e}")
+            # 为什么 warning 而非 error：goto 超时/网络波动不等于 cookie 本身坏掉，
+            # 但又需要告警用户（下次自动重试也许会好），warning 级别更准确。
+            xhs_logger.warning(f"[+] 小红书 cookie 校验异常: {e}")
             return False
         finally:
             # 无论成功失败，显式关闭 context 和 browser，避免浏览器进程残留

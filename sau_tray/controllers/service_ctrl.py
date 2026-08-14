@@ -91,6 +91,8 @@ class ServiceController:
     def __init__(self) -> None:
         logger.info("ServiceController 构造函数开始初始化")  # 为什么打这条日志：追踪 ServiceController 初始化
         self._cleanup_done = False
+        self._exit_in_progress = False  # 为什么加这个：on_exit 调用后会置 True，用户再点菜单里的启动/停止服务/重启/退出时，能正确返回"正在退出，请稍候"而不是重复发起服务控制命令（日志里就出现了退出清理 30s 超时期间又点启动服务，导致 SCM 还在 stopping 时就发 start，必然 30s 后提示启动失败）
+        self._exit_lock = threading.Lock()
         self._icon: object | None = None
         # 升级状态
         self._upgrade_state_lock = threading.Lock()
@@ -124,6 +126,72 @@ class ServiceController:
 
     def is_applying(self, upgrade_state: dict[str, Any]) -> bool:
         return upgrade_state.get("phase") == "applying" or bool(self._applying_target_version)
+
+    # ------------------------------------------------------------------
+    # 状态同步 / 兜底
+    # ------------------------------------------------------------------
+    def _refresh_state_from_scm(self, tag: str) -> None:
+        """用 SCM 真实状态立刻回写到 state，保证菜单标记与实际一致。
+
+        为什么需要这个函数：
+            tray_app.py 的菜单项 callable 文本完全依赖 state["service_running"]。
+            但 service_running 只在 _poll_status_loop 每 3s 轮询一次刷新。
+            用户刚点「启动服务」1 秒内如果立刻右键菜单，看到的是上一次轮询结果，
+            就会出现「停止服务前仍显示 ●」（用户以为没启动成功）的视觉错位。
+            另外：_wait_for_status 异常（30s 超时、UAC 拒绝等）也会让 state 停留在旧值，
+            必须主动拉一次 SCM 覆盖。
+        """
+        try:
+            from sau_service.service_host import get_service_status
+            scm_status = get_service_status()
+            # SCM 状态 → service_running 的映射：running / starting → True；其他 False
+            scm_to_running = {
+                "running": True,
+                "starting": True,
+                "stopped": False,
+                "stopping": False,
+            }
+            new_service_running = scm_to_running.get(scm_status, None)
+            logger.info(
+                "_refresh_state_from_scm[%s]: scm_status=%s → state.service_running=%s",
+                tag, scm_status, new_service_running,
+            )
+            state.set_status({
+                "service_running": new_service_running,
+                "_last_scm_status": scm_status,
+                "_last_scm_status_at": time.time(),
+            })
+        except Exception as e:
+            logger.warning(
+                "_refresh_state_from_scm[%s]: get_service_status 异常，state 未刷新: %s",
+                tag, e,
+            )
+
+    @staticmethod
+    def _force_kill_sau_service(tag: str) -> None:
+        """兜底 taskkill /f /t 杀 sau-service.exe 宿主进程。
+
+        为什么需要这个暴力手段：
+            用户日志里出现了 status_code=3 (stopping) 从 00:11:40 一直卡到 00:12:10
+            整整 30s 都没有 → stopped。这是典型的服务宿主进程
+            自己 asyncio 事件循环关不掉（_call_connection_lost TypeError 等异常）
+            导致 SvcDoRun 函数不返回、SCM 一直看到 SERVICE_STOP_PENDING 的状态。
+            Windows SCM 不会主动杀进程（直到服务预设时间阈值到了超时），
+            所以这里要主动 taskkill tree，让宿主立即退出 → SCM 立刻变 stopped。
+        """
+        import subprocess
+        try:
+            logger.warning(
+                "_force_kill_sau_service[%s]: 服务长时间卡在 stopping/starting，强制杀 sau-service.exe",
+                tag,
+            )
+            subprocess.run(
+                ["taskkill", "/f", "/t", "/im", "sau-service.exe"],
+                capture_output=True, timeout=10,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except Exception as e:
+            logger.warning("_force_kill_sau_service[%s] taskkill 失败: %s", tag, e)
 
     # ------------------------------------------------------------------
     # 后台线程：状态轮询 + 图标更新
@@ -169,52 +237,94 @@ class ServiceController:
     # ------------------------------------------------------------------
     # 服务控制
     # ------------------------------------------------------------------
+    def _is_exiting(self, action: str) -> bool:
+        """退出清理过程中拦截所有服务控制/菜单操作，避免用户重复点击导致的竞态。
+
+        为什么要拦截：on_exit 开始执行后（步骤 3/7 停服 + 30s 轮询期间），
+        用户依然可能点开菜单点击「启动服务」或「退出」，日志里就出现了：
+          1) on_exit: 服务 30s 内未停止（stopping）
+          2) 用户点击启动服务 → on_start_service 被调用 → elevated_service_control start 发出
+          3) SCM 还卡在 stopping → _wait_for_status("running", 30s) → 必然 30s 超时 → 提示启动失败
+        拦截后给用户一个"正在退出，请稍候"的 show_notify 就好，不做任何服务控制。
+        """
+        with self._exit_lock:
+            if not self._exit_in_progress:
+                return False
+        logger.info("ServiceController.%s: 退出清理正在进行，本次操作忽略", action)
+        try:
+            show_notify("正在退出，请稍候再操作…", APP_NAME)
+        except Exception:
+            pass
+        return True
+
     def start_service(self) -> None:
         """启动 Windows 服务（异步执行，避免阻塞 pystray 线程）。"""
+        if self._is_exiting("start_service"):
+            return
         logger.info("on_start_service: 执行启动服务命令")  # 为什么打这条日志：追踪用户启动服务的操作
         def _do_start() -> None:
             try:
+                # 启动前先回滚 state：无论之前 service_running 是什么，
+                # 用 SCM 真实状态刷新一次，避免菜单文本依赖的状态与 SCM 不一致。
+                # 这正是「菜单标记仍是停止服务」的根因：之前 state 里 service_running 没有及时同步。
+                self._refresh_state_from_scm("start_service 前")
                 system_svc.elevated_service_control("start")
                 logger.info("on_start_service: 提权成功，start 命令已发出")  # 为什么打这条日志：确认 UAC 提权通过
                 self._wait_for_status("running")
                 logger.info("on_start_service: 服务已达到 running 状态")  # 为什么打这条日志：确认服务启动成功
+                # 成功后再次刷新 state（含 HTTP /status 结果），保证 3s 轮询间隙里的菜单标记立刻显示 ● 停止服务
+                self._refresh_state_from_scm("start_service 后")
                 show_notify("服务已启动")
             except Exception as e:
                 logger.warning("on_start_service: 提权失败或执行异常: %s", e)  # 为什么打这条日志：记录启动失败原因（含 UAC 拒绝）
+                # 启动失败兜底：state.service_running 必须立刻同步为 SCM 真实状态
+                # （否则用户看到的菜单标记就还停留在"停止服务"，和实际不一致）
+                self._refresh_state_from_scm("start_service 异常")
                 show_notify(f"启动服务失败: {e}")
         threading.Thread(target=_do_start, daemon=True, name="SAU-SvcStart").start()
 
     def stop_service(self) -> None:
         """停止 Windows 服务（异步执行，避免阻塞 pystray 线程）。"""
+        if self._is_exiting("stop_service"):
+            return
         logger.info("on_stop_service: 执行停止服务命令")  # 为什么打这条日志：追踪用户停止服务的操作
         def _do_stop() -> None:
             try:
+                self._refresh_state_from_scm("stop_service 前")
                 system_svc.elevated_service_control("stop")
                 logger.info("on_stop_service: 提权成功，stop 命令已发出")  # 为什么打这条日志：确认 UAC 提权通过
                 self._wait_for_status("stopped")
                 logger.info("on_stop_service: 服务已达到 stopped 状态")  # 为什么打这条日志：确认服务停止成功
+                self._refresh_state_from_scm("stop_service 后")
                 show_notify("服务已停止")
             except Exception as e:
                 logger.warning("on_stop_service: 提权失败或执行异常: %s", e)  # 为什么打这条日志：记录停止失败原因（含 UAC 拒绝）
+                self._refresh_state_from_scm("stop_service 异常")
                 show_notify(f"停止服务失败: {e}")
         threading.Thread(target=_do_stop, daemon=True, name="SAU-SvcStop").start()
 
     def restart_service(self) -> None:
         """重启 Windows 服务（异步执行，避免阻塞 pystray 线程）。"""
+        if self._is_exiting("restart_service"):
+            return
         logger.info("on_restart_service: 执行重启服务命令")  # 为什么打这条日志：追踪用户重启服务的操作
         def _do_restart() -> None:
             try:
+                self._refresh_state_from_scm("restart_service 前")
                 system_svc.elevated_service_control("stop")
                 logger.info("on_restart_service: stop 阶段提权成功")  # 为什么打这条日志：确认停止阶段 UAC 通过
                 self._wait_for_status("stopped")
                 time.sleep(1)
+                self._refresh_state_from_scm("restart 中间阶段 stop 完成")
                 system_svc.elevated_service_control("start")
                 logger.info("on_restart_service: start 阶段提权成功")  # 为什么打这条日志：确认启动阶段 UAC 通过
                 self._wait_for_status("running")
                 logger.info("on_restart_service: 服务已重启完成，状态 running")  # 为什么打这条日志：确认服务重启成功
+                self._refresh_state_from_scm("restart_service 后")
                 show_notify("服务已重启")
             except Exception as e:
                 logger.warning("on_restart_service: 提权失败或执行异常: %s", e)  # 为什么打这条日志：记录重启失败原因
+                self._refresh_state_from_scm("restart_service 异常")
                 show_notify(f"重启服务失败: {e}")
         threading.Thread(target=_do_restart, daemon=True, name="SAU-SvcRestart").start()
 
@@ -437,35 +547,46 @@ class ServiceController:
     # 退出清理
     # ------------------------------------------------------------------
     def on_exit(self, icon: object) -> None:
-        """退出清理：关闭 GUI/托盘 → 停止服务（带等待与超时保护） → 终止进程 → 释放锁。
+        """退出清理：停止后台轮询 → 停止服务 → 清理进程 → 停止 GUI → 停止托盘 → 释放锁。
 
-        关键约束：无论 UAC 是否确认、服务是否停得下来，托盘都必须能退出，
-        绝不永久挂起。
+        关键顺序约束（为什么步骤 4「停止 GUI」被延后到步骤 6）：
+          - 步骤 3（服务控制）、步骤 4（清理 sau 进程）中仍需要：
+              ① show_notify/show_info（对话框显示必须要 GUI 线程的消息泵）
+              ② gui_thread.get_cleanup_lock()（GUI 线程的内部状态，停了就拿不到）
+              ③ 升级确认框通过 gui_thread.schedule 调度
+          - 如果在步骤 2 就停 GUI 线程，上面这些功能会静默失效
+          - 结论：GUI 线程应该是倒数第二个才关（icon.stop 之前或之后均可，但必须在所有"可能弹框/对话框"的业务逻辑之后）
+
+        无论 UAC 是否确认、服务是否停得下来，托盘都必须能退出，绝不永久挂起。
         """
+        # 「正在退出」拦截：防止退出清理中再次调用 start_service/stop_service/on_exit（日志里 30s stopping 等待期间用户又点了启动服务）
+        with self._exit_lock:
+            if self._exit_in_progress:
+                logger.info("on_exit: 退出清理已在进行中，忽略重复调用")
+                try:
+                    show_notify("正在退出，请稍候…", APP_NAME)
+                except Exception:
+                    pass
+                return
+            self._exit_in_progress = True
+
         logger.info("on_exit: 开始退出清理")
 
-        # 1. 停止后台线程
-        logger.info("on_exit 清理步骤[1/6]: 停止后台轮询线程（调用 stop_background_threads）")  # 为什么打这条日志：追踪清理步骤顺序
+        # 1. 停止后台轮询
+        logger.info("on_exit 清理步骤[1/7]: 停止后台轮询线程（调用 stop_background_threads）")  # 为什么打这条日志：追踪清理步骤顺序
         self.stop_background_threads()
 
-        # 2. 停止 GUI 线程
-        logger.info("on_exit 清理步骤[2/6]: 停止 GUI 线程（调用 gui_thread.stop）")  # 为什么打这条日志：追踪清理步骤顺序
-        try:
-            gui_thread.stop()
-        except Exception:
-            logger.exception("on_exit: 停止 GUI 线程异常")
-
-        # 3. 等待登录线程结束
-        logger.info("on_exit 清理步骤[3/6]: 等待登录线程结束（轮询线程 join 2s）")  # 为什么打这条日志：追踪清理步骤顺序
+        # 2. 等待登录线程结束（这些线程可能会调 show_* 弹通知，所以放在 GUI 存活期内）
+        logger.info("on_exit 清理步骤[2/7]: 等待登录线程结束（轮询线程 join 2s）")  # 为什么打这条日志：追踪清理步骤顺序
         try:
             for t in gui_thread.get_login_threads():
                 t.join(timeout=2.0)
         except Exception:
             logger.exception("on_exit: 等待登录线程异常")
 
-        # 4. 停服：elevated_service_control 会阻塞在 UAC 确认框，
+        # 3. 停服：elevated_service_control 会阻塞在 UAC 确认框，
         #    故放入独立线程并 join(15) 防护；超时/UAC 拒绝均不阻塞退出。
-        logger.info("on_exit 清理步骤[4/6]: 停止服务（停服+轮询确认，带超时防护）")  # 为什么打这条日志：追踪清理步骤顺序
+        logger.info("on_exit 清理步骤[3/7]: 停止服务（停服+轮询确认，带超时防护）")  # 为什么打这条日志：追踪清理步骤顺序
         stop_error: dict[str, Any] = {}
 
         def _do_stop() -> None:
@@ -516,8 +637,8 @@ class ServiceController:
                     except Exception:
                         logger.exception("on_exit: 停服超时提示发送失败")
 
-        # 5. 进程清理（互斥锁延后到 icon.stop() 之后释放，见步骤 7）
-        logger.info("on_exit 清理步骤[5/6]: 清理 sau 进程（kill_sau_processes）+ 停止托盘 icon.stop")  # 为什么打这条日志：追踪清理步骤顺序
+        # 4. 进程清理（互斥锁延后到 icon.stop() 之后释放，见步骤 7）
+        logger.info("on_exit 清理步骤[4/7]: 清理 sau 进程（kill_sau_processes）")  # 为什么打这条日志：追踪清理步骤顺序
         try:
             cleanup_lock = gui_thread.get_cleanup_lock()
             with cleanup_lock:
@@ -529,16 +650,23 @@ class ServiceController:
         except Exception:
             logger.exception("on_exit: 进程清理异常")
 
-        # 6. 停止托盘图标
+        # 5. 停止 GUI 线程（所有可能弹对话框/通知的业务逻辑必须已经结束）
+        logger.info("on_exit 清理步骤[5/7]: 停止 GUI 线程（调用 gui_thread.stop）")  # 为什么打这条日志：追踪清理步骤顺序
         try:
-            logger.info("on_exit: 执行 icon.stop() 停止托盘图标")  # 为什么打这条日志：确认托盘停止步骤已执行
+            gui_thread.stop()
+        except Exception:
+            logger.exception("on_exit: 停止 GUI 线程异常")
+
+        # 6. 停止托盘图标（停止图标后 icon.notify() 就不能用了，所以 GUI 要先停完）
+        try:
+            logger.info("on_exit 清理步骤[6/7]: 执行 icon.stop() 停止托盘图标")  # 为什么打这条日志：确认托盘停止步骤已执行
             icon.stop()
         except Exception:
             logger.exception("on_exit: 停止托盘图标异常")
 
         # 7. 释放单实例互斥锁（尽量靠后：icon.stop() 异常时避免无锁窗口
         #    导致用户重启出双实例）
-        logger.info("on_exit 清理步骤[6/6]: 释放单实例互斥锁 release_single_instance")  # 为什么打这条日志：追踪清理步骤顺序
+        logger.info("on_exit 清理步骤[7/7]: 释放单实例互斥锁 release_single_instance")  # 为什么打这条日志：追踪清理步骤顺序
         try:
             system_svc.release_single_instance()
             logger.info("on_exit: 单实例互斥锁已释放")
@@ -551,8 +679,28 @@ class ServiceController:
     # 内部：状态轮询
     # ------------------------------------------------------------------
     def _poll_status_loop(self, stop_event: threading.Event) -> None:
-        """后台线程：每 3s 轮询本地 API /status，同一循环顺带 GET /upgrade。"""
+        """后台线程：每 3s 轮询本地 API /status，同一循环顺带 GET /upgrade。
+
+        为什么轮询失败时增加 SCM 状态兜底：
+          - 开发环境下通常用 `python sau_backend.py` 启动进程（本地 5410 端口起得很快）
+          - 打包为 Windows 服务后：
+              1. Session 0 下启动慢（本地 API 服务器 aiohttp 启动会晚于托盘启动 5~10s）
+              2. 即使 SCM 报告服务 running，Local API 可能仍在初始化（init_db / generate_local_token）
+              3. generate_local_token 失败 → 500 auth fail → 轮询一直报通
+              4. 端口冲突 / 绑定失败 → 5410 不通，但 SCM 显示 running
+          - 简单把 service_running 设成 False 会让用户看到"服务未运行"的红叉，但实际上 SCM 已经
+            在正常运行，只是本地 API 还没 ready。
+          - 解决：轮询失败时"相信 Windows SCM 的 running/starting 状态"作为
+            service_running 的兜底，真实反映「服务已启动但本地 API 还没起来」的状态，
+            同时把轮询失败的具体原因（timeout/401/500/refused）打到 warning 日志，便于排障。
+        """
+        # 记录上一次的轮询失败类型，用于去重日志（相同类型不连续打满）
+        last_fail_tag: str | None = None
+
         while not stop_event.is_set():
+            # ------------------------------------------------------------------
+            # 先 GET /upgrade（顺便拿升级状态，失败用缓存）
+            # ------------------------------------------------------------------
             try:
                 fetched = _fetch_local_api("/upgrade")
                 upgrade_state = fetched if isinstance(fetched, dict) else {}
@@ -562,19 +710,105 @@ class ServiceController:
                 self._current_upgrade_state = upgrade_state
             self._track_applying(upgrade_state)
 
+            # ------------------------------------------------------------------
+            # GET /status 拿核心状态
+            # ------------------------------------------------------------------
+            fail_tag: str | None = None
+            scm_running: bool | None = None
+
             try:
                 data = _fetch_local_api("/status")
                 data["service_running"] = True
                 data["updating"] = False
                 state.set_status(data)
                 self._check_apply_result(data)
-            except Exception:
+            except Exception as e:
+                # 细化诊断：区分 timeout / refused / 401 token 错 / 500 token 未生成 / 其他
+                # 为什么：打包后"一直未连接"的用户场景里，最常见的根因 90% 是下面 4 种之一，
+                # 日志里直接写明后用户不用去猜"到底是服务没启动，还是 token 错，还是端口被占"
+                msg = str(e).lower()
+                if isinstance(e, TimeoutError) or "timeout" in msg or "timed out" in msg:
+                    fail_tag = "HTTP_TIMEOUT_2s"
+                    warn_text = (
+                        "status 轮询超时(2s)，可能是服务 Session 0 初始化慢、或网络事件循环阻塞"
+                    )
+                elif "refused" in msg or "winerror 1225" in msg or "connection reset" in msg:
+                    fail_tag = "CONN_REFUSED_5410"
+                    warn_text = (
+                        "本地 API 127.0.0.1:5410 连接被拒绝，可能是："
+                        "① 服务还没真正起来 ② 5410 被其他程序占用 ③ LocalApiServer(aiohttp) 未启动成功"
+                    )
+                elif "401" in msg or "unauthorized" in msg:
+                    fail_tag = "TOKEN_401_MISMATCH"
+                    warn_text = (
+                        "本地 API 鉴权失败(401)：托盘读的 local_token 与服务生成的 token 不一致，"
+                        "可能服务重装后 credential.bin 未同步"
+                    )
+                elif "500" in msg or "local token not configured" in msg:
+                    fail_tag = "TOKEN_500_MISSING"
+                    warn_text = (
+                        "本地 API 返回 500(Local token missing)："
+                        "服务 generate_local_token() 未生成成功，"
+                        "检查 SAU_HOME 目录权限（需允许 SYSTEM 写 local_token.bin）"
+                    )
+                else:
+                    fail_tag = f"STATUS_FETCH_ERR_{type(e).__name__}"
+                    warn_text = f"status 轮询未知异常: {e}"
+
+                # [SCM 兜底] 轮询失败时不要直接把 service_running=False，先查 SCM
+                # 为什么：打包成 Windows 服务后，服务刚启动的几秒里 SCM 显示 running，
+                # 但本地 API 还没 ready，直接报 False 会让用户错觉"服务未启动"
+                try:
+                    from sau_service.service_host import get_service_status
+                    scm_status = get_service_status()
+                    if scm_status in ("running", "starting"):
+                        scm_running = True
+                    elif scm_status in ("stopping", "stopped", "paused", "pausing"):
+                        scm_running = False
+                    else:
+                        scm_running = None  # not installed / unknown → 不兜底
+                except Exception as sce:
+                    fail_tag_suffix = f"+SCM_QUERY_ERR_{type(sce).__name__}"
+                    fail_tag = (fail_tag or "") + fail_tag_suffix if fail_tag else fail_tag_suffix[1:]
+                    scm_running = None
+
+                # service_running 优先级：SCM running/starting → True；SCM stopped → False；其他按 None
+                if scm_running is True:
+                    # 兜底：服务在 SCM 层面是 running，只是本地 API 还没 ready
+                    fallback_service_running = True
+                elif scm_running is False:
+                    fallback_service_running = False
+                else:
+                    # SCM 查询失败 / 未安装：保守认为服务未运行
+                    fallback_service_running = False
+
                 state.set_status({
-                    "service_running": False,
+                    "service_running": fallback_service_running,
                     "ws_connected": False,
                     "clock_sync_status": "unknown",
                     "updating": self.is_applying(upgrade_state),
+                    # SCM 兜底状态备注：如果轮询失败但 SCM running，就把失败信息记到 debug，
+                    # 不影响托盘图标颜色（图标按 fallback_service_running 着色）
                 })
+
+                # 去重日志：同一种失败类型 3s 一轮没必要打满 info，用 warning 不重复打
+                if fail_tag != last_fail_tag:
+                    scm_hint = (
+                        f"（SCM 兜底：service_running={fallback_service_running}，"
+                        f"SCM_status={getattr(self, '_last_scm_status', 'N/A')}）"
+                    )
+                    logger.warning(
+                        "_poll_status_loop: %s fail_tag=%s %s",
+                        warn_text, fail_tag, scm_hint,
+                    )
+                    # 记录最近一次 SCM 状态（下次日志里能看到）
+                    try:
+                        from sau_service.service_host import get_service_status as _gs  # noqa: F811
+                        self._last_scm_status = _gs()
+                    except Exception:
+                        self._last_scm_status = "query_failed"
+            finally:
+                last_fail_tag = fail_tag
 
             self._maybe_prompt_upgrade(upgrade_state)
             stop_event.wait(POLL_INTERVAL)
@@ -746,13 +980,44 @@ class ServiceController:
 
     @staticmethod
     def _wait_for_status(target_status: str, timeout: int = 30) -> None:
-        """轮询等待服务达到目标状态。"""
+        """轮询等待服务达到目标状态。
+
+        修复点（问题 4：stop 卡 stopping 30s 超时）：
+            当目标是 stopped 且轮询期间连续处于 stopping 超过 25s、
+            或目标是 running 且连续处于 starting 超过 25s 时，
+            认为服务宿主进程自己卡了（典型是 asyncio 事件循环关不回来），
+            调用 _force_kill_sau_service 杀掉 sau-service.exe —— 进程消失后
+            SCM 会立刻把状态置为 stopped / stopped-start 失败，从而避免 30s
+            轮询一直停在中间状态最后抛 TimeoutError。
+        """
         from sau_service.service_host import get_service_status
         deadline = time.time() + timeout
+        # 记录连续停在 stopping / starting 的起算时刻
+        pending_since: float | None = None
+        pending_tag: str | None = None
         while time.time() < deadline:
             current = get_service_status()
             if current == target_status:
                 return
+            # 识别 stopping / starting 的长时间停顿：连续同一状态超过 25s
+            if target_status == "stopped" and current == "stopping":
+                if pending_tag == "stopping":
+                    if (time.time() - pending_since) >= 25:
+                        ServiceController._force_kill_sau_service("_wait_for_status: stopping>25s")
+                        pending_tag = None
+                else:
+                    pending_since = time.time()
+                    pending_tag = "stopping"
+            elif target_status == "running" and current == "starting":
+                if pending_tag == "starting":
+                    if (time.time() - pending_since) >= 25:
+                        ServiceController._force_kill_sau_service("_wait_for_status: starting>25s")
+                        pending_tag = None
+                else:
+                    pending_since = time.time()
+                    pending_tag = "starting"
+            else:
+                pending_tag = None
             time.sleep(1)
         raise TimeoutError(
             f"服务未能在 {timeout}s 内达到 {target_status} 状态"

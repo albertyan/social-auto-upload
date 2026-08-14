@@ -123,23 +123,39 @@ def _is_service_running() -> bool:
 
 
 def _text_start_service(item: Any) -> str:
-    """动态"启动服务"文本：服务未运行时前面加 ● 标识。
+    """动态"启动服务"文本。
 
-    为什么要加标识：
-    - 用户右键菜单时能一眼看出当前服务状态，不用点开子菜单再判断
-    - 未运行用 ● 强调"可以执行的操作"
+    按用户要求：
+    - 服务处于运行状态 → 显示「已启动」（同时菜单项置灰，不可点击）
+    - 服务未运行 → 显示「启动服务」（可用）
     """
-    return "● 启动服务" if not _is_service_running() else "启动服务"
+    return "已启动" if _is_service_running() else "启动服务"
 
 
 def _text_stop_service(item: Any) -> str:
-    """动态"停止服务"文本：服务运行时前面加 ● 标识。
+    """动态"停止服务"文本。
 
-    为什么和启动服务互补：
-    - 启动/停止两个菜单项里必有且仅有一个带标识，不会都有或都没有
-    - 用户通过标识位置可以快速知道当前服务是"已停"还是"在跑"
+    按用户要求：
+    - 服务处于运行状态 → 显示「停止服务」（可用）
+    - 服务未运行 → 显示「已停止」（同时菜单项置灰，不可点击）
     """
-    return "● 停止服务" if _is_service_running() else "停止服务"
+    return "停止服务" if _is_service_running() else "已停止"
+
+
+def _enabled_start_service(item: Any) -> bool:
+    """启动菜单项可用性：服务未运行时才允许点击。
+
+    为什么这么设计：
+        当服务已经 running 时再点"启动服务"只会发一条重复 start 命令给 SCM，
+        SCM 会忽略重复 start 但会打日志。直接把菜单项置灰，
+        可以让用户在 UI 上一眼就知道"当前这个操作不能再做"。
+    """
+    return not _is_service_running()
+
+
+def _enabled_stop_service(item: Any) -> bool:
+    """停止菜单项可用性：服务运行时才允许点击。"""
+    return _is_service_running()
 
 
 # 平台登录状态的 scan 结果缓存（3s TTL）
@@ -196,9 +212,18 @@ def _build_menu() -> Any:
     from pystray import MenuItem, Menu
 
     service_items = [
-        # text 传 callable 而不是 str：pystray 每次显示菜单都会重新调用，拿到最新状态标识
-        MenuItem(_text_start_service, lambda icon, item: _service_ctrl.start_service()),
-        MenuItem(_text_stop_service, lambda icon, item: _service_ctrl.stop_service()),
+        # 启动菜单：running → 文本「已启动」+ 置灰；stopped → 文本「启动服务」+ 可用
+        MenuItem(
+            _text_start_service,
+            lambda icon, item: _service_ctrl.start_service(),
+            enabled=_enabled_start_service,
+        ),
+        # 停止菜单：running → 文本「停止服务」+ 可用；stopped → 文本「已停止」+ 置灰
+        MenuItem(
+            _text_stop_service,
+            lambda icon, item: _service_ctrl.stop_service(),
+            enabled=_enabled_stop_service,
+        ),
         MenuItem("重启服务", lambda icon, item: _service_ctrl.restart_service()),
     ]
 
@@ -239,6 +264,13 @@ def _setup_file_logging() -> None:
     """
     from logging.handlers import RotatingFileHandler
 
+    # 统一格式：控制台 + 文件日志都用同样的时间戳格式，
+    # 与 runner.py / service_host.py / sau_agent.py 保持一致（方便跨模块 grep 日志）
+    # 为什么显式写 datefmt：Python 默认 asctime 是 `2003-07-08 16:49:45,896`（逗号毫秒，各版本略有差异）
+    # 显式 `%Y-%m-%d %H:%M:%S` 与其他入口完全对齐，排障时跨文件不会因为时间格式差异产生歧义。
+    _COMMON_FMT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    _COMMON_DATEFMT = "%Y-%m-%d %H:%M:%S"
+
     candidates = [SAU_HOME / "logs"]
     local_appdata = os.environ.get("LOCALAPPDATA")
     if local_appdata:
@@ -249,12 +281,17 @@ def _setup_file_logging() -> None:
     for log_dir in candidates:
         try:
             log_dir.mkdir(parents=True, exist_ok=True)
-            logging.getLogger().addHandler(
-                RotatingFileHandler(
-                    log_dir / "sau-tray.log",
-                    maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8",
-                )
+            fh = RotatingFileHandler(
+                log_dir / "sau-tray.log",
+                maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8",
             )
+            # 文件日志必须独立配置 formatter：
+            # RotatingFileHandler 默认继承 basicConfig 格式（理论上有 asctime），
+            # 但某些 Python 版本/某些 Nuitka 打包后 logger handler 注册顺序会
+            # 导致 fallback 到 root logger 的默认格式（只有 message 没有时间戳），
+            # 这里显式 setFormatter 以保证文件里每行一定有「年-月-日 时:分:秒」时间戳。
+            fh.setFormatter(logging.Formatter(_COMMON_FMT, datefmt=_COMMON_DATEFMT))
+            logging.getLogger().addHandler(fh)
             logger.info("已选定文件日志目录并创建 RotatingFileHandler: %s", log_dir)  # 为什么打这条日志：确认最终使用的日志目录位置
             return
         except Exception as e:
@@ -282,9 +319,17 @@ def run_tray() -> None:
 
     from pystray import Icon
 
+    # 统一日志格式：控制台 + 后续追加的文件日志都按同一个 fmt/datefmt，
+    # 与 runner.py / service_host.py / sau_agent.py / sau_ops.py 保持一致。
+    _COMMON_FMT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    _COMMON_DATEFMT = "%Y-%m-%d %H:%M:%S"
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        format=_COMMON_FMT,
+        datefmt=_COMMON_DATEFMT,
+        force=True,  # 为什么 force=True：Nuitka 打包或某些热重载场景下 root logger 之前已经被 basicConfig 初始化过；
+                    # Python 3.8+ 默认不会覆盖已有 handler 的 formatter，会导致"明明写了 format 但日志还是没时间戳"
+                    # 的诡异问题。force=True 强制重新配置 root logger，确保所有 handler 都用我们指定的格式。
     )
     # 生产环境 --windows-console-mode=disable 导致 stderr 丢失，
     # 必须追加文件日志供排障取证。首选 SAU_HOME\logs；普通用户
@@ -326,6 +371,139 @@ def run_tray() -> None:
     # 注入图标引用
     dialogs.set_icon(icon)
     _service_ctrl.set_icon(icon)
+
+    # ------------------------------------------------------------------
+    # 启动 Banner：连通性 + 环境自检日志
+    # （为什么放在这里：此时 Controller 已实例化、GUI 线程已启动、日志写入可用，
+    #  打包安装后用户反馈"托盘一直未连接"时，只看这份 Banner 就能定位根因，
+    #  不需要让用户再跑诊断脚本）
+    # ------------------------------------------------------------------
+    def _startup_self_check() -> None:
+        """后台执行一次性自检，结果打到 info 日志（不阻塞托盘启动）。"""
+        try:
+            import urllib.request
+            import urllib.error
+            import socket
+            from sau_service.service_host import get_service_status
+            from sau_agent_pkg.config import load_local_token
+
+            # 1) Windows SCM 层面服务状态（这是最权威的状态，比本地 API 准）
+            try:
+                scm_status = get_service_status()
+            except Exception as se:
+                scm_status = f"query_error:{type(se).__name__}:{se}"
+
+            # 2) local_token.bin 是否存在 + 长度（500=token 未生成；401=token 不匹配）
+            try:
+                token = load_local_token() or ""
+                token_len = len(token) if token else 0
+                token_status = f"len={token_len}" if token_len else "EMPTY/MISSING"
+            except Exception as te:
+                token_len = -1
+                token_status = f"read_error:{type(te).__name__}:{te}"
+
+            # 3) LOCAL_API_URL 5410 端口是否真的在监听（=服务真的起来了）
+            host = "127.0.0.1"
+            port = 5410
+            port_open = False
+            try:
+                with socket.create_connection((host, port), timeout=0.8):
+                    port_open = True
+            except Exception:
+                port_open = False
+
+            # 4) 连通性 HTTP 层检测（超时 1.5s，能直接区分是端口被占 / 鉴权错 / 服务初始化慢）
+            http_status: str = "N/A"
+            http_body_preview: str = ""
+            try:
+                token = load_local_token() or ""
+                req = urllib.request.Request(_LOCAL_API_URL + "/status", method="GET")
+                if token:
+                    req.add_header("X-SAU-Local-Token", token)
+                with urllib.request.urlopen(req, timeout=1.5) as resp:
+                    http_status = str(resp.status)
+                    raw = resp.read(256).decode(errors="replace")
+                    http_body_preview = raw[:160].replace("\n", "\\n")
+            except urllib.error.HTTPError as he:
+                http_status = f"HTTP_{he.code}"
+                try:
+                    raw = he.read(256).decode(errors="replace")
+                    http_body_preview = raw[:160].replace("\n", "\\n")
+                except Exception:
+                    http_body_preview = ""
+            except urllib.error.URLError as ue:
+                http_status = f"URL_ERR_{type(ue.reason).__name__}"
+                http_body_preview = str(ue.reason)[:160]
+            except Exception as he:
+                http_status = f"UNKNOWN_ERR_{type(he).__name__}"
+                http_body_preview = str(he)[:160]
+
+            # 5) config.json 是否存在 + agent_id / server_url（空值=未绑定服务端=必然未连接）
+            try:
+                from sau_agent_pkg.config import load_config
+                cfg = load_config() or {}
+                has_agent_id = bool(cfg.get("agent_id"))
+                has_server_url = bool(str(cfg.get("server_url", "")).strip())
+                config_ok = f"agent_id={'Y' if has_agent_id else 'N'} server_url={'Y' if has_server_url else 'N'}"
+            except Exception as ce:
+                config_ok = f"load_error:{type(ce).__name__}:{ce}"
+
+            # 为什么从 sau_tray.core.config 引入 LOCAL_API_URL：
+            #   之前这里直接引用了 LOCAL_API_URL 标识符，但它在 tray_app.py 顶层未 import，
+            #   会抛 NameError: name 'LOCAL_API_URL' is not defined，刚好被外层 except 吞掉
+            #   只打 warning 不影响启动，但启动 Banner 自检日志就缺失了。
+            try:
+                from sau_tray.core.config import LOCAL_API_URL as _LOCAL_API_URL
+            except Exception:
+                _LOCAL_API_URL = "http://127.0.0.1:5410"
+
+            logger.info(
+                "========== 启动 Banner 自检 ==========\n"
+                "  SAU_HOME            = %s\n"
+                "  _LOCAL_API_URL       = %s (port_5410_listen=%s)\n"
+                "  SCM_service_status  = %s\n"
+                "  local_token_status  = %s (raw_token_len=%d)\n"
+                "  HTTP_/status_check  = %s  body=%s\n"
+                "  config_status       = %s\n"
+                "  快速结论: %s\n"
+                "=======================================",
+                SAU_HOME,
+                _LOCAL_API_URL, "YES" if port_open else "NO",
+                scm_status,
+                token_status, token_len,
+                http_status, http_body_preview or "(empty)",
+                config_ok,
+                _self_check_summary(scm_status, port_open, token_len, http_status, config_ok),
+            )
+        except Exception as ce:
+            logger.warning("启动 Banner 自检异常（不影响托盘启动，仅排障用）: %s", ce, exc_info=True)
+
+    def _self_check_summary(
+        scm_status: str,
+        port_open: bool,
+        token_len: int,
+        http_status: str,
+        config_ok: str,
+    ) -> str:
+        """把自检结果浓缩成一句话，帮用户快速理解为什么"托盘显示未连接"。"""
+        if scm_status not in ("running", "starting"):
+            return f"[关键] Windows 服务当前={scm_status}，未启动状态 → 先启动服务后再观察"
+        if not port_open:
+            return f"[关键] SCM={scm_status} 但 5410 未监听 → LocalApiServer 启动失败，查 sau-service.log 里 _main 入口是否崩溃"
+        if token_len <= 0:
+            return f"[关键] local_token 缺失/长度 0 → 服务 generate_local_token() 未生成，查 SAU_HOME 权限，要求 SYSTEM 用户有写权限"
+        if http_status in ("500", "HTTP_500"):
+            return f"[关键] HTTP_500(Local token missing) → 服务端没生成 token，需检查服务启动日志"
+        if http_status in ("401", "HTTP_401"):
+            return f"[关键] HTTP_401(Unauthorized) → 托盘读到的 token 与服务端生成的不匹配，重装服务后可能出现，重启托盘通常能解决"
+        if "agent_id=N" in config_ok or "server_url=N" in config_ok:
+            return f"[次要] config.json 缺失 agent_id/server_url → 即使本地 API 通，也无法连上 opcgeo 服务端 → 托盘菜单『设置…』里配置 Server URL + 绑定 Agent 后会正常"
+        if http_status == "200":
+            return f"[正常] 全部检查项通过，托盘稍后 3~6 秒内轮询到服务即可显示绿色/已连接"
+        return f"[待观察] 服务正在启动或有异常，http_status={http_status}，稍后再看状态轮询 warning 日志"
+
+    # 后台跑，不阻塞 icon.run（用户要立即看到托盘图标）
+    threading.Thread(target=_startup_self_check, daemon=True, name="SAU-StartupSelfCheck").start()
 
     # 启动后台线程（状态轮询 + 图标更新）
     stop_event = _service_ctrl.start_background_threads()
