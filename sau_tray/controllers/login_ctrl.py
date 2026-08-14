@@ -34,7 +34,7 @@ class LoginController:
         return self._view
 
     def login(self, platform_key: str) -> None:
-        """启动平台登录流程（在后台线程中执行）。
+        """启动平台登录流程（先弹账号名输入框 → 在后台线程中执行 Playwright 登录）。
 
         Parameters
         ----------
@@ -46,9 +46,17 @@ class LoginController:
 
         def _do_login() -> None:
             try:
-                from sau_tray.login_flows import do_login
-                do_login(platform_key)
+                # 为什么不用 do_login(platform_key, account="default")：
+                # 新增 prompt_account_and_login 包装了"先弹 simpledialog 输入账号标识，再调 login_platform"，
+                # 允许同一平台并存多个账号文件（douyin_zhangsan.json / douyin_lisi.json），
+                # 而不是永远覆盖 douyin_default.json。
+                from sau_tray.login_flows import prompt_account_and_login
+                ok = prompt_account_and_login(platform_key)
                 display_name_inner = PLATFORM_DISPLAY_NAMES.get(platform_key, platform_key)
+                if not ok:
+                    # ok=False 表示用户取消了 simpledialog 输入账号名，不是登录失败，不弹 error toast
+                    logger.info("登录流程: %s (%s) 用户取消账号名输入，已中止", platform_key, display_name_inner)
+                    return
                 logger.info("登录流程完成: platform=%s (%s)", platform_key, display_name_inner)  # 为什么打这条日志：确认登录成功完成
                 show_notify(f"{display_name_inner} 登录完成")
             except Exception as e:

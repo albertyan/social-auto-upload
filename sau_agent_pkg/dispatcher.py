@@ -15,6 +15,8 @@ sau_agent_pkg.dispatcher
 from __future__ import annotations
 
 import asyncio
+import dataclasses
+import inspect
 import json
 import logging
 import shutil
@@ -33,6 +35,9 @@ from sau_agent_pkg.upstream_adapter import PLATFORMS, get_request_class, get_upl
 logger = logging.getLogger(__name__)
 
 _DOWNLOADS_DIR = SAU_HOME / "downloads"
+
+# bilibili 投稿必填分区 tid：21 = 日常（与生活区兼容），服务端暂未下发 tid 时的兜底值
+DEFAULT_BILIBILI_TID = 21
 
 
 def _now_ms() -> int:
@@ -254,7 +259,15 @@ class Dispatcher:
 
             # 6. 成功
             await self._report_progress(task_id, "publishing", 100, "Upload complete")
-            await self._report_result(task_id, "success", None, None)
+            # submit_mode=manual 备注：仅 tencent 有草稿能力（is_draft），其余平台已按普通发布执行
+            submit_mode = task.get("submit_mode") or "auto"
+            remarks: str | None = None
+            if submit_mode == "manual":
+                if platform_key == "tencent":
+                    remarks = "已保存为草稿"
+                else:
+                    remarks = "平台不支持草稿，已直接发布"
+            await self._report_result(task_id, "success", None, None, remarks)
             self._update_task_status(task_id, "success")
             # 上传成功 info 带整体耗时：统计端到端 RT，便于容量评估
             logger.info(
@@ -326,7 +339,9 @@ class Dispatcher:
         logger.debug("_download_file: start url_prefix=%s filename=%s", url_prefix, filename)
         dest = dest_dir / filename
         try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=600)) as resp:
+            # total=None：5GB 级大文件不限总时长，仅限制单次读超时，避免 total=600 下载中途被切断
+            timeout = aiohttp.ClientTimeout(total=None, sock_read=300)
+            async with session.get(url, timeout=timeout) as resp:
                 if resp.status == 403:
                     # 403 warning 记 url 前缀：签名过期最常见，让运维快速判断是签名问题还是资源被删
                     logger.warning("_download_file: 403 Forbidden url_prefix=%s", url_prefix)
@@ -334,7 +349,8 @@ class Dispatcher:
                     raise FileRenewNeeded(url)
                 resp.raise_for_status()
                 with open(dest, "wb") as f:
-                    async for chunk in resp.content.iter_chunked(8192):
+                    # 512KB chunk：大文件场景减少事件循环唤醒次数，提升吞吐
+                    async for chunk in resp.content.iter_chunked(512 * 1024):
                         f.write(chunk)
         except asyncio.TimeoutError:
             # 超时 warning 记 url 前缀：CDN 抖动/带宽打满时会触发，定位是哪条素材慢
@@ -357,33 +373,43 @@ class Dispatcher:
         task: dict,
         files: list[Path],
     ) -> Any:
-        """根据 Request dataclass 构建请求对象。"""
-        title = task.get("title", "")
-        tags = task.get("tags", [])
-        description = task.get("description", "")
+        """
+        根据 Request dataclass 字段白名单构建请求对象，一处覆盖全部 7 平台。
 
-        # 根据 dataclass 字段适配
-        if content_type == "video":
-            return req_cls(
-                account_name=account_name,
-                video_file=files[0] if files else None,
-                title=title,
-                tags=tags,
-                publish_date=None,
-                headless=True,
-                debug=False,
-            )
-        else:
-            # note / 图文
-            return req_cls(
-                account_name=account_name,
-                image_files=files,
-                title=title or description,
-                tags=tags,
-                publish_date=None,
-                headless=True,
-                debug=False,
-            )
+        各平台 dataclass 字段差异（必填/可选/有无）由 fields(req_cls) 白名单自动适配：
+        - video 分支 douyin/kuaishou/xhs/tencent/bilibili 必填 description
+        - note 分支必填 note（图文正文），图片字段为 image_files
+        - bilibili 必填 tid 且无 headless/debug；youtube 无 publish_date
+        - baijiahao publish_date 必填，0 表示立即发布
+        - submit_mode=manual 仅 tencent 映射 is_draft=True
+        构造失败（缺必填字段等）直接抛出 TypeError，由 _execute 统一异常路径回报 failed。
+        """
+        title = task.get("title") or ""
+        tags = task.get("tags") or []
+        if isinstance(tags, str):
+            # 兼容服务端过渡期下发的逗号/JSON 字符串形式
+            tags = [t.strip() for t in tags.strip("[]").replace('"', "").split(",") if t.strip()]
+        desc = task.get("description") or ""
+        submit_mode = task.get("submit_mode") or "auto"
+        candidates = dict(
+            account_name=account_name,
+            title=title,
+            tags=tags,
+            # 立即发布：上游约定 0 表示不定时（sau_cli: publish_date=args.schedule or 0）；
+            # 不能用 None，否则白名单过滤后 baijiahao 等必填字段缺失
+            publish_date=0,
+            description=desc,                    # douyin/kuaishou/xhs/tencent/bilibili video 必填
+            note=desc or title,                  # note/图文分支必填
+            video_file=files[0] if content_type == "video" and files else None,
+            image_files=files if content_type == "note" and files else None,
+            headless=True,
+            debug=False,
+            tid=DEFAULT_BILIBILI_TID,            # bilibili 必填分区
+            is_draft=submit_mode == "manual",    # 仅 tencent 有该字段，白名单自动过滤其余平台
+        )
+        allowed = {f.name for f in dataclasses.fields(req_cls)}
+        kwargs = {k: v for k, v in candidates.items() if k in allowed and v is not None}
+        return req_cls(**kwargs)
 
     # ------------------------------------------------------------------
     # 恢复与持久化
@@ -478,11 +504,27 @@ class Dispatcher:
                 logger.exception("Error reporting progress for %s", task_id)
 
     async def _report_result(
-        self, task_id: str, status: str, error: str | None, publish_url: str | None
+        self,
+        task_id: str,
+        status: str,
+        error: str | None,
+        publish_url: str | None,
+        remarks: str | None = None,
     ) -> None:
         if self._result_cb:
             try:
-                await self._result_cb(task_id, status, error, publish_url)
+                # 兼容旧版 4 参回调签名（无 remarks），先探测再调用，避免回调内部 TypeError 被误判后重复调用
+                try:
+                    params = inspect.signature(self._result_cb).parameters
+                    supports_remarks = len(params) >= 5 or any(
+                        p.kind in (p.VAR_POSITIONAL, p.VAR_KEYWORD) for p in params.values()
+                    )
+                except (TypeError, ValueError):
+                    supports_remarks = False
+                if supports_remarks:
+                    await self._result_cb(task_id, status, error, publish_url, remarks)
+                else:
+                    await self._result_cb(task_id, status, error, publish_url)
             except Exception:
                 logger.exception("Error reporting result for %s", task_id)
 

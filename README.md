@@ -20,21 +20,34 @@ social-auto-upload/
 │   ├── local_api.py        #   本地控制 HTTP API（aiohttp，127.0.0.1:5410）
 │   ├── accounts.py         #   账号扫描与 cookie 有效性检查
 │   ├── machine.py          #   机器指纹采集（MachineGuid + 卷序列号 + CPU ID）
-│   ├── upstream_adapter.py #   上游 API 隔离层（平台能力注册表、上传/登录/检查函数映射）
+│   ├── upstream_adapter.py #   上游 API 隔离层（平台能力注册表、上传/登录/检查函数映射；百家号本地适配）
+│   ├── updater.py          #   在线更新状态机（upgrade_state.json）
 │   └── __init__.py
 ├── sau_service/            # Windows 系统服务
-│   ├── service_host.py     #   pywin32 服务宿主（Session 0，Local System）
+│   ├── service_host.py     #   pywin32 服务宿主（Session 0，Local System；含 get_service_status / 事件日志）
 │   ├── runner.py           #   前台调试模式入口（不依赖 pywin32）
 │   └── __init__.py
 ├── sau_tray/               # 系统托盘应用
-│   ├── tray_app.py         #   托盘图标、状态轮询、菜单构建
+│   ├── tray_app.py         #   托盘图标、状态轮询、菜单构建（4 态启动/停止 enabled callable）
 │   ├── login_flows.py      #   各平台有头登录流程
 │   ├── home_shim.py        #   SAU_HOME 运行时垫片（改写 conf.BASE_DIR）
+│   ├── services/           #   托盘侧业务服务
+│   │   └── system_svc.py   #     提权服务控制（start/restart 前置 1060 自动补装服务）
 │   └── __init__.py
 ├── packaging/              # 打包与安装
 │   ├── nuitka_build.py     #   Nuitka 统一构建脚本（四个目标）
 │   └── installer/
-│       └── sau.iss         #   Inno Setup 安装脚本
+│       ├── sau.iss         #   Inno Setup 安装脚本（CurStepChanged 兜底 + 管理员自检 runas 重拉）
+│       ├── post-install.bat#   安装后统一执行脚本（四层服务注册/启动兜底 + 15s 轮询 STATE=RUNNING）
+│       ├── sau-diagnose.bat#   现场诊断脚本（sc query + 日志打包）
+│       └── output/         #   生成的安装包（sau-x.y.z.exe）
+├── dist/                   # 打包产物（Nuitka 输出 + 安装辅助脚本）
+│   ├── sau-service.dist/   #   sau-service.exe（standalone 目录）
+│   ├── sau-tray.dist/      #   sau-tray.exe（standalone 目录）
+│   ├── sau.exe             #   上游 CLI（onefile）
+│   ├── sau-ops.exe         #   统一运维 CLI（onefile）
+│   ├── post-install.bat    #   打包后拷贝的安装后脚本
+│   └── sau-diagnose.bat    #   打包后拷贝的诊断脚本
 ├── uploader/               # 各平台上传器（上游）
 │   ├── douyin_uploader/    #   抖音
 │   ├── ks_uploader/        #   快手
@@ -154,19 +167,35 @@ python packaging/nuitka_build.py --target all --dry-run
 ### Inno Setup 安装包
 
 ```bash
-# 先完成 Nuitka 构建，然后执行：
-iscc /DVersion=0.1.0 /DSourceDir=..\dist packaging\installer\sau.iss
+# 先完成 Nuitka 构建，然后执行（注意 ISCC 需要 Inno Setup 6，建议 6.7.3）：
+#   重要：禁止用 UpdateResource 事后修改生成的 Setup.exe，会破坏 Inno Setup
+#   尾部嵌入的 7z 数据容器 offset，触发 "The setup files are corrupted"。
+& "D:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DVersion=0.1.3 "packaging\installer\sau.iss"
 ```
 
-安装包行为：
-- 安装四个 EXE 及 standalone 依赖到 `{autopf}\SAU`
-- 创建 `%ProgramData%\SAU` 运行时数据目录（cookies、db、logs、downloads、browsers 等）
-- 注册并启动 `SAUAgentService` Windows 服务（自动延迟启动）
-- 安装 patchright 浏览器内核
-- 写入当前用户自启注册表项（`HKCU\...\Run\SauTray`）
-- 启动托盘应用
-- 创建开始菜单快捷方式（可选桌面快捷方式）
-- 卸载时询问是否保留数据目录
+安装包产物位置：`packaging\installer\output\sau-<Version>.exe`
+
+**管理员/UAC 保证方案（三重保险）：**
+1. `[Setup] PrivilegesRequired=admin`（ISCC 默认写入 asInvoker manifest 失败时由后两层兜底）
+2. `InitializeSetup` 阶段执行 `net session`（ExitCode 非 0 说明当前不是管理员），`ShellExec('runas', {srcexe})` 以提权方式重拉 setup
+3. 服务安装/控制环节（见下）统一 `ShellExecuteW runas`，即便 setup 本身没提权也能逐项提权
+
+> **注意（内置 Administrator 账户）：** Windows 安全策略默认对"内置 Administrator 账户"启用 `FilterAdministratorToken=0`（即 Admin Approval Mode 关闭），即使 manifest 写了 `requireAdministrator` 双击也会静默提权不弹 UAC。要测试弹 UAC 请使用普通用户账户，或 secpol.msc → 本地策略 → 安全选项 → "用户账户控制：用于内置管理员账户的管理员批准模式" → 启用 → 重启。
+
+**安装包行为（含 0.1.3 后的增强）：**
+1. 安装四个 EXE 及 standalone 依赖到 `{autopf}\SAU`
+2. 创建 `%ProgramData%\SAU` 运行时数据目录（cookies、db、logs、downloads、browsers 等）
+3. 写入当前用户自启注册表项（`HKCU\...\Run\SauTray`）
+4. 安装 patchright 浏览器内核
+5. 【服务注册 · 四层兜底（1060 防护）】确保 `SAUAgentService` 一定被 SCM 识别
+   - ① post-install.bat Step2：幂等 remove → 两次 sau-service.exe install → 失败则 `sc create` 旁路
+   - ② sau.iss `CurStepChanged(ssPostInstall)` Pascal 层再做一次 ① 的全流程（TStringList.LoadFromFile + Pos 解析 sc query）
+   - ③ 托盘 [elevated_service_control](file:///d:/dev/workspace/social-auto-upload/sau_tray/services/system_svc.py#L87-L150)：用户点"启动/重启服务"时，若 `get_service_status` 含 "not installed"，会先提权 `sau-service.exe install` 再执行动作
+   - ④ 以上全失败时 post-install.bat 在 `install.log` 打醒目 WARNING 横幅并 dump `sau-service-crash.log`
+6. 【安装后自动启动服务】注册完成后不返回：双重 start（sau-service.exe start + `sc start` fallback）+ **15s 轮询 `sc query STATE`**，直到 `RUNNING` 才继续下一步（保证托盘自启后菜单"已启动/停止"状态正确）
+7. 启动托盘应用
+8. 创建开始菜单快捷方式（可选桌面快捷方式）
+9. 卸载时询问是否保留 `%ProgramData%\SAU` 数据目录
 
 ---
 
@@ -381,6 +410,428 @@ Agent 核心通过 WebSocket 长连接 opcgeo 服务端，完整生命周期：
 - 任务结果（`task_result`）先写入 `result_queue` 表，WS 发送成功后删除
 - 重连后自动逐条重放 `result_queue` 中未发送的结果
 
+### 上游任务下发协议（WS 上下行）
+
+Agent 作为 **WebSocket 客户端**主动连服务端（URL：`config.json.server_url`，默认 `wss://…/opcgeo/agent/ws`，query 传 `agentId=<UUID>&machine=<机器码>`，HTTP header 带 `Authorization: Bearer <agent_token>`）。
+
+#### 连接/注册流程
+1. WS 握手成功后立即发 `type=register`（身份 + 能力 + 全量账号清单）
+2. 服务端回 `type=registered`；若 `data.pending_tasks[]` 非空，则这些是设备离线期间积压的任务，Agent 会立即 submit 全部
+3. 之后每 30s 发 `type=heartbeat`
+
+#### 下行消息（服务端 → Agent）
+| type | 说明 |
+|---|---|
+| `registered` | 注册成功回执：`{message, expire_at|null, agent_id, pending_tasks?:publish_task[]}` |
+| `publish_task` | **下发一条发布任务**（见下完整 JSON 结构）→ `_handle_publish_task` 原封不动丢 Dispatcher.submit |
+| `heartbeat_ack` | 心跳应答：`{server_time, expire_at, ...}`，Agent 用 server_time 做时钟同步（滑动平均） |
+| `account_check` | 指令：立刻触发某平台某账号 cookie 检查 |
+| `file_renewed` | 素材重签成功回执：`{task_id, file_url? | media_urls?[]}` → Agent 用新 URL 重新 submit 该任务 |
+| `bind_rejected` | 绑定冲突：`{reason: replaced|rebind|token_reset}`，WS 正常关闭后 Agent 标记凭证无效不再重连 |
+| `upgrade_notice` | 在线升级通知：`{version, download_url, sha256?, force?}`，写 `upgrade_state.json` 启动下载 |
+| `token_expired` | token 已过期：Agent 进入冻结态，dispatcher.pause() 只入队不执行 |
+
+#### 上行消息（Agent → 服务端）
+| type | 触发时机 | data 关键字段 |
+|---|---|---|
+| `register` | 刚连上 WS 时 | `agent_id, machine_code, version, platforms[], accounts[{platform,account,valid}]` |
+| `heartbeat` | 每 30s | `agent_id, active_tasks, accounts, clock_offset_ms` |
+| `task_progress` | 任务阶段切换（下载/上传/发布） | `{task_id, stage, percent(0/50/70/100 典型), message}` |
+| `task_result` | 任务最终成功/失败一次 | `{task_id, status:success|failed, error?, publish_url?}` |
+| `file_renew` | 下载素材 403（签名过期）时抛 FileRenewNeeded → 自动发 | `{task_id, platform_key, content_type, file_url|media_urls}` |
+| `account_sync` | 账号状态变化（登录新账号/删账号）时推一次 | `{accounts:[{platform,account,valid,last_check_at}]}` |
+| `error_log` | 未归类致命错误上送 | `{task_id?, message, traceback_excerpt}` |
+
+#### `publish_task.data` JSON 格式（服务端必须按此下发）
+
+> Dispatcher.submit(data) 消费侧约定；所有未知字段会被忽略，核心必填字段缺省会直接进入 task_result=failed。
+
+| 字段 | 必填 | 类型 | 说明 |
+|---|---|---|---|
+| `task_id` | ✅ | string | 全局唯一任务 ID（用于进度/结果关联、断线重放、file_renew 重签、幂等取消旧任务） |
+| `platform_key` | ✅ | string | 平台 key：`douyin` / `kuaishou` / `xiaohongshu` / `bilibili` / `tencent` / `youtube` / `baijiahao`（见 [PLATFORMS 注册表](file:///d:/dev/workspace/social-auto-upload/sau_agent_pkg/upstream_adapter.py#L183-L220)） |
+| `content_type` | ✅ | string | `"video"` 或 `"note"`（图文）；B 站/视频号/YouTube/百家号 **只支持 video**（Caps.note=None，下发会进 task_result=failed "该平台不支持 note 类型"） |
+| `account_name` | ❌ | string | 指定上传账号；缺省 = 自动选 `accounts.first_valid(platform_key)` |
+| **video 任务** | | | `content_type=video` 时使用： |
+| `file_url` | ✅(video) | string | 视频下载 URL（通常是签名 CDN URL；过期返回 403 → 自动触发 file_renew 协议） |
+| **note 任务** | | | `content_type=note` 时使用： |
+| `media_urls[]` | ✅(note) | string[] | 多图素材下载 URL 数组（jpg/png/webp/gif，会下载为 media_000.jpg …） |
+| **发布元数据** | | | 两类任务通用： |
+| `title` | 推荐 | string | 标题；note 任务若 `title` 空串会 fallback 用 `description` |
+| `tags[]` | 推荐 | string[] | 标签（上传时各平台自动转 `#xxx` 或写入平台标签接口） |
+| `description` | 可选 | string | 描述/正文（note 任务还承担标题 fallback 角色） |
+| `publish_date` | ❌ | 任意 | **注意当前 Dispatcher._build_request 会忽略该字段直接写 `None`（立发）**；定时发布需服务端在约定时间再下发该任务。 |
+
+**两个真实下发示例：**
+```json
+// 视频任务（抖音）
+{
+  "type": "publish_task",
+  "data": {
+    "task_id":        "OPC-20260814-3a7f",
+    "platform_key":   "douyin",
+    "content_type":   "video",
+    "account_name":   "dongchedage_official",
+    "file_url":       "https://cdn.opcgeo.com/materials/OPC-20260814-3a7f.mp4?sign=xxx",
+    "title":          "今天试车：比亚迪海豹 07 GT",
+    "tags":           ["新能源","海豹","试驾","BYD"],
+    "description":    "深圳国际赛车场测试，0-100 3.8s"
+  }
+}
+
+// 图文任务（小红书）
+{
+  "type": "publish_task",
+  "data": {
+    "task_id":        "XHS-814-p1",
+    "platform_key":   "xiaohongshu",
+    "content_type":   "note",
+    "media_urls": [
+      "https://cdn.opcgeo.com/xhs/814-p1-cover.jpg?sign=xxx",
+      "https://cdn.opcgeo.com/xhs/814-p1-2.jpg?sign=xxx",
+      "https://cdn.opcgeo.com/xhs/814-p1-3.jpg?sign=xxx"
+    ],
+    "title":      "通勤穿搭｜5 套秋天不重样",
+    "tags":       ["穿搭","通勤","OOTD"],
+    "description":"身高 165 体重 48，单品链接在评论 🍂"
+  }
+}
+```
+
+#### 素材签名过期/重签的交互闭环
+1. Agent 下载 file_url/media_url 命中 HTTP 403（签名过期）
+2. Dispatcher 抛 `FileRenewNeeded` → 自动上送 `type=file_renew`（带 task_id + 原 URL）
+3. 服务端重新签发 URL → 下行 `type=file_renewed`：`{task_id, file_url:NEW_URL}` 或 `{task_id, media_urls:[NEW1,NEW2,…]}`
+4. Agent 收到后从 SQLite 里恢复该任务的完整 publish_task data，覆盖新 URL → **Dispatcher 重新 submit**（相当于幂等重试）
+
+#### 单平台多账号（文件命名 + 托盘输入 + RR 负载 + publish_task 精确/自动）
+
+Agent 支持同一平台并存多条独立账号（如抖音张三、抖音李四），不强制共用一条 `default` cookie。
+
+**1. 文件命名与存储结构**
+- 新体系 cookie 文件位于 `%ProgramData%\SAU\cookies\{platform_key}_{account_name}.json`
+  - 例：`douyin_zhangsan.json`、`douyin_lisi.json`、`xiaohongshu_default.json`
+- 文件名中 `account_name` 允许中文/英文/数字，Windows 非法字符（`\ / : * ? " < > |`）会被自动替换为 `_`，长度截断 64
+- 旧体系（`cookiesFile/` 目录 + SQLite `user_info` 表）仍被兼容扫描，但新登录一律写新体系
+
+**2. 托盘 GUI 多账号登录入口**
+- 选择「平台登录 → 抖音/快手/...」后，先弹 tkinter simpledialog 让用户输入「账号标识名」，默认值填 `default`
+- 取消对话框静默跳过（不弹错误 toast）；输入后按 `platform+account` 复合键写文件，不会再覆盖同平台其他账号
+- 登录成功后立即触发一次主动扫描（不等 3s 轮询），上游立刻收到 `account_sync added`
+
+**3. publish_task 时如何指定账号**
+- **精确模式**：`publish_task.data.account_name = "zhangsan"` → 只使用 `{platform}_zhangsan.json`，找不到该账号直接 fail：`invalid_account`
+- **自动模式（推荐）**：`account_name` 省略 / 传 `null` / 传空串 → 走 `FirstValidResolver`：
+  - 先把同平台所有账号按 `account_name` 字典序排序保证稳定
+  - 按 **Round-Robin 轮换**起点 index（`_rr_idx[platform]` 每次调用 +1），避免永远打第一个账号
+  - 命中 10 分钟 TTL 缓存（`is_valid=True`）直接返回；缓存 miss 再启动 Playwright 真检查
+- 映射约定位置：[Dispatcher._build_request](file:///d:/dev/workspace/social-auto-upload/sau_agent_pkg/dispatcher.py)
+
+**4. 删除账号（本地 API + 自动上送 removed）**
+- 本地 API `DELETE /accounts?platform=<p>&account=<a>` 同时删除：
+  - 新体系 `cookies/{p}_{a}.json`
+  - 旧体系 SQLite `user_info` 行 + `cookiesFile/{uuid}.json`
+- 删除完成后立即主动扫描，Scanner diff 产出 `removed` 事件 → 上游立刻收到 `account_sync`，无需等心跳
+
+---
+
+#### 账号状态上行报告机制（AccountEventBus 事件驱动 + 300ms 去抖合并）
+
+除了每 30s 心跳携带的 `accounts[]` 快照外，账号发生增删改/失效翻转时**实时**通过 `type=account_sync` 上行，不再依赖心跳轮询。
+
+**1. 四类事件（AccountEventBus 发布）**
+
+| action | 触发时机 | 典型来源 |
+|---|---|---|
+| `added` | cookies 目录新增 `{p}_{a}.json` 文件 | 托盘登录成功、手动复制 cookie 文件进目录 |
+| `removed` | `{p}_{a}.json` 文件被删除，或 DELETE /accounts API 删除成功 | 本地 API 删除、用户手动删文件 |
+| `changed` | 同 key 文件 `mtime` 变动（覆写） | 同一个账号重新登录覆盖 cookie |
+| `validity_switched` | `is_valid` 在 True↔False 间翻转（cookie 过期被检出 / 重新登录后恢复有效） | ValidityChecker.check_one_and_record 写缓存时对比 |
+
+> **首扫描快照**：服务启动首次 `scan(emit_events=True)` 时只保存 baseline，不把"磁盘上已经存在的账号"当成 added 触发一轮假事件。
+
+**2. 文件系统监听（CookieFilesPoller，无第三方 watchdog 依赖）**
+- 后台线程每 3 秒轮询 `cookies/` 与旧 `cookiesFile/` 两个目录（`threading.Event.wait(timeout=3)`，可被 stop 立即唤醒退出）
+- 轮询内部调用 `scan(emit_events=True)` → Scanner 对比 `_last_snapshot`：
+  - 新 key → added
+  - 缺 key → removed
+  - 同 key `_mtime_ms` 不同 → changed
+- 托盘登录/删除 API 完成后会立即主动 scan 一次，实际延迟通常 0ms，不必等下一个 3s 周期
+
+**3. WS 上行 account_sync 消息格式**
+
+```jsonc
+{
+  "type": "account_sync",
+  "data": {
+    "trigger": "event",              // "event" | "check" | "heartbeat"  上游用来定位来源
+    "events": [                      // 本次合并的增量事件（可能多个，按 (p,a,action) 去重）
+      {"action":"added",              "platform":"douyin", "account":"zhangsan", "is_valid":null, "checked_at":null, "source":"scanner"},
+      {"action":"validity_switched",  "platform":"douyin", "account":"lisi",     "is_valid":false,"checked_at":"2025-08-14T12:00:00+08:00","source":"checker"}
+    ],
+    "accounts": [                    // 【强制字段】合并后的全量快照（与心跳格式一致），老服务端只读这一项就够
+      {"platform_key":"douyin","account_name":"zhangsan","is_valid":null, "checked_at":null, ...},
+      {"platform_key":"douyin","account_name":"lisi",    "is_valid":false,"checked_at":"2025-08-14T12:00:00+08:00", ...}
+    ]
+  }
+}
+```
+
+**字段语义（三合一快照，统一由 `_build_account_snapshot_with_validity()` 生成）：**
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| `platform_key` | str | `douyin/xiaohongshu/...` |
+| `account_name` | str | 复合键的另一部分（不再默认 `default`） |
+| `is_valid` | bool \| null | `null`=从未做过检查，未知；不要把 `null` 当成 `false` 误判失效 |
+| `checked_at` | ISO8601 \| null | 最近一次 Playwright 检查时间 |
+| `legacy_type` / `legacy_file` | str/null | 旧体系兼容字段（新体系返回 null） |
+
+**4. 300ms 去抖 + 同键去重（避免抖动消息）**
+- 事件总线发布后，跨线程通过 `loop.call_soon_threadsafe(queue.put_nowait, payload)` 投递到 WS 协程侧（避免 Playwright/轮询线程直接 `await ws.send` 抛 RuntimeError）
+- 消费者协程 `_account_sync_worker_loop`：
+  1. 取到队列第 1 条 → `await asyncio.sleep(0.3)` 收集 300ms 内的后续事件
+  2. 按 `(platform, account, action)` 复合键去重（如先删后加同一账号只保留最终一条）
+  3. 组合一条消息 `trigger=event + events[] + 全量 accounts[]` 发送
+  4. 发送失败：回塞队列（队列上限 1000 防内存爆）
+
+**5. 其他 trigger 来源**
+| trigger | 何时发 |
+|---|---|
+| `check` | 服务端下发 `type=account_check` 时回包 |
+| `heartbeat` | 每 30s 心跳 `data.accounts[]`；虽然消息 type 仍是 `heartbeat`，但内部 accounts 快照字段与 account_sync 完全一致（带 is_valid/checked_at） |
+
+#### 冻结调度条件（下发的任务不会执行，只会 queued 入表）
+1. **时钟偏差 > 5 分钟**（`CLOCK_DRIFT_THRESHOLD_MS = 300000`）：滑动平均偏差超限 → Dispatcher.pause()，偏差恢复自动 resume
+2. **token 超期超 3 天宽限**：`heartbeat_ack.expire_at` + 3d 之后冻结，需服务端重新下发 `registered.expire_at` 或重新 bind token
+
+### 各平台上传请求数据结构（UploadRequest Dataclass）
+
+Dispatcher 根据 `publish_task.platform_key + content_type` 从 [PLATFORMS 注册表](file:///d:/dev/workspace/social-auto-upload/sau_agent_pkg/upstream_adapter.py#L183-L220) 取出对应 `(RequestClass, upload_fn)`，然后把 publish_task 字段映射成该平台的 **UploadRequest dataclass** 再调用上传。所有 dataclass 定义在 [sau_cli.py#L60-L188](file:///d:/dev/workspace/social-auto-upload/sau_cli.py#L60-L188)（百家号为本地适配，定义在 [upstream_adapter.py#L95-L104](file:///d:/dev/workspace/social-auto-upload/sau_agent_pkg/upstream_adapter.py#L95-L104)）。
+
+#### 能力总览表
+
+| platform_key | 视频 (video) | 图文 (note) | Dataclass 前缀 |
+|---|---|---|---|
+| `douyin` | ✅ | ✅ | DouyinVideoUploadRequest / DouyinNoteUploadRequest |
+| `kuaishou` | ✅ | ✅ | KuaishouVideoUploadRequest / KuaishouNoteUploadRequest |
+| `xiaohongshu` | ✅ | ✅ | XiaohongshuVideoUploadRequest / XiaohongshuNoteUploadRequest |
+| `bilibili` | ✅ | ❌ | BilibiliVideoUploadRequest |
+| `tencent` (视频号) | ✅ | ❌ | TencentVideoUploadRequest |
+| `youtube` | ✅ | ❌ | YouTubeVideoUploadRequest |
+| `baijiahao` | ✅ | ❌ | BaijiahaoVideoUploadRequest（本地适配） |
+
+#### 通用常量说明
+
+| 常量 / 枚举 | 取值 | 说明 |
+|---|---|---|
+| `publish_strategy` | `"immediate"` | （默认）立即发布 |
+| `publish_strategy` | `"scheduled"` | 定时发布；此时 `publish_date` 不能传 `0/None`，按 `SCHEDULE_FORMAT = "%Y-%m-%d %H:%M"` 填 datetime |
+| YouTube `visibility` | `"public"` (默认) / `"unlisted"` / `"private"` | 视频可见范围 |
+| B站 `tid` | int（分区号，如 17=科技区、21=日常、138=搞笑） | B站视频必须指定分区 |
+| `debug` | `True` (默认) | 上传器 debug 模式，会打更多内部日志 |
+| `headless` | `True` (默认，YouTube 默认 False) | 是否无头浏览器；YouTube 因风控原因默认有头执行 |
+
+> **映射约定（Dispatcher._build_request 规则，见 [dispatcher.py](file:///d:/dev/workspace/social-auto-upload/sau_agent_pkg/dispatcher.py)）：**
+> - 所有 UploadRequest 的 `account_name`：若 publish_task 给了就用，否则 `accounts.first_valid(platform_key)` 自动找
+> - `video_file` → 下载后的 `downloads/{task_id}/video.{mp4|mov|mkv}`
+> - `image_files[]` → 下载后的 `downloads/{task_id}/media_000.jpg ...`（保持 media_urls 顺序）
+> - `title` → publish_task.title；note 任务若 title 空 → fallback 用 description
+> - `note` (图文正文字段) → publish_task.description；若缺 description → 用 title
+> - `description` (视频描述字段) → publish_task.description；缺省为空串
+> - `publish_date` → **当前 Dispatcher 忽略 publish_task.publish_date 直接写 `None/0`（立即发布）**；定时发布需要服务端按时间再下发
+> - `tags[]` → 原样透传
+
+---
+
+#### 1. 抖音 douyin — DouyinVideoUploadRequest / DouyinNoteUploadRequest
+
+**DouyinVideoUploadRequest**（视频）
+[定义位置](file:///d:/dev/workspace/social-auto-upload/sau_cli.py#L60-L75)
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `account_name` | str | (必填) | 账号名，对应 cookies/douyin_{account}.json |
+| `video_file` | Path | (必填) | 本地视频文件路径（mp4/mov/mkv） |
+| `title` | str | (必填) | 视频标题 |
+| `description` | str | (必填) | 视频描述/简介 |
+| `tags` | list[str] | (必填) | 话题标签（上传时自动补 # 前缀） |
+| `publish_date` | datetime \| int | (必填) | 发布时间（int=0=立即；或 SCHEDULE_FORMAT 的 datetime） |
+| `thumbnail_file` | Path \| None | None | 自定义封面缩略图（选填） |
+| `thumbnail_landscape_file` | Path \| None | None | 横屏封面（选填，抖音横版专用） |
+| `thumbnail_portrait_file` | Path \| None | None | 竖屏封面（选填，抖音竖版专用） |
+| `product_link` | str | `""` | 商品橱窗挂载链接（选填） |
+| `product_title` | str | `""` | 商品标题（选填） |
+| `publish_strategy` | str | `"immediate"` | `"immediate"` / `"scheduled"` |
+| `debug` | bool | `True` | 上传器 debug 日志 |
+| `headless` | bool | `True` | 无头浏览器 |
+
+**DouyinNoteUploadRequest**（图文笔记）
+[定义位置](file:///d:/dev/workspace/social-auto-upload/sau_cli.py#L78-L89)
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `account_name` | str | (必填) | 账号名 |
+| `image_files` | list[Path] | (必填) | 多张图路径（jpg/png/webp/gif，顺序即展示顺序） |
+| `title` | str | (必填) | 笔记标题 |
+| `note` | str | (必填) | 笔记正文（Dispatcher 用 publish_task.description 映射） |
+| `tags` | list[str] | (必填) | 标签 |
+| `publish_date` | datetime \| int | (必填) | 发布时间 |
+| `publish_strategy` | str | `"immediate"` | 立即 / 定时 |
+| `debug` | bool | `True` | debug |
+| `headless` | bool | `True` | 无头 |
+| `bgm` | str | `""` | 背景音乐 ID（选填，抖音图文支持 BGM） |
+
+---
+
+#### 2. 快手 kuaishou — KuaishouVideoUploadRequest / KuaishouNoteUploadRequest
+
+**KuaishouVideoUploadRequest**（视频）
+[定义位置](file:///d:/dev/workspace/social-auto-upload/sau_cli.py#L92-L103)
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `account_name` | str | (必填) | 快手账号 |
+| `video_file` | Path | (必填) | 视频路径 |
+| `title` | str | (必填) | 标题 |
+| `description` | str | (必填) | 描述 |
+| `tags` | list[str] | (必填) | 标签 |
+| `publish_date` | datetime \| int | (必填) | 发布时间 |
+| `thumbnail_file` | Path \| None | None | 封面缩略图（选填） |
+| `publish_strategy` | str | `"immediate"` | 立即 / 定时 |
+| `debug` | bool | `True` | debug |
+| `headless` | bool | `True` | 无头 |
+
+**KuaishouNoteUploadRequest**（图文）
+[定义位置](file:///d:/dev/workspace/social-auto-upload/sau_cli.py#L106-L116)
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `account_name` | str | (必填) | 账号 |
+| `image_files` | list[Path] | (必填) | 多图路径 |
+| `title` | str | (必填) | 标题 |
+| `note` | str | (必填) | 正文 |
+| `tags` | list[str] | (必填) | 标签 |
+| `publish_date` | datetime \| int | (必填) | 发布时间 |
+| `publish_strategy` | str | `"immediate"` | 立即 / 定时 |
+| `debug` | bool | `True` | debug |
+| `headless` | bool | `True` | 无头 |
+
+---
+
+#### 3. 小红书 xiaohongshu — XiaohongshuVideoUploadRequest / XiaohongshuNoteUploadRequest
+
+**XiaohongshuVideoUploadRequest**（视频笔记）
+[定义位置](file:///d:/dev/workspace/social-auto-upload/sau_cli.py#L119-L130)
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `account_name` | str | (必填) | 小红书账号 |
+| `video_file` | Path | (必填) | 视频路径 |
+| `title` | str | (必填) | 笔记标题（小红书标题必填，20字内曝光好） |
+| `description` | str | (必填) | 笔记正文 |
+| `tags` | list[str] | (必填) | 话题标签（小红书支持「参与话题」） |
+| `publish_date` | datetime \| int | (必填) | 发布时间 |
+| `thumbnail_file` | Path \| None | None | 视频封面（选填） |
+| `publish_strategy` | str | `"immediate"` | 立即 / 定时 |
+| `debug` | bool | `True` | debug |
+| `headless` | bool | `True` | 无头 |
+
+**XiaohongshuNoteUploadRequest**（图文笔记）
+[定义位置](file:///d:/dev/workspace/social-auto-upload/sau_cli.py#L133-L143)
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `account_name` | str | (必填) | 账号 |
+| `image_files` | list[Path] | (必填) | 多图（小红书最多 18 张；建议 3:4 竖图 1080×1440） |
+| `title` | str | (必填) | 笔记标题（必填，否则上传接口失败） |
+| `note` | str | (必填) | 正文 |
+| `tags` | list[str] | (必填) | 话题标签 |
+| `publish_date` | datetime \| int | (必填) | 发布时间 |
+| `publish_strategy` | str | `"immediate"` | 立即 / 定时 |
+| `debug` | bool | `True` | debug |
+| `headless` | bool | `True` | 无头 |
+
+---
+
+#### 4. Bilibili — BilibiliVideoUploadRequest（仅视频）
+
+[定义位置](file:///d:/dev/workspace/social-auto-upload/sau_cli.py#L146-L154)
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `account_name` | str | (必填) | B站账号 |
+| `video_file` | Path | (必填) | 视频路径（biliup 上传，支持分片并发） |
+| `title` | str | (必填) | 视频标题（80 字符内） |
+| `description` | str | (必填) | 简介（250 字符内） |
+| `tid` | int | (必填) | **分区号**（B站强制要求）：如 17=科技、21=日常、138=搞笑、188=科技-野生技能协会、234=影视杂谈 |
+| `tags` | list[str] | (必填) | 标签（最多 10 个） |
+| `publish_date` | datetime \| int | (必填) | 发布时间（0=立即；B 站定时发布需要大会员或粉丝数达标） |
+
+> **注意：** B站 dataclass 没有 debug/headless 字段 —— 因为底层走 `biliup-rs` 命令行上传工具，不是 Playwright 浏览器，也没有无头/有头概念。也没有 publish_strategy 字段，由 publish_date=0/非 0 自动判断。
+
+---
+
+#### 5. 视频号 tencent — TencentVideoUploadRequest（仅视频）
+
+[定义位置](file:///d:/dev/workspace/social-auto-upload/sau_cli.py#L157-L173)
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `account_name` | str | (必填) | 视频号绑定的微信号账号名 |
+| `video_file` | Path | (必填) | 视频路径（建议 30 分钟内，4K H.264） |
+| `title` | str | (必填) | 标题 |
+| `description` | str | (必填) | 描述 |
+| `tags` | list[str] | (必填) | 标签 |
+| `publish_date` | datetime \| int | (必填) | 发布时间 |
+| `thumbnail_file` | Path \| None | None | 通用封面（选填） |
+| `thumbnail_landscape_file` | Path \| None | None | 横版 16:9 封面（选填） |
+| `thumbnail_portrait_file` | Path \| None | None | 竖版 3:4 封面（选填） |
+| `short_title` | str \| None | None | 短标题（视频号 13 字以内，首页卡片展示） |
+| `category` | str \| None | None | 分类（视频号后台分类名，如「生活」「教育」） |
+| `is_draft` | bool | `False` | 是否仅存草稿（不发布） |
+| `publish_strategy` | str | `"immediate"` | 立即 / 定时 |
+| `debug` | bool | `True` | debug |
+| `headless` | bool | `True` | 无头 |
+
+---
+
+#### 6. YouTube — YouTubeVideoUploadRequest（仅视频）
+
+[定义位置](file:///d:/dev/workspace/social-auto-upload/sau_cli.py#L176-L187)
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `account_name` | str | (必填) | YouTube 账号名（对应 cookie 文件） |
+| `video_file` | Path | (必填) | 视频路径（建议 15 分钟以内，1080p+） |
+| `title` | str | (必填) | 标题（100 字符内） |
+| `description` | str | (必填) | 视频描述（5000 字符内，支持换行和链接） |
+| `tags` | list[str] | (必填) | 标签（最多 500 字符合计） |
+| `thumbnail_file` | Path \| None | None | 自定义缩略图（1280×720，<2MB） |
+| `playlist` | str \| None | None | 发布后加入的播放列表名（选填；不存在不会自动创建） |
+| `visibility` | str | `"public"` | 可见范围：`public`（公开）/ `unlisted`（不公开搜索）/ `private`（私有） |
+| `debug` | bool | `True` | debug |
+| `headless` | bool | `False` | **YouTube 默认有头**；因 Google 风控会检测无头模式，无头模式失败率很高 |
+
+> **YouTube 风控注意：** `headless=False` 需要桌面会话存在（即服务 Session 0 不能跑 Playwright GUI），因此 YouTube 上传推荐手动在用户会话下用 `sau_service/runner.py` 前台模式跑，或者用有头 + Session 0 隔离。
+
+---
+
+#### 7. 百家号 baijiahao — BaijiahaoVideoUploadRequest（仅视频，本地适配）
+
+[定义位置](file:///d:/dev/workspace/social-auto-upload/sau_agent_pkg/upstream_adapter.py#L95-L104)（百家号作为本地适配，不在上游 sau_cli.py 中）
+
+| 字段 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `account_name` | str | (必填) | 百家号账号 |
+| `video_file` | Path | (必填) | 视频路径 |
+| `title` | str | (必填) | 标题（百家号推荐 15-30 字含关键词） |
+| `tags` | list[str] | (必填) | 标签（百家号标签越多分发越好） |
+| `publish_date` | datetime \| int | (必填) | 发布时间 |
+| `debug` | bool | `True` | debug（百家号本地适配默认开 debug） |
+| `headless` | bool | `True` | 无头浏览器 |
+
+> **百家号说明：** 百家号没有标准化的 login/check CLI 函数，登录/检查直接走 `uploader.baijiahao_uploader.main` 的 `baijiahao_setup()` + `cookie_auth()`。百家号 UploadRequest 没有 `description` 独立字段（底层 `BaiJiaHaoVideo` 构造时只取 title/tags/publish_date/file_path，description 会被底层自动从简介栏推断）。百家号也没有 `publish_strategy` 字段，由 publish_date=0/非 0 自动判断立即或定时。
+
 ### 任务调度
 
 `Dispatcher` 负责任务的完整执行流程：
@@ -388,30 +839,33 @@ Agent 核心通过 WebSocket 长连接 opcgeo 服务端，完整生命周期：
 ```
 接收 publish_task
     ↓
-落 local_tasks 表（status=queued）
+落 local_tasks 表（status=queued）【进程重启靠 recover_pending() 读回来重跑】
     ↓
-等待信号量（并发控制，默认 max_concurrency=2）
+等待信号量（并发控制，默认 max_concurrency=1）
     ↓
-解析账号 → 检查 cookie 有效性
+解析账号（account_name 缺省时自动找 first_valid）→ 检查 cookie 有效性（过期直接 failed）
     ↓
-下载素材（aiohttp 异步下载，video → file_url，note → media_urls[]）
+下载素材（aiohttp 异步下载，video → downloads/{task_id}/video.mp4，note → media_000.jpg/…）
     ↓
-构建 UploadRequest（dataclass）
+【HTTP 403】→ 抛 FileRenewNeeded → 走 file_renew 协议 → 新 URL 到后重新 submit
     ↓
-调用 upstream_adapter 上传函数
+构建 UploadRequest（dataclass：video 走 Caps.video[0]；note 走 Caps.note[0]）
     ↓
-回报结果（task_progress → task_result）
+调用 upstream_adapter 上传函数（video→Caps.video[1] / note→Caps.note[1]）
     ↓
-清理下载文件
+回报进度/结果（task_progress 多阶段 → task_result 一次【先写 SQLite result_queue 再上送，断线重发】）
+    ↓
+清理 downloads/{task_id} 临时目录
 ```
 
-**异常分类：**
-- Cookie 失效 → `failed`
-- 网络错误 → 请求 `file_renew`（素材重签）
-- 签名 URL 过期（HTTP 403） → `FileRenewNeeded` → 请求重签
-- 其他异常 → `failed`
+**异常分类（最终 task_result.status=failed 时的 error 字段约定）：**
+- `cookie missing for {platform} {account}` / `cookie expired`
+- `Unknown platform: {platform_key}` / `Platform {p} does not support {content_type}`
+- `Download failed: HTTP {status} {file_url}`（非 403 的下载失败；403 走 file_renew 不会直接失败）
+- `Upload function not found for …`
+- 其余未分类异常的 traceback 摘要（`{type}: {message}`）
 
-**重启恢复：** 服务重启时 `recover_pending()` 扫描 `local_tasks` 中 `queued/running` 状态的任务，重新提交执行。
+**重启恢复：** 服务启动时 `recover_pending()` 扫描 `local_tasks` 中 `status in ('queued','running')` 的行，重新 Dispatcher.submit 并覆盖落库行为（不会重复 insert）。
 
 ### 账号管理
 
@@ -422,16 +876,23 @@ Agent 核心通过 WebSocket 长连接 opcgeo 服务端，完整生命周期：
 
 ### 本地控制 API
 
-监听 `127.0.0.1:5410`，所有请求需携带 `X-SAU-Local-Token` 请求头（值来自 `local_token.bin`，服务每次启动时随机生成）。
+监听 `127.0.0.1:5410`，所有请求需携带 `X-SAU-Local-Token` 请求头（值来自 `%ProgramData%\SAU\local_token.bin`，服务每次启动时随机生成；服务刚启动托盘先起会遇到 500 "Local token not configured"，属正常现象，几毫秒后 token 文件生成就恢复）。
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/status` | 服务状态（WS 连接、活跃任务、账号列表、时钟偏差等） |
-| POST | `/login` | 返回支持的平台列表 |
-| POST | `/accounts/recheck` | 触发全量 Cookie 检查 |
-| POST | `/config` | 更新 `server_url` / 绑定 `token` |
-| GET | `/config` | 读取非敏感配置（token 只返回是否已绑定） |
-| POST | `/reload` | 配置热重载（触发 WS 重连） |
+| GET | `/status` | 服务状态（WS 连接、活跃任务、账号列表、时钟偏差、token 剩余天数、last_close_reason 等） |
+| POST | `/login` | 返回支持的平台列表（含 supports_video / supports_note 标志位）；body 可选 platform+account 打追踪日志 |
+| POST | `/accounts/recheck` | **异步**触发全量 Cookie 检查 → 立即返回 `{task_id, status:"queued"}`，不阻塞调用方（避免多账号 10-25s 导致托盘 HTTP timeout） |
+| GET | `/accounts/status` | 账号检查结果：① `?task_id=xxx` 命中当前任务 → 返回进度/结果（running/done/error + accounts[] + checked_at）；② 无 task_id 有上次缓存 → 返回 cached；③ 从未检查过 → `scanned_only` scan() 扫出全量账号（is_valid=None，保证 UI 不显示空白） |
+| DELETE | `/accounts` | 删除指定平台+账号（query：`platform=<p>&account=<a>`）；同时清理新体系 cookie 文件和旧体系 SQLite/UUID 条目；删除完成后立刻通过 WS 上送 `account_sync removed`，不必等心跳轮询 |
+| POST | `/config` | 更新 `server_url` / 绑定 `token`（DPAPI 加密存 credential.bin）/ 写入 `agent_id`；若绑定了 server_url/token 但没给 agent_id，会自动 get_agent_id 生成 |
+| GET | `/config` | 读取非敏感配置（`server_url` / `agent_id` / `heartbeat_interval` / `max_concurrency` / `token_bound`） |
+| POST | `/reload` | 配置热重载（触发 SauAgentCore.reload_config → WS 断开重连 + 时钟/注册重算） |
+| GET | `/upgrade` | 在线更新状态（upgrade_state.json 原始内容：phase / version / download_p / error 等；无则返回 `{}`） |
+
+认证失败响应：
+- `local_token.bin` 尚未生成（服务启动中）：`500 {"error":"Local token not configured"}`
+- `X-SAU-Local-Token` header 值不匹配：`401 {"error":"Unauthorized"}`
 
 ### 系统服务
 
@@ -454,14 +915,23 @@ Agent 核心通过 WebSocket 长连接 opcgeo 服务端，完整生命周期：
 - **图标颜色：** 绿色（已连接）/ 黄色（未连接或时钟偏差）/ 红色（服务未运行）
 - **Tooltip：** 显示连接状态文字
 
-**菜单功能：**
-- 服务控制：启动 / 停止 / 重启
-- 平台登录：抖音 / 快手 / 小红书 / B 站 / 视频号 / YouTube / 百家号
-- 账号状态查看与重新检查
-- 绑定 opcgeo 账号向导（tkinter 输入框 → 调用本地 API）
+**服务控制菜单（4 态动态文本 + 动态置灰，用 pystray MenuItem 的 `text=` + `enabled=` callable 实现，每次显示菜单重新求值）：**
+
+| 服务实际状态 | 启动菜单项 | 停止菜单项 |
+|---|---|---|
+| 🟢 running（SCM STATE=RUNNING） | 文本「已启动」+ **不可用（置灰）** | 文本「停止服务」+ **可用** |
+| 🔴 stopped / not installed（1060） | 文本「启动服务」+ **可用** | 文本「已停止」+ **不可用（置灰）** |
+| restart 菜单始终可用；选择启动/重启时，若托盘检测到 `not installed` 会先提权自动执行 `sau-service.exe install` 完成注册再启动。
+
+代码：[托盘菜单 4 态函数](file:///d:/dev/workspace/social-auto-upload/sau_tray/tray_app.py#L125-L158) + [elevated_service_control 自动补装](file:///d:/dev/workspace/social-auto-upload/sau_tray/services/system_svc.py#L87-L150)
+
+**其他菜单功能：**
+- 平台登录：抖音 / 快手 / 小红书 / B 站 / 视频号 / YouTube（百家号暂无登录菜单，需手动放 cookie 文件）
+- 账号状态查看与重新检查（重新检查已改为后台异步任务，返回 task_id 后托盘轮询 GET `/accounts/status?task_id=xxx`，避免多账号 10-25s 阻塞 HTTP 超时）
+- 绑定 opcgeo 账号向导（tkinter 输入框 → 调用本地 API POST `/config`）
 - 打开日志目录
-- 关于（显示 Agent ID、机器码、连接状态等）
-- 检查更新
+- 关于（显示 Agent ID、机器码、连接状态、token 剩余天数、时钟偏差等）
+- 检查更新（托盘轮询 GET `/upgrade`，读 upgrade_state.json phase/version）
 - 退出托盘（不停止服务）
 
 ---
@@ -482,52 +952,84 @@ Agent 核心通过 WebSocket 长连接 opcgeo 服务端，完整生命周期：
 
 ### 常见问题
 
-**1. 托盘图标显示红色（服务未运行）**
+**1. 托盘图标显示红色（服务未运行 / 1060 服务未安装）**
+
+托盘日志里若反复出现 `get_service_status query failed: (1060, 'GetServiceKeyName', '指定的服务未安装。')`，是 SCM 没识别到 `SAUAgentService`。**从 0.1.3 起四层兜底，按以下顺序逐级尝试：**
 
 ```bash
-# 检查服务状态
-sau-ops service status
+# ① 最简单：托盘菜单直接点"启动服务"。系统会先检测 not installed → 先提权 sau-service.exe install → 再 start。
+# ② 手动 CLI：
+sau-ops service install     # 先注册
+sau-ops service start       # 再启动
+sau-ops service status      # 确认 STATE=RUNNING
 
-# 启动服务
-sau-ops service start
+# ③ 若 install 失败（pywin32 静默失败），直接 SCM 旁路：
+sc create SAUAgentService binPath= "\"C:\Program Files\SAU\sau-service.exe\"" start= auto DisplayName= "SAU Publish Agent" depend= RpcSs
+sc config SAUAgentService start= delayed-auto
+sc description SAUAgentService "社交媒体自动发布 Agent 服务（Session 0，含 WS 长连接 + 本地 5410 API）"
+sc start SAUAgentService
 
-# 若服务未安装
-sau-ops service install
+# ④ 现场信息收集（生成诊断包）：
+%ProgramData%\SAU\sau-diagnose.bat
 ```
+
+安装阶段也有兜底：安装包会在 `post-install.bat` Step 2 + `sau.iss CurStepChanged` 两次执行服务注册流程；若均失败，安装日志 `install.log` 尾部会有醒目的 `****************** WARNING ******************` 横幅并附带 `sau-service-crash.log`。
 
 **2. WS 连接失败（黄色图标）**
 
 - 检查 `config.json` 中 `server_url` 是否正确
 - 检查 Token 是否已绑定：`sau-ops status`
-- 检查网络是否可达
+- 若 `status.token_status = "frozen"`（超宽限）或 `last_close_reason = replaced/rebind/token_reset`（bind_rejected 冻结），需重新执行绑定向导：`托盘 → 绑定 opcgeo 账号` 或 `sau-ops bind --server <ws> --token <t>`
+- 检查网络是否可达（`ping / wscat 连 server_url`）
 - 查看服务日志：`%ProgramData%\SAU\logs\sau-service.log`
 
 **3. 时钟偏差告警**
 
-- 托盘图标变黄，日志中出现 `Clock drift detected`
-- Agent 会暂停任务调度直到时钟恢复同步
-- 检查本机时间是否准确，必要时同步 NTP
+- 托盘图标变黄，日志中出现 `Clock drift detected` 或 `status.clock_sync_status = "drifting"`
+- Agent 会 `Dispatcher.pause()` 暂停任务调度（只入队 queued 不执行），直到偏差回到 5 分钟以内自动 resume
+- 检查本机时间是否准确，必要时同步 NTP（`w32tm /resync /nowait`）
 
 **4. Cookie 失效**
 
 ```bash
 # 检查账号状态
 sau-ops accounts list
-sau-ops accounts recheck
+# 注意：第一次点"账号状态"若显示 scanned_only（is_valid=null）表示从未做过检查，先触发一次：
+sau-ops accounts recheck   # 会返回 task_id，后台异步执行，10-25s/账号
 
 # 重新登录（通过托盘菜单或 CLI）
-# 托盘 → 平台登录 → 选择平台
+# 托盘 → 平台登录 → 选择平台（有头浏览器，用户扫码/手动登录后 Cookie 自动保存）
+# 百家号暂无登录菜单，需按 cookies 命名约定（baijiahao_{account}.json）手动放置 cookie 文件
 ```
 
 **5. 浏览器内核未安装**
 
 ```bash
 sau-ops browser install
-# 或从离线包安装
+# 或从离线包安装（zip 解压后根目录含 CHROMIUM_VERSION 文件）
 sau-ops browser install --from browsers.zip
 ```
 
-**6. 环境全面检查**
+**6. 安装包启动报 "The setup files are corrupted. Please obtain a new copy of the program."**
+
+这是 **事后修改 Inno Setup Setup.exe 导致**：Inno Setup 的 Setup.exe = PE 头 loader + 尾部固定偏移的内嵌 7z/ZIP 数据容器，用 `UpdateResource` 写 `.rsrc`（比如嵌入 manifest）会改变节表大小/扇区对齐，使尾部数据 offset 表失效 → 完整性校验 100% 触发 corrupted。
+
+**解决：** 不要用任何工具事后改生成的 `sau-x.y.z.exe`。
+- 若需要管理员/UAC，安装包已内置 `InitializeSetup → net session ExitCode → ShellExec('runas', {srcexe})` 三重保险（见安装包章节）
+- 重新执行 `ISCC.exe` 编译一份干净的安装包：
+  ```powershell
+  & "D:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DVersion=0.1.3 "packaging\installer\sau.iss"
+  ```
+
+**7. 双击安装包不弹 UAC（内置 Administrator 账户）**
+
+这是 **Windows 安全策略默认行为**，不是代码 bug：Windows 对"内置 Administrator 账户（Administrator，SID S-1-5-21-...-500）"默认关闭 Admin Approval Mode（`FilterAdministratorToken=0`），即使 `requireAdministrator` manifest 也会静默提权不弹 UAC 确认框。
+
+**如需真实弹 UAC 验证体验：**
+- 用普通用户账户运行；或
+- `secpol.msc → 本地策略 → 安全选项 → 用户账户控制：用于内置管理员账户的管理员批准模式 → 已启用 → 重启`
+
+**8. 环境全面检查**
 
 ```bash
 sau-ops doctor

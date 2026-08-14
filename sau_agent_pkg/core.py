@@ -122,6 +122,150 @@ class SauAgentCore:
         # 连接状态变更回调
         self.on_connection_change: Optional[Any] = None
 
+        # 账号变更事件订阅句柄（__init__ 订阅，对象销毁时取消订阅）
+        # 为什么不用 weakref：生命周期与 SauAgentCore 一致，core 被销毁时监听器也应一起停止
+        self._account_event_unsub: Optional[Callable[[], None]] = None
+        # 账号文件轮询监听器是否已启动标记（避免重复 start）
+        self._account_watcher_started = False
+
+        # 向 events 线程（或其他非 WS 线程）写入 account_sync 的安全队列
+        # 为什么单独用 asyncio.Queue：AccountEventBus 在任意线程 publish（CookieFilesPoller 线程、
+        # Playwright 检查线程回调），直接从非事件循环线程 await ws.send 会抛
+        # RuntimeError: no running event loop；用 call_soon_threadsafe + Queue 让事件循环
+        # 自己消费，线程安全。
+        self._account_sync_queue: "asyncio.Queue[dict[str, Any]]" = asyncio.Queue()
+        self._account_sync_worker: Optional[asyncio.Task[None]] = None
+        # 主事件循环引用：run() 内保存，供非事件循环线程（如 CookieFilesPoller 轮询线程）
+        # 的事件回调通过 call_soon_threadsafe 安全投递，避免在非主线程 get_event_loop() 抛 RuntimeError
+        self._main_loop: Optional[asyncio.AbstractEventLoop] = None
+
+        try:
+            self._subscribe_account_events()
+        except Exception:
+            logger.exception("初始化账号事件订阅失败")
+
+    # ------------------------------------------------------------------
+    # 账号变更订阅 + 增量上行 account_sync
+    # ------------------------------------------------------------------
+    def _subscribe_account_events(self) -> None:
+        """订阅 accounts.py 事件总线：Scanner/Checker 产生的事件 -> 推到 _account_sync_queue。"""
+        from sau_agent_pkg.accounts import (
+            AccountEvent,
+            subscribe_account_events,
+            start_account_file_watcher,
+        )
+
+        def _on_event(event: AccountEvent) -> None:
+            # 把事件对象 flatten 成简单 dict（便于 Queue 传递和下游 JSON 序列化）
+            payload: dict[str, Any] = {
+                "source": event.source,
+                "action": event.action,
+                "platform": event.platform,
+                "account": event.account,
+                "is_valid": event.is_valid,
+                "checked_at": event.checked_at,
+                "legacy_type": event.legacy_type,
+                "legacy_file": event.legacy_file,
+            }
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                # 非事件循环线程（如 CookieFilesPoller 轮询线程）：回退到 run() 保存的主循环。
+                # Python 3.10+ 非主线程无已设 loop 时 get_event_loop() 会抛 RuntimeError，
+                # 不能用它兜底，否则事件被总线静默吞掉、增量 account_sync 链路失效
+                loop = self._main_loop
+            if loop is None or loop.is_closed():
+                logger.debug("account event dropped: main loop not ready (source=%s action=%s)",
+                             event.source, event.action)
+                return
+            loop.call_soon_threadsafe(self._account_sync_queue.put_nowait, payload)
+
+        self._account_event_unsub = subscribe_account_events(_on_event)
+
+        # 启动账号文件轮询监听器（首次启动一次性；CookieFilesPoller.start 本身就是幂等）
+        start_account_file_watcher()
+        self._account_watcher_started = True
+        logger.info("账号变更监听已启用（3s 轮询 cookies 目录 + 有效性翻转）")
+
+    async def _account_sync_worker_loop(self, ws: websockets.WebSocketClientProtocol) -> None:
+        """消费 _account_sync_queue 的待上送事件，打包成 WS type=account_sync 消息发送。
+
+        为什么不是每来一条发一条：短时间内连续删除 3 个 cookie 文件会产生 3 条 removed 事件，
+        合并成一次 payload 推送上游；更省流量也减少服务端消息处理。
+        """
+        while True:
+            payloads: list[dict[str, Any]] = []
+            first = await self._account_sync_queue.get()
+            payloads.append(first)
+            # 去抖：等 300ms，把同一波变更合并一次上送
+            await asyncio.sleep(0.3)
+            while not self._account_sync_queue.empty():
+                try:
+                    payloads.append(self._account_sync_queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+
+            # 去重：同一 (platform, account, action) 只保留最后一条（避免 removed/added 抖动）
+            dedup: dict[tuple[str, str, str], dict[str, Any]] = {}
+            for p in payloads:
+                key = (p["platform"], p["account"], p["action"])
+                dedup[key] = p
+            batch_events = list(dedup.values())
+
+            # 立即重算当前全量 accounts 快照（含缓存有效性）——服务端拿到 snapshot 就能直接更新状态
+            current_accounts = self._build_account_snapshot_with_validity()
+
+            msg = {
+                "type": "account_sync",
+                "data": {
+                    "trigger": "event",     # 触发原因："event"（增量事件）/ "check"（服务端指令）/ "heartbeat"
+                    "events": batch_events,
+                    "accounts": current_accounts,
+                },
+            }
+            try:
+                await ws.send(json.dumps(msg, ensure_ascii=False))
+                logger.info("account_sync 上送成功: %s events=%d total_accounts=%d",
+                            ",".join(f"{e['action']}@{e['platform']}/{e['account']}" for e in batch_events),
+                            len(batch_events), len(current_accounts))
+            except Exception:
+                # 发送失败不阻塞消费者：退回队列（最多退回 100 条防内存爆）
+                for p in batch_events:
+                    if self._account_sync_queue.qsize() < 1000:
+                        self._account_sync_queue.put_nowait(p)
+                logger.debug("account_sync 发送失败，事件已退回队列待重连后重发")
+
+    def _build_account_snapshot_with_validity(self) -> list[dict[str, Any]]:
+        """构建「当前账号 + 最近一次有效性结果」的完整快照（register / heartbeat / account_sync 共用）。
+
+        为什么不再直接 accounts.scan()：scan() 只返回 platform/account，没有 is_valid；
+        上游只拿这两个字段无法在一次 heartbeat 里看出"哪些账号失效了"。
+        这里合并 last_check 缓存，没有缓存的那条 is_valid / checked_at 置 null 即可。
+        """
+        from sau_agent_pkg.accounts import get_last_check_all
+        raw_scan = accounts.scan(emit_events=False)
+        # last_check_all 是一个 list，转 {(p, a): entry} 加速 O(1) 合并
+        last_check = get_last_check_all() or []
+        cache_map: dict[tuple[str, str], dict[str, Any]] = {
+            (r["platform_key"], r["account_name"]): r
+            for r in last_check
+        }
+        snapshot: list[dict[str, Any]] = []
+        for acc in raw_scan:
+            key = (acc["platform_key"], acc["account_name"])
+            cached = cache_map.get(key)
+            snapshot.append({
+                "platform_key": acc["platform_key"],
+                "account_name": acc["account_name"],
+                # 有效性：有缓存就以缓存为准；没检查过则为 None（代表「未知」，非 False）
+                "is_valid": None if cached is None else bool(cached.get("is_valid")),
+                "checked_at": None if cached is None else cached.get("checked_at"),
+                "legacy_type": acc.get("legacy_type"),
+                "legacy_file": acc.get("legacy_file"),
+            })
+        snapshot.sort(key=lambda r: (r["platform_key"], r["account_name"]))
+        return snapshot
+
     @property
     def dispatcher(self) -> Dispatcher:
         return self._dispatcher
@@ -192,6 +336,8 @@ class SauAgentCore:
         """WS 主循环：连接 → 注册 → 收消息 → 重连。"""
         self._stop_event = stop_event
         self._resume_event = asyncio.Event()
+        # 保存主循环引用：非事件循环线程的账号事件回调（_on_event）靠它投递到队列
+        self._main_loop = asyncio.get_running_loop()
         backoff = _BACKOFF_INITIAL
 
         while not stop_event.is_set():
@@ -236,6 +382,8 @@ class SauAgentCore:
                     heartbeat_task = asyncio.create_task(self._heartbeat_loop(ws))
                     # 启动 result_queue 补发
                     replay_task = asyncio.create_task(self._replay_result_queue(ws))
+                    # 启动 account_sync 增量消费者（合并 300ms 后上送，断线时 finally 块统一取消）
+                    account_sync_task = asyncio.create_task(self._account_sync_worker_loop(ws))
 
                     try:
                         async for raw in ws:
@@ -247,6 +395,7 @@ class SauAgentCore:
                     finally:
                         heartbeat_task.cancel()
                         replay_task.cancel()
+                        account_sync_task.cancel()
 
             except ConnectionClosed as e:
                 logger.warning("WS connection closed: code=%s reason=%s", e.code, e.reason)
@@ -338,7 +487,8 @@ class SauAgentCore:
     # 注册
     # ------------------------------------------------------------------
     async def _send_register(self, ws: websockets.WebSocketClientProtocol, agent_id: str, machine_code: str) -> None:
-        """发送 register 消息。"""
+        """发送 register 消息（附带当前全量账号快照 + 最近一次有效性结果）。"""
+        current_accounts = self._build_account_snapshot_with_validity()
         msg = {
             "type": "register",
             "data": {
@@ -346,27 +496,28 @@ class SauAgentCore:
                 "machine_code": machine_code,
                 "version": APP_VERSION,
                 "platforms": list(PLATFORMS.keys()),
-                "accounts": accounts.scan(),
+                "accounts": current_accounts,
             },
         }
         await ws.send(json.dumps(msg, ensure_ascii=False))
-        logger.info("Register message sent")
+        logger.info("Register message sent, accounts=%d", len(current_accounts))
 
     # ------------------------------------------------------------------
     # 心跳
     # ------------------------------------------------------------------
     async def _heartbeat_loop(self, ws: websockets.WebSocketClientProtocol) -> None:
-        """每 30s 发送心跳。"""
+        """每 30s 发送心跳（账号快照含 is_valid/checked_at）。"""
         interval = self._config.get("heartbeat_interval", _HEARTBEAT_INTERVAL)
         while True:
             await asyncio.sleep(interval)
             try:
+                current_accounts = self._build_account_snapshot_with_validity()
                 msg = {
                     "type": "heartbeat",
                     "data": {
                         "agent_id": self._config.get("agent_id", ""),
                         "active_tasks": self._dispatcher.active_count,
-                        "accounts": accounts.scan(),
+                        "accounts": current_accounts,
                         "clock_offset_seconds": self.clock_offset_seconds,
                     },
                 }
@@ -442,11 +593,20 @@ class SauAgentCore:
         logger.info("Received publish_task: %s", task_id)
 
     async def _handle_account_check(self, ws: websockets.WebSocketClientProtocol, data: dict) -> None:
-        """处理 account_check：全量检查并上报。"""
+        """处理 account_check：服务端要求触发全量检查并上报（含 is_valid/checked_at）。"""
         results = await accounts.check_all()
-        msg = {"type": "account_sync", "data": {"accounts": results}}
+        # 按 (platform_key, account_name) 排序，保证 show/hide 顺序稳定
+        results_sorted = sorted(results, key=lambda r: (r["platform_key"], r["account_name"]))
+        msg = {
+            "type": "account_sync",
+            "data": {
+                "trigger": "check",     # 触发原因："event"（增量）/ "check"（服务端指令）/ "heartbeat"
+                "events": [],            # 指令检查不会产生 source=scanner 的事件，这里留空
+                "accounts": results_sorted,
+            },
+        }
         await ws.send(json.dumps(msg, ensure_ascii=False))
-        logger.info("Account check completed, %d accounts reported", len(results))
+        logger.info("Account check completed, %d accounts reported (trigger=check)", len(results_sorted))
 
     async def _handle_heartbeat_ack(self, ws: websockets.WebSocketClientProtocol, data: dict) -> None:
         """处理 heartbeat_ack：时钟同步 + token 有效期同步。"""
@@ -592,14 +752,23 @@ class SauAgentCore:
         except Exception:
             logger.debug("Failed to send task_progress for %s", task_id)
 
-    async def send_task_result(self, task_id: str, status: str, error: str | None, publish_url: str | None) -> None:
-        """发送 task_result 消息，同时落 result_queue。"""
+    async def send_task_result(
+        self,
+        task_id: str,
+        status: str,
+        error: str | None,
+        publish_url: str | None,
+        remarks: str | None = None,
+    ) -> None:
+        """发送 task_result 消息，同时落 result_queue。remarks 为可选备注（如草稿降级说明）。"""
         result_data = {
             "task_id": task_id,
             "status": status,
             "error": error,
             "publish_url": publish_url,
         }
+        if remarks:
+            result_data["remarks"] = remarks
         async with self._result_queue_lock:
             # 落 result_queue
             conn = get_connection()

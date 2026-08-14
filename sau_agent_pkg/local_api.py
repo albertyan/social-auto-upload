@@ -9,6 +9,8 @@ sau_agent_pkg.local_api
 - GET  /status            服务状态
 - POST /login             返回支持的平台列表
 - POST /accounts/recheck  触发全量 cookie 检查
+- GET  /accounts/status   查询账号检查结果（task_id 轮询 / cached / scanned_only）
+- DELETE /accounts        删除指定账号（query: platform=<platform>&account=<account>）
 - POST /config            更新 server_url / 绑定 token
 - GET  /config            读取非敏感配置
 - POST /reload            配置热重载（重连 WS）
@@ -118,6 +120,7 @@ class LocalApiServer:
         self._app.router.add_post("/login", self._handle_login)
         self._app.router.add_post("/accounts/recheck", self._handle_accounts_recheck)
         self._app.router.add_get("/accounts/status", self._handle_accounts_status)
+        self._app.router.add_delete("/accounts", self._handle_accounts_delete)
         self._app.router.add_post("/config", self._handle_config_update)
         self._app.router.add_get("/config", self._handle_config_read)
         self._app.router.add_post("/reload", self._handle_reload)
@@ -298,6 +301,13 @@ class LocalApiServer:
             }
         else:
             last = accounts.get_last_check_all()
+            # checked_at_ms：get_last_check_all 本身只返回 list，用内部 _CHECKER 读时间
+            # 为什么要读时间：GUI 展示"最后检查于 x 分钟前"，不打日志也要能通过 API 获取
+            checked_at_ms = 0
+            try:
+                _, checked_at_ms = accounts._CHECKER.get_last_check_all()  # noqa: SLF001
+            except Exception:
+                checked_at_ms = 0
             if last is None:
                 # 为什么在无缓存时也要扫账号：
                 # 用户点"账号状态"弹框时，如果之前没点过"检查账号有效性"，
@@ -324,10 +334,60 @@ class LocalApiServer:
                 response = {
                     "status": "cached",
                     "accounts": last,
-                    "checked_at_ms": accounts._last_check_all_time_ms,
+                    "checked_at_ms": checked_at_ms,
                 }
         resp = web.json_response(response)
         logger.info("handler path=%s method=%s %s body=None status=%d task_id=%s", path, request.method, caller, resp.status, task_id)
+        return resp
+
+    # ------------------------------------------------------------------
+    # DELETE /accounts
+    # ------------------------------------------------------------------
+    async def _handle_accounts_delete(self, request: web.Request) -> web.Response:
+        """删除指定账号（新体系 cookie 文件 + 旧体系 SQLite + cookiesFile UUID 文件）。
+
+        query:
+            platform=<platform_key>（必填）
+            account=<account_name>（必填）
+        说明：
+        - 新体系：删除 SAU_HOME/cookies/{platform}_{account}.json
+        - 旧体系：同时删除 sau.db user_info 行 + SAU_HOME/cookiesFile/{uuid}.json
+        - 删除完成后会自动触发 scan(emit_events=True) → Scanner diff 产出 removed 事件 →
+          SauAgentCore 收到事件 → 立即 WS 上送 type=account_sync 给上游
+        """
+        path = request.path
+        caller = _caller_ident(request)
+        platform = request.query.get("platform", "")
+        account = request.query.get("account", "")
+        logger.info(
+            "handler path=%s method=%s %s query=(platform=%s account=%s)",
+            path, request.method, caller, platform, account,
+        )
+        if not platform or not account:
+            resp = web.json_response({
+                "error": "Missing required query params: platform and account",
+            }, status=400)
+            logger.info(
+                "_handle_accounts_delete: 400 missing params path=%s status=%d",
+                path, resp.status,
+            )
+            return resp
+        ok, reason = accounts.delete_account(platform, account)
+        if not ok:
+            resp = web.json_response({
+                "ok": False,
+                "error": reason,
+            }, status=404)
+        else:
+            resp = web.json_response({
+                "ok": True,
+                "platform": platform,
+                "account": account,
+            })
+        logger.info(
+            "_handle_accounts_delete: done path=%s status=%d ok=%s reason=%s",
+            path, resp.status, ok, reason,
+        )
         return resp
 
     # ------------------------------------------------------------------
