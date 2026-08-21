@@ -22,21 +22,38 @@ social-auto-upload/
 │   ├── machine.py          #   机器指纹采集（MachineGuid + 卷序列号 + CPU ID）
 │   ├── upstream_adapter.py #   上游 API 隔离层（平台能力注册表、上传/登录/检查函数映射；百家号本地适配）
 │   ├── updater.py          #   在线更新状态机（upgrade_state.json）
+│   ├── upstream_adapter.py #   上游 API 隔离层（平台能力注册表、上传/登录/检查函数映射；百家号本地适配）
+│   ├── updater.py          #   在线更新状态机（upgrade_state.json）
 │   └── __init__.py
 ├── sau_service/            # Windows 系统服务
+│   ├── service_host.py     #   pywin32 服务宿主（Session 0，Local System；含 get_service_status / 事件日志）
 │   ├── service_host.py     #   pywin32 服务宿主（Session 0，Local System；含 get_service_status / 事件日志）
 │   ├── runner.py           #   前台调试模式入口（不依赖 pywin32）
 │   └── __init__.py
 ├── sau_tray/               # 系统托盘应用
 │   ├── tray_app.py         #   托盘图标、状态轮询、菜单构建（4 态启动/停止 enabled callable）
+│   ├── tray_app.py         #   托盘图标、状态轮询、菜单构建（4 态启动/停止 enabled callable）
 │   ├── login_flows.py      #   各平台有头登录流程
 │   ├── home_shim.py        #   SAU_HOME 运行时垫片（改写 conf.BASE_DIR）
+│   ├── services/           #   托盘侧业务服务
+│   │   └── system_svc.py   #     提权服务控制（start/restart 前置 1060 自动补装服务）
 │   ├── services/           #   托盘侧业务服务
 │   │   └── system_svc.py   #     提权服务控制（start/restart 前置 1060 自动补装服务）
 │   └── __init__.py
 ├── packaging/              # 打包与安装
 │   ├── nuitka_build.py     #   Nuitka 统一构建脚本（四个目标）
 │   └── installer/
+│       ├── sau.iss         #   Inno Setup 安装脚本（CurStepChanged 兜底 + 管理员自检 runas 重拉）
+│       ├── post-install.bat#   安装后统一执行脚本（四层服务注册/启动兜底 + 15s 轮询 STATE=RUNNING）
+│       ├── sau-diagnose.bat#   现场诊断脚本（sc query + 日志打包）
+│       └── output/         #   生成的安装包（sau-x.y.z.exe）
+├── dist/                   # 打包产物（Nuitka 输出 + 安装辅助脚本）
+│   ├── sau-service.dist/   #   sau-service.exe（standalone 目录）
+│   ├── sau-tray.dist/      #   sau-tray.exe（standalone 目录）
+│   ├── sau.exe             #   上游 CLI（onefile）
+│   ├── sau-ops.exe         #   统一运维 CLI（onefile）
+│   ├── post-install.bat    #   打包后拷贝的安装后脚本
+│   └── sau-diagnose.bat    #   打包后拷贝的诊断脚本
 │       ├── sau.iss         #   Inno Setup 安装脚本（CurStepChanged 兜底 + 管理员自检 runas 重拉）
 │       ├── post-install.bat#   安装后统一执行脚本（四层服务注册/启动兜底 + 15s 轮询 STATE=RUNNING）
 │       ├── sau-diagnose.bat#   现场诊断脚本（sc query + 日志打包）
@@ -167,6 +184,35 @@ python packaging/nuitka_build.py --target all --dry-run
 ### Inno Setup 安装包
 
 ```bash
+# 先完成 Nuitka 构建，然后执行（注意 ISCC 需要 Inno Setup 6，建议 6.7.3）：
+#   重要：禁止用 UpdateResource 事后修改生成的 Setup.exe，会破坏 Inno Setup
+#   尾部嵌入的 7z 数据容器 offset，触发 "The setup files are corrupted"。
+& "D:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DVersion=0.1.3 "packaging\installer\sau.iss"
+```
+
+安装包产物位置：`packaging\installer\output\sau-<Version>.exe`
+
+**管理员/UAC 保证方案（三重保险）：**
+1. `[Setup] PrivilegesRequired=admin`（ISCC 默认写入 asInvoker manifest 失败时由后两层兜底）
+2. `InitializeSetup` 阶段执行 `net session`（ExitCode 非 0 说明当前不是管理员），`ShellExec('runas', {srcexe})` 以提权方式重拉 setup
+3. 服务安装/控制环节（见下）统一 `ShellExecuteW runas`，即便 setup 本身没提权也能逐项提权
+
+> **注意（内置 Administrator 账户）：** Windows 安全策略默认对"内置 Administrator 账户"启用 `FilterAdministratorToken=0`（即 Admin Approval Mode 关闭），即使 manifest 写了 `requireAdministrator` 双击也会静默提权不弹 UAC。要测试弹 UAC 请使用普通用户账户，或 secpol.msc → 本地策略 → 安全选项 → "用户账户控制：用于内置管理员账户的管理员批准模式" → 启用 → 重启。
+
+**安装包行为（含 0.1.3 后的增强）：**
+1. 安装四个 EXE 及 standalone 依赖到 `{autopf}\SAU`
+2. 创建 `%ProgramData%\SAU` 运行时数据目录（cookies、db、logs、downloads、browsers 等）
+3. 写入当前用户自启注册表项（`HKCU\...\Run\SauTray`）
+4. 安装 patchright 浏览器内核
+5. 【服务注册 · 四层兜底（1060 防护）】确保 `SAUAgentService` 一定被 SCM 识别
+   - ① post-install.bat Step2：幂等 remove → 两次 sau-service.exe install → 失败则 `sc create` 旁路
+   - ② sau.iss `CurStepChanged(ssPostInstall)` Pascal 层再做一次 ① 的全流程（TStringList.LoadFromFile + Pos 解析 sc query）
+   - ③ 托盘 [elevated_service_control](file:///d:/dev/workspace/social-auto-upload/sau_tray/services/system_svc.py#L87-L150)：用户点"启动/重启服务"时，若 `get_service_status` 含 "not installed"，会先提权 `sau-service.exe install` 再执行动作
+   - ④ 以上全失败时 post-install.bat 在 `install.log` 打醒目 WARNING 横幅并 dump `sau-service-crash.log`
+6. 【安装后自动启动服务】注册完成后不返回：双重 start（sau-service.exe start + `sc start` fallback）+ **15s 轮询 `sc query STATE`**，直到 `RUNNING` 才继续下一步（保证托盘自启后菜单"已启动/停止"状态正确）
+7. 启动托盘应用
+8. 创建开始菜单快捷方式（可选桌面快捷方式）
+9. 卸载时询问是否保留 `%ProgramData%\SAU` 数据目录
 # 先完成 Nuitka 构建，然后执行（注意 ISCC 需要 Inno Setup 6，建议 6.7.3）：
 #   重要：禁止用 UpdateResource 事后修改生成的 Setup.exe，会破坏 Inno Setup
 #   尾部嵌入的 7z 数据容器 offset，触发 "The setup files are corrupted"。
@@ -840,21 +886,31 @@ Dispatcher 根据 `publish_task.platform_key + content_type` 从 [PLATFORMS 注�
 接收 publish_task
     ↓
 落 local_tasks 表（status=queued）【进程重启靠 recover_pending() 读回来重跑】
+落 local_tasks 表（status=queued）【进程重启靠 recover_pending() 读回来重跑】
     ↓
 等待信号量（并发控制，默认 max_concurrency=1）
+等待信号量（并发控制，默认 max_concurrency=1）
     ↓
+解析账号（account_name 缺省时自动找 first_valid）→ 检查 cookie 有效性（过期直接 failed）
 解析账号（account_name 缺省时自动找 first_valid）→ 检查 cookie 有效性（过期直接 failed）
     ↓
 下载素材（aiohttp 异步下载，video → downloads/{task_id}/video.mp4，note → media_000.jpg/…）
     ↓
 【HTTP 403】→ 抛 FileRenewNeeded → 走 file_renew 协议 → 新 URL 到后重新 submit
+下载素材（aiohttp 异步下载，video → downloads/{task_id}/video.mp4，note → media_000.jpg/…）
     ↓
+【HTTP 403】→ 抛 FileRenewNeeded → 走 file_renew 协议 → 新 URL 到后重新 submit
+    ↓
+构建 UploadRequest（dataclass：video 走 Caps.video[0]；note 走 Caps.note[0]）
 构建 UploadRequest（dataclass：video 走 Caps.video[0]；note 走 Caps.note[0]）
     ↓
 调用 upstream_adapter 上传函数（video→Caps.video[1] / note→Caps.note[1]）
+调用 upstream_adapter 上传函数（video→Caps.video[1] / note→Caps.note[1]）
     ↓
 回报进度/结果（task_progress 多阶段 → task_result 一次【先写 SQLite result_queue 再上送，断线重发】）
+回报进度/结果（task_progress 多阶段 → task_result 一次【先写 SQLite result_queue 再上送，断线重发】）
     ↓
+清理 downloads/{task_id} 临时目录
 清理 downloads/{task_id} 临时目录
 ```
 
@@ -864,7 +920,14 @@ Dispatcher 根据 `publish_task.platform_key + content_type` 从 [PLATFORMS 注�
 - `Download failed: HTTP {status} {file_url}`（非 403 的下载失败；403 走 file_renew 不会直接失败）
 - `Upload function not found for …`
 - 其余未分类异常的 traceback 摘要（`{type}: {message}`）
+**异常分类（最终 task_result.status=failed 时的 error 字段约定）：**
+- `cookie missing for {platform} {account}` / `cookie expired`
+- `Unknown platform: {platform_key}` / `Platform {p} does not support {content_type}`
+- `Download failed: HTTP {status} {file_url}`（非 403 的下载失败；403 走 file_renew 不会直接失败）
+- `Upload function not found for …`
+- 其余未分类异常的 traceback 摘要（`{type}: {message}`）
 
+**重启恢复：** 服务启动时 `recover_pending()` 扫描 `local_tasks` 中 `status in ('queued','running')` 的行，重新 Dispatcher.submit 并覆盖落库行为（不会重复 insert）。
 **重启恢复：** 服务启动时 `recover_pending()` 扫描 `local_tasks` 中 `status in ('queued','running')` 的行，重新 Dispatcher.submit 并覆盖落库行为（不会重复 insert）。
 
 ### 账号管理
@@ -876,6 +939,7 @@ Dispatcher 根据 `publish_task.platform_key + content_type` 从 [PLATFORMS 注�
 
 ### 本地控制 API
 
+监听 `127.0.0.1:5410`，所有请求需携带 `X-SAU-Local-Token` 请求头（值来自 `%ProgramData%\SAU\local_token.bin`，服务每次启动时随机生成；服务刚启动托盘先起会遇到 500 "Local token not configured"，属正常现象，几毫秒后 token 文件生成就恢复）。
 监听 `127.0.0.1:5410`，所有请求需携带 `X-SAU-Local-Token` 请求头（值来自 `%ProgramData%\SAU\local_token.bin`，服务每次启动时随机生成；服务刚启动托盘先起会遇到 500 "Local token not configured"，属正常现象，几毫秒后 token 文件生成就恢复）。
 
 | 方法 | 路径 | 说明 |
@@ -929,7 +993,23 @@ Dispatcher 根据 `publish_task.platform_key + content_type` 从 [PLATFORMS 注�
 - 平台登录：抖音 / 快手 / 小红书 / B 站 / 视频号 / YouTube（百家号暂无登录菜单，需手动放 cookie 文件）
 - 账号状态查看与重新检查（重新检查已改为后台异步任务，返回 task_id 后托盘轮询 GET `/accounts/status?task_id=xxx`，避免多账号 10-25s 阻塞 HTTP 超时）
 - 绑定 opcgeo 账号向导（tkinter 输入框 → 调用本地 API POST `/config`）
+**服务控制菜单（4 态动态文本 + 动态置灰，用 pystray MenuItem 的 `text=` + `enabled=` callable 实现，每次显示菜单重新求值）：**
+
+| 服务实际状态 | 启动菜单项 | 停止菜单项 |
+|---|---|---|
+| 🟢 running（SCM STATE=RUNNING） | 文本「已启动」+ **不可用（置灰）** | 文本「停止服务」+ **可用** |
+| 🔴 stopped / not installed（1060） | 文本「启动服务」+ **可用** | 文本「已停止」+ **不可用（置灰）** |
+| restart 菜单始终可用；选择启动/重启时，若托盘检测到 `not installed` 会先提权自动执行 `sau-service.exe install` 完成注册再启动。
+
+代码：[托盘菜单 4 态函数](file:///d:/dev/workspace/social-auto-upload/sau_tray/tray_app.py#L125-L158) + [elevated_service_control 自动补装](file:///d:/dev/workspace/social-auto-upload/sau_tray/services/system_svc.py#L87-L150)
+
+**其他菜单功能：**
+- 平台登录：抖音 / 快手 / 小红书 / B 站 / 视频号 / YouTube（百家号暂无登录菜单，需手动放 cookie 文件）
+- 账号状态查看与重新检查（重新检查已改为后台异步任务，返回 task_id 后托盘轮询 GET `/accounts/status?task_id=xxx`，避免多账号 10-25s 阻塞 HTTP 超时）
+- 绑定 opcgeo 账号向导（tkinter 输入框 → 调用本地 API POST `/config`）
 - 打开日志目录
+- 关于（显示 Agent ID、机器码、连接状态、token 剩余天数、时钟偏差等）
+- 检查更新（托盘轮询 GET `/upgrade`，读 upgrade_state.json phase/version）
 - 关于（显示 Agent ID、机器码、连接状态、token 剩余天数、时钟偏差等）
 - 检查更新（托盘轮询 GET `/upgrade`，读 upgrade_state.json phase/version）
 - 退出托盘（不停止服务）
@@ -955,8 +1035,28 @@ Dispatcher 根据 `publish_task.platform_key + content_type` 从 [PLATFORMS 注�
 **1. 托盘图标显示红色（服务未运行 / 1060 服务未安装）**
 
 托盘日志里若反复出现 `get_service_status query failed: (1060, 'GetServiceKeyName', '指定的服务未安装。')`，是 SCM 没识别到 `SAUAgentService`。**从 0.1.3 起四层兜底，按以下顺序逐级尝试：**
+**1. 托盘图标显示红色（服务未运行 / 1060 服务未安装）**
+
+托盘日志里若反复出现 `get_service_status query failed: (1060, 'GetServiceKeyName', '指定的服务未安装。')`，是 SCM 没识别到 `SAUAgentService`。**从 0.1.3 起四层兜底，按以下顺序逐级尝试：**
 
 ```bash
+# ① 最简单：托盘菜单直接点"启动服务"。系统会先检测 not installed → 先提权 sau-service.exe install → 再 start。
+# ② 手动 CLI：
+sau-ops service install     # 先注册
+sau-ops service start       # 再启动
+sau-ops service status      # 确认 STATE=RUNNING
+
+# ③ 若 install 失败（pywin32 静默失败），直接 SCM 旁路：
+sc create SAUAgentService binPath= "\"C:\Program Files\SAU\sau-service.exe\"" start= auto DisplayName= "SAU Publish Agent" depend= RpcSs
+sc config SAUAgentService start= delayed-auto
+sc description SAUAgentService "社交媒体自动发布 Agent 服务（Session 0，含 WS 长连接 + 本地 5410 API）"
+sc start SAUAgentService
+
+# ④ 现场信息收集（生成诊断包）：
+%ProgramData%\SAU\sau-diagnose.bat
+```
+
+安装阶段也有兜底：安装包会在 `post-install.bat` Step 2 + `sau.iss CurStepChanged` 两次执行服务注册流程；若均失败，安装日志 `install.log` 尾部会有醒目的 `****************** WARNING ******************` 横幅并附带 `sau-service-crash.log`。
 # ① 最简单：托盘菜单直接点"启动服务"。系统会先检测 not installed → 先提权 sau-service.exe install → 再 start。
 # ② 手动 CLI：
 sau-ops service install     # 先注册
@@ -981,10 +1081,15 @@ sc start SAUAgentService
 - 检查 Token 是否已绑定：`sau-ops status`
 - 若 `status.token_status = "frozen"`（超宽限）或 `last_close_reason = replaced/rebind/token_reset`（bind_rejected 冻结），需重新执行绑定向导：`托盘 → 绑定 opcgeo 账号` 或 `sau-ops bind --server <ws> --token <t>`
 - 检查网络是否可达（`ping / wscat 连 server_url`）
+- 若 `status.token_status = "frozen"`（超宽限）或 `last_close_reason = replaced/rebind/token_reset`（bind_rejected 冻结），需重新执行绑定向导：`托盘 → 绑定 opcgeo 账号` 或 `sau-ops bind --server <ws> --token <t>`
+- 检查网络是否可达（`ping / wscat 连 server_url`）
 - 查看服务日志：`%ProgramData%\SAU\logs\sau-service.log`
 
 **3. 时钟偏差告警**
 
+- 托盘图标变黄，日志中出现 `Clock drift detected` 或 `status.clock_sync_status = "drifting"`
+- Agent 会 `Dispatcher.pause()` 暂停任务调度（只入队 queued 不执行），直到偏差回到 5 分钟以内自动 resume
+- 检查本机时间是否准确，必要时同步 NTP（`w32tm /resync /nowait`）
 - 托盘图标变黄，日志中出现 `Clock drift detected` 或 `status.clock_sync_status = "drifting"`
 - Agent 会 `Dispatcher.pause()` 暂停任务调度（只入队 queued 不执行），直到偏差回到 5 分钟以内自动 resume
 - 检查本机时间是否准确，必要时同步 NTP（`w32tm /resync /nowait`）
@@ -996,8 +1101,12 @@ sc start SAUAgentService
 sau-ops accounts list
 # 注意：第一次点"账号状态"若显示 scanned_only（is_valid=null）表示从未做过检查，先触发一次：
 sau-ops accounts recheck   # 会返回 task_id，后台异步执行，10-25s/账号
+# 注意：第一次点"账号状态"若显示 scanned_only（is_valid=null）表示从未做过检查，先触发一次：
+sau-ops accounts recheck   # 会返回 task_id，后台异步执行，10-25s/账号
 
 # 重新登录（通过托盘菜单或 CLI）
+# 托盘 → 平台登录 → 选择平台（有头浏览器，用户扫码/手动登录后 Cookie 自动保存）
+# 百家号暂无登录菜单，需按 cookies 命名约定（baijiahao_{account}.json）手动放置 cookie 文件
 # 托盘 → 平台登录 → 选择平台（有头浏览器，用户扫码/手动登录后 Cookie 自动保存）
 # 百家号暂无登录菜单，需按 cookies 命名约定（baijiahao_{account}.json）手动放置 cookie 文件
 ```
@@ -1007,9 +1116,30 @@ sau-ops accounts recheck   # 会返回 task_id，后台异步执行，10-25s/账
 ```bash
 sau-ops browser install
 # 或从离线包安装（zip 解压后根目录含 CHROMIUM_VERSION 文件）
+# 或从离线包安装（zip 解压后根目录含 CHROMIUM_VERSION 文件）
 sau-ops browser install --from browsers.zip
 ```
 
+**6. 安装包启动报 "The setup files are corrupted. Please obtain a new copy of the program."**
+
+这是 **事后修改 Inno Setup Setup.exe 导致**：Inno Setup 的 Setup.exe = PE 头 loader + 尾部固定偏移的内嵌 7z/ZIP 数据容器，用 `UpdateResource` 写 `.rsrc`（比如嵌入 manifest）会改变节表大小/扇区对齐，使尾部数据 offset 表失效 → 完整性校验 100% 触发 corrupted。
+
+**解决：** 不要用任何工具事后改生成的 `sau-x.y.z.exe`。
+- 若需要管理员/UAC，安装包已内置 `InitializeSetup → net session ExitCode → ShellExec('runas', {srcexe})` 三重保险（见安装包章节）
+- 重新执行 `ISCC.exe` 编译一份干净的安装包：
+  ```powershell
+  & "D:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DVersion=0.1.3 "packaging\installer\sau.iss"
+  ```
+
+**7. 双击安装包不弹 UAC（内置 Administrator 账户）**
+
+这是 **Windows 安全策略默认行为**，不是代码 bug：Windows 对"内置 Administrator 账户（Administrator，SID S-1-5-21-...-500）"默认关闭 Admin Approval Mode（`FilterAdministratorToken=0`），即使 `requireAdministrator` manifest 也会静默提权不弹 UAC 确认框。
+
+**如需真实弹 UAC 验证体验：**
+- 用普通用户账户运行；或
+- `secpol.msc → 本地策略 → 安全选项 → 用户账户控制：用于内置管理员账户的管理员批准模式 → 已启用 → 重启`
+
+**8. 环境全面检查**
 **6. 安装包启动报 "The setup files are corrupted. Please obtain a new copy of the program."**
 
 这是 **事后修改 Inno Setup Setup.exe 导致**：Inno Setup 的 Setup.exe = PE 头 loader + 尾部固定偏移的内嵌 7z/ZIP 数据容器，用 `UpdateResource` 写 `.rsrc`（比如嵌入 manifest）会改变节表大小/扇区对齐，使尾部数据 offset 表失效 → 完整性校验 100% 触发 corrupted。
