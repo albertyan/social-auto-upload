@@ -696,6 +696,12 @@ class ServiceController:
         """
         # 记录上一次的轮询失败类型，用于去重日志（相同类型不连续打满）
         last_fail_tag: str | None = None
+        # 记录上一次的 WS 连接状态，用于边沿跳变检测（False→True 时弹 Toast）
+        # 为什么放在这里而不是状态字典里：
+        #   state.set_status/get_status 存的是「当前状态」用于 UI 展示，
+        #   「上次状态」是轮询线程内部的临时比对变量，只用于触发一次性通知，
+        #   不需要对外暴露，也不需要线程间共享（轮询只有一个线程）。
+        last_ws_connected: bool = False
 
         while not stop_event.is_set():
             # ------------------------------------------------------------------
@@ -715,6 +721,8 @@ class ServiceController:
             # ------------------------------------------------------------------
             fail_tag: str | None = None
             scm_running: bool | None = None
+            # 本次循环拿到的 WS 连接状态（用于最后统一更新 last_ws_connected）
+            current_ws_connected: bool = False
 
             try:
                 data = _fetch_local_api("/status")
@@ -722,6 +730,8 @@ class ServiceController:
                 data["updating"] = False
                 state.set_status(data)
                 self._check_apply_result(data)
+                # 本地 API 通了，WS 状态直接用服务端返回值
+                current_ws_connected = bool(data.get("ws_connected", False))
             except Exception as e:
                 # 细化诊断：区分 timeout / refused / 401 token 错 / 500 token 未生成 / 其他
                 # 为什么：打包后"一直未连接"的用户场景里，最常见的根因 90% 是下面 4 种之一，
@@ -782,6 +792,7 @@ class ServiceController:
                     # SCM 查询失败 / 未安装：保守认为服务未运行
                     fallback_service_running = False
 
+                # 本地 API 没通 → WS 肯定未连接（current_ws_connected 保持 False 默认值）
                 state.set_status({
                     "service_running": fallback_service_running,
                     "ws_connected": False,
@@ -809,6 +820,19 @@ class ServiceController:
                         self._last_scm_status = "query_failed"
             finally:
                 last_fail_tag = fail_tag
+
+            # ── WS 连接边沿跳变检测（上一轮 False → 本轮 True → 弹 Toast）──
+            # 为什么不用 on_connection_change 回调放在服务端：
+            #   服务进程运行在 Session 0（LocalSystem），Windows 禁止 Session 0
+            #   直接弹 Toast/MessageBox（Session 0 Isolation）；托盘在用户
+            #   Session 中，由托盘轮询触发通知才能真正显示。
+            # 为什么是「上升沿」检测而不是每次 True 都弹：
+            #   轮询间隔 3s，如果连上后每次都弹，用户会被连续 Toast 刷屏；
+            #   只在从 False 跳变到 True 的第一次弹一次，符合「首次连接成功」的语义。
+            if current_ws_connected and not last_ws_connected:
+                show_notify("连接服务器成功")
+
+            last_ws_connected = current_ws_connected
 
             self._maybe_prompt_upgrade(upgrade_state)
             stop_event.wait(POLL_INTERVAL)

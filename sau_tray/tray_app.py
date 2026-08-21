@@ -240,10 +240,10 @@ def _build_menu() -> Any:
         MenuItem("服务", Menu(*service_items)),
         MenuItem("平台登录", Menu(*login_items)),
         MenuItem("账号状态", _service_ctrl.on_show_accounts),
-        MenuItem("检查账号有效性", _service_ctrl.on_recheck_accounts),
+        # MenuItem("检查账号有效性", _service_ctrl.on_recheck_accounts),
         MenuItem("设置…", _on_settings),
         MenuItem("打开日志目录", _service_ctrl.on_open_logs),
-        MenuItem("关于", _service_ctrl.on_about),
+        # MenuItem("关于", _service_ctrl.on_about),
         MenuItem("检查更新", _service_ctrl.on_check_update),
         MenuItem("退出服务", _on_exit_tray),
     ]

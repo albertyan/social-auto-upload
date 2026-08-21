@@ -218,11 +218,21 @@ def prompt_account_and_login(platform_key: str) -> bool:
     托盘 GUI 登录入口：弹 tkinter simpledialog 让用户输入「账号标识名」，默认 "default"。
 
     为什么单独抽这个函数：
-    - 托盘（pystray）的 MenuItem lambda 在 pystray 线程执行，不是桌面主线程；
-      tkinter 在 pystray 线程直接弹 simpledialog 在 Windows 上没问题（子消息循环自洽），
-      但必须明确放在独立线程（调用方用 Thread 包装）里，避免 pystray 菜单阻塞菜单刷新。
     - 用户点击"平台登录 -> 抖音"时，通过本函数先问账号名（支持同平台多账号并存），
       不会再像以前那样写死 default 覆盖同一个 cookie 文件。
+
+    为什么必须把 simpledialog 调度到 gui_thread（而不是在登录线程里自己 new 一个 Tk）：
+    - Windows 上 tkinter 有严格的单线程 GUI 亲和性约束：所有窗口操作（包括弹出 modal dialog）
+      必须在同一个跑 mainloop 的线程里执行。程序已经在 sau_tray.core.gui_thread 里创建了
+      一个隐藏的 _gui_root 并持续跑 mainloop，如果这里在登录线程里再单独 new Tk() 并 askstring，
+      会因为第二个 Tk 实例没有自己的 mainloop 而在 Windows 上出现以下常见问题：
+        ① simpledialog 窗口完全 invisible（只在任务栏闪烁，桌面看不到）
+        ② 窗口出现但点输入框不响应（消息循环在另一个线程里被主 Tk 吞了）
+        ③ askstring 直接 return None（相当于用户点取消，但实际根本没弹出）
+      这些症状都会让用户感觉「输完账号标识并没有实现登录 / 对话框根本没弹」。
+    - 解决方案：把「弹 simpledialog」放到 gui_thread.schedule（通过 _gui_queue 调度），
+      让 modal dialog 依附在已运行 mainloop 的 _gui_root 上作为 parent；登录线程这边用
+      threading.Event 阻塞等待结果，保证「登录线程只做登录，GUI 线程只做 UI」的线程模型正确。
 
     账号名约束（会自动过滤）：
     - 去首尾空白；空串或取消 → 使用 default
@@ -231,26 +241,60 @@ def prompt_account_and_login(platform_key: str) -> bool:
     - 超长（>64）→ 截断
     """
     import re as _re
-    from tkinter import Tk
+    import threading
     from tkinter import simpledialog
+    from sau_tray.core import gui_thread
 
     platform_name = _PLATFORM_NAMES.get(platform_key, platform_key)
-    root = Tk()
-    root.withdraw()
-    # 为什么必须在 withdraw 之后 lift 一下：
-    # tkinter 顶级窗口在简化对话框前不调用 lift 会在 Windows 上被其他窗口遮住（弹不出来最前）
-    root.lift()
-    root.attributes("-topmost", True)
-    try:
-        raw = simpledialog.askstring(
-            title=f"登录 {platform_name}",
-            prompt=f"请输入账号标识名（将保存为 {platform_key}_<标识名>.json，用于区分同平台多个账号）：",
-            initialvalue="default",
-            parent=root,
-        )
-    finally:
-        root.destroy()
 
+    # 登录线程 Event + 结果共享盒子（可变 list 用来跨线程写回）
+    done = threading.Event()
+    result_box: list[str | None] = [None]  # 第 0 位放 askstring 返回值（None=取消，str=用户输入）
+
+    def _run_in_gui(root) -> None:
+        """在 GUI 线程（mainloop 宿主）中弹 simpledialog，并把结果写回 result_box。"""
+        # 为什么一定要 attributes("-topmost", True) + lift()：
+        # Windows 上 modal dialog 默认在 z-order 底部，如果此时 IDE 或浏览器最大化，
+        # dialog 会被遮挡在后面，用户以为没弹窗直接以为卡住了。
+        try:
+            root.attributes("-topmost", True)
+            root.lift()
+            raw = simpledialog.askstring(
+                title=f"登录 {platform_name}",
+                prompt=f"请输入账号标识名（将保存为 {platform_key}_<标识名>.json，用于区分同平台多个账号）：",
+                initialvalue="default",
+                parent=root,
+            )
+            result_box[0] = raw
+        except Exception as e:
+            # 弹 dialog 失败时，按取消处理（不要抛异常阻断线程），同时打日志让排障能定位到
+            logger.error("prompt_account_and_login: GUI 线程弹 simpledialog 失败，按取消处理: %s", e)
+            result_box[0] = None
+        finally:
+            # 恢复 root 的 topmost 状态，避免影响其他 dialog
+            try:
+                root.attributes("-topmost", False)
+            except Exception:
+                pass
+            # 唤醒登录线程
+            done.set()
+
+    if not gui_thread.get_thread() or not gui_thread.get_thread().is_alive():
+        # 理论上 tray_app 启动时一定会先 gui_thread.start()，但兜底避免极端情况
+        logger.warning("prompt_account_and_login: GUI 线程未运行，无法弹出账号名输入框，已中止登录")
+        return False
+
+    # 调度到 GUI 线程执行弹框
+    gui_thread.schedule(_run_in_gui)
+
+    # 登录线程阻塞等待结果（timeout=120s 兜底避免 GUI 线程卡死导致登录线程永远等下去）
+    # 为什么给 120s：用户可能中途离开电脑，不能无限阻塞；超时就当取消处理并打日志
+    wait_ok = done.wait(timeout=120.0)
+    if not wait_ok:
+        logger.warning("prompt_account_and_login: 等待 GUI 账号名输入超时 (>120s)，视为取消")
+        return False
+
+    raw = result_box[0]
     if raw is None:
         # 用户点取消：不走登录流程（不打开浏览器）
         logger.info("prompt_account_and_login: %s 用户取消输入账号名，跳过登录", platform_key)
