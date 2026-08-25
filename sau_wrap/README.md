@@ -1,10 +1,11 @@
-# sau_wrap —— SAU 客户端包装层（S1 已落，S2：Agent WS 核心，S3：5409 本地 API，S4：任务执行核心，S5：瘦托盘，S6：本地 Web 控制台）
+# sau_wrap —— SAU 客户端包装层（S1~S7 已落，S8：打包与分发）
 
 按《SAU客户端重建方案-单EXE与包装层设计》实施计划推进：
 单一入口子命令分发 + pywin32 服务宿主 + **Agent WS 主循环（S2）** +
 **5409 本地 API（S3）** + **任务执行核心（S4：dispatcher）** +
 **瘦托盘（S5：pystray）** + **本地 Web 控制台（S6：Vue3 + 静态托管 + 票据/会话鉴权）** +
-**半自动升级编排（S7：八态状态机 + 可注入执行器编排 + 启动自检自愈）**。
+**半自动升级编排（S7：八态状态机 + 可注入执行器编排 + 启动自检自愈）** +
+**打包与分发（S8：Nuitka 单 exe + Inno Setup + 哈希发布闭环）**。
 **上游源码零修改**（只新增本目录；控制台不复用上游 sau_frontend，冲突 1 定案）。
 
 ## 实现状态
@@ -25,7 +26,8 @@
 | `machine-code` | ✅ 真实机器码（SHA-256(MachineGuid+卷序列号+CPU ID) 前 32 位，§5.7） |
 | `bind` | ✅ 写 `config.json` + `credential.bin`（DPAPI LOCAL_MACHINE） |
 | `tray` | ✅ 瘦托盘（S5，见上） |
-| `browser / doctor` | ⬜ 占位 |
+| `browser install` | ✅ 内核安装（S8：npmmirror 镜像 + 官方源轮换 3 轮/60s 卡死检测 + `--from-file` 离线；落 `%ProgramData%\SAU\browsers\`） |
+| `doctor` | ✅ 八项体检（S8：服务/端口/配置凭证/WS/内核/数据目录可写/磁盘/日志末 20 行；有 FAIL 退出码 1） |
 | 版本号 | ✅ `version.py` 的 `APP_VERSION`（可被环境变量 `SAU_VERSION` 覆盖），`--version` 显示 |
 | 日志 | ✅ `%ProgramData%\SAU\logs\service.log`（10MB × 5 轮转） |
 
@@ -151,7 +153,21 @@
 - **可测试性**：编排全部经 `UpgradeExecutor`（7 个可调用 + `resolve_install_dir`）注入——开发/测试用假执行器全路径覆盖；`real_executors()`（win32serviceutil 停启服 / robocopy / wmic 杀托盘 / Inno 静默安装 / urllib 轮询校验）仅在服务宿主接线；
 - **真机验证缺口**：开发环境无服务注册与安装器，停服/安装/回滚全以假执行器覆盖；真实停启、Inno 安装、robocopy 备份恢复的真机验证留待 S8 打包出安装包后执行。
 
+## S8（打包与分发）范围与语义（重建方案 §7/§8.5/§8.6/§8.7/§13/§17）
+
+- **单一产物**：`sau_wrap/entry.py` → `sau.exe`（Nuitka --standalone，吸收全部子命令）；控制台窗口策略定案 `--windows-console-mode=disable`（GUI 子系统，托盘/服务无双击黑窗；终端调用时 stdout 继承调用方终端仍可见；致命异常由 `entry.py` AllocConsole 兜底弹窗）；
+- **版本来源**：`SAU_VERSION` 环境变量 > `sau_wrap/version.py`（不回退读上游，§8.4）；
+- **包含**：上游运行时 `uploader/utils/myUtils`（只读引用）+ `sau_wrap` 全量 + `patchright/playwright/aiohttp/websockets/pystray/PIL/win32` 等（biliup 不进包，见体积优化条）；`conf.example.py` + 控制台 `dist → ui/`（dist 缺失自动先构建）；patchright driver 经 `--include-package-data` 单份进产物；
+- **体积优化（§8.6）**：`--nofollow-import-to` 排除清单 26 项（测试框架/tkinter/flask 系/流媒体遗留/trio/xhs/旧前端旧托盘 + 首构建 400MB 实测后追加裁剪：cv2 仅登录链路 98.6MB / numpy 伴生 26MB / stream_gears 随 biliup 32.5MB，逐条注释依据见 `nuitka_build.py`）；`--disable-plugin=playwright`（防浏览器二进制进产物 +100MB，内核走 `browser install`）；biliup 不进包（上游经 subprocess 调独立二进制，首次使用按需下载）；`--python-flag=no_asserts`；**不用 UPX**（杀软误报风险定案）；目标体积 ≤100MB（不含内核，口径为 Inno 安装包）；
+- **构建纪律（§7.5）**：`--jobs=4`、`CCACHE_DISABLE=1` + `--disable-cache=all`、`--remove-output` 清残留；编译器缺失由 Nuitka 自动下载（`--assume-yes-for-downloads`），版本落档 `packaging/BUILD_ENV.md`；
+- **browser install（§8.7 三层方案）**：默认 npmmirror 镜像（`PLAYWRIGHT_DOWNLOAD_HOST`）+ 官方源，60 秒无输出判卡死自动换源（最多 3 轮）；`--from-file <zip>` 离线安装（兼容两种 zip 布局）；内核统一落 `%ProgramData%\SAU\browsers\`（`entry.py` 顶部 `PLAYWRIGHT_BROWSERS_PATH` setdefault，SYSTEM 服务/托盘/CLI 全路径一致，避免默认 `%USERPROFILE%` 缓存跨会话不一致）；当前 chromium revision 1208；
+- **安装器（sau.iss）**：固定 AppId（新布局自身，支撑覆盖升级 §8.4）；`PrivilegesRequired=admin`；LZMA2 ultra + SolidCompression（§8.6 手段⑤）；首装六步（[Files] 整目录释放 → post_install.bat：数据目录+users-full ACL → VERSION → 服务注册（失败 exit 11 不静默）→ 启动重试 3 次（失败 exit 12）→ HKCU 自启（失败仅记日志，§17 阶段 6））；内核不在安装器内下载（首启按需 §7.3）；覆盖升级 `PrepareToInstall` 停服 + 句柄释放等待 30s；卸载六步（杀托盘/停服/remove+sc delete/删自启项/删程序文件/数据默认保留+勾选全删，§13）；产物命名 `sau-{version}.exe`（与升级链一致）；
+- **哈希发布闭环（§8.5）**：`hash_release.py` 自动计算安装包 64 位小写 SHA-256，输出发布单 `release-manifest.json`（版本/文件名/哈希/下载地址占位）——运营只搬运不手填，管理端 `PUT /sau/upgrade-config` 按发布单填三字段即广播；
+- **doctor 八项（§14）**：服务状态/5409 端口/配置凭证/WS 连通/浏览器内核/数据目录可写/磁盘剩余（<2GB FAIL）/三日志末 20 行；有 FAIL 退出码 1。
+- **验证边界**：本步完成 Nuitka 产物验证（--help/--version/doctor/ui/index.html）与安装包编译实测（ISCC 6.7.3，产物 51.3MB ≤ §8.6 目标 100MB）；真实服务注册/卸载/覆盖升级在干净虚拟环境的验证留待下一步。
+
 ## 运行方式（开发环境，仓库根目录）
+
 
 ```powershell
 # 依赖（当前环境已具备；新环境执行）
@@ -179,6 +195,40 @@ python -m sau_wrap service remove
 ```
 
 打包形态下同一入口收敛为 `sau.exe`（SCM ImagePath 指向 `"…\sau.exe" agent --startup auto`）。
+
+## 打包与发布（S8，仓库根目录）
+
+```powershell
+# 1) 构建 standalone 产物（含控制台自动构建；首次会下载 MinGW，耗时较长）
+.venv\Scripts\python.exe -m sau_wrap.packaging.nuitka_build
+#   → sau_wrap\packaging\out\sau.dist\sau.exe + ui\
+
+# 2) 编译安装包（需 Inno Setup ≥6.3，x64compatible 指令所限；版本号可用 /DMyAppVersion 覆盖）
+# 当前开发机实装：D:\Program Files (x86)\Inno Setup 6（6.7.3，2026-08-26 实测编译成功）
+& "D:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
+    /DMyAppVersion=2.0.0a0 sau_wrap\packaging\installer\sau.iss
+#   → sau_wrap\packaging\installer\Output\sau-{version}.exe（2.0.0a0 实测 51.3MB）
+
+# 3) 哈希发布闭环（自动算 64 位小写 SHA-256，输出发布单）
+.venv\Scripts\python.exe -m sau_wrap.packaging.hash_release
+#   → installer\Output\release-manifest.json；运营按发布单上传安装包，
+#     管理端 PUT /sau/upgrade-config 填三字段（版本号/download_url/sha256）
+```
+
+发布单实测样例（2.0.0a0）：
+
+```json
+{
+  "version": "2.0.0a0",
+  "installer_file": "sau-2.0.0a0.exe",
+  "size_bytes": 53757202,
+  "sha256": "85b8550b4bd8bd96458fe6dae8c4c7c1dce167906788e9363fcd00c042a95f67",
+  "download_url": "https://<部署域名>/sau/sau-2.0.0a0.exe"
+}
+```
+
+构建环境版本矩阵与缺失项处理见 `packaging/BUILD_ENV.md`（§8.5）；
+打包产物不入库（`packaging/.gitignore`：`out/` 与 `installer/Output/`）。
 
 ## 服务注册参数
 
@@ -209,7 +259,8 @@ sau_wrap/
 ├── tray/                      瘦托盘（S5：app.py 主体，pystray + Pillow 代码生成图标；S6：票据链路）
 ├── console/                   Web 控制台源码（S6：Vue3 + Vite；dist/node_modules 不入库，见 console/.gitignore）
 ├── upgrade/                   半自动升级编排（S7：updater.py 通知校验/下载/八态状态机；orchestrator.py 可注入执行器六步编排/回滚/启动自检）
-├── packaging/                 占位（S8）
+├── browser.py / doctor.py     浏览器内核安装（§8.7）与八项体检（§14）
+├── packaging/                 打包与分发（S8）：nuitka_build.py 构建脚本 / build_console.py 控制台构建 / installer/sau.iss Inno Setup 脚本 / post_install.bat 安装后编排 / hash_release.py 哈希发布闭环 / BUILD_ENV.md 版本矩阵
 └── requirements.txt           包装层独立依赖清单（§8.1）
 ```
 
@@ -221,7 +272,7 @@ python sau_wrap\tests\verify_s3.py   # S3：5409 本地 API，14/14 通过（结
 python sau_wrap\tests\verify_s4.py   # S4：任务执行核心，16/16 通过（结果写 tests\_verify_report_s4.txt）
 python sau_wrap\tests\verify_s5.py   # S5：瘦托盘（模块级），29/29 通过（结果写 tests\_verify_report_s5.txt）
 python sau_wrap\tests\verify_s6.py   # S6：本地 Web 控制台，31/31 通过（需先 npm run build；结果写 tests\_verify_report_s6.txt）
-python sau_wrap\tests\verify_s7.py   # S7：半自动升级编排，34/34 通过（结果写 tests\_verify_report_s7.txt）
+python sau_wrap\tests\verify_s7.py   # S7：半自动升级编排，36/36 通过（结果写 tests\_verify_report_s7.txt）
 ```
 
 - **verify_s2**（五场景）：①注册握手 + 心跳往返 + publish_task 落库 + 优雅停止；②断线重连退避

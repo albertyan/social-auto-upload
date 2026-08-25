@@ -24,11 +24,18 @@ CLI 框架选型：文档 §2.4.1 建议「Typer 或 Click」，本实现采用 
 
 from __future__ import annotations
 
+import os
 import sys
 
 import click
 
+from sau_wrap import paths
 from sau_wrap.version import APP_VERSION
+
+# 浏览器内核统一落 %ProgramData%\SAU\browsers（§3.6/§8.7）：
+# 服务（SYSTEM）/托盘/CLI 全路径一致，避免默认 %USERPROFILE% 缓存
+# 在 SYSTEM 与用户会话间不一致（任务 #19 ②-2 决策）。
+os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(paths.BROWSERS_DIR))
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
@@ -138,11 +145,21 @@ def browser() -> None:
 @click.option("--from-file", "from_file", type=str, default=None,
               help="离线安装：本地内核 zip 路径（§8.7 第三层兜底）")
 def browser_install(from_file: str | None) -> None:
-    """【占位】下载 / 安装浏览器内核（实施计划后续步骤）。"""
+    """下载 / 安装浏览器内核（§8.7：镜像源 + 60s 卡死换源 + 离线兜底）。"""
+    import logging
+
+    from sau_wrap import browser
+
+    logger = logging.getLogger("sau.browser")
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s [%(levelname)s] %(message)s")
     if from_file:
-        click.echo(f"browser install --from-file {from_file} 尚未实现（离线安装入口，§8.7）。")
+        ok = browser.install_from_file(from_file, logger)
     else:
-        click.echo("browser install 尚未实现（镜像源下载 + 卡死换源，§8.7）。")
+        ok = browser.install_online(logger)
+    if not ok:
+        sys.exit(1)
+    click.echo(f"浏览器内核就绪：{browser.chromium_executable()}")
 
 
 # ---------------------------------------------------------------- 诊断 / 绑定族
@@ -150,8 +167,10 @@ def browser_install(from_file: str | None) -> None:
 
 @cli.command()
 def doctor() -> None:
-    """【占位】诊断（实施计划后续步骤，§14.3 八项检查清单）。"""
-    click.echo("sau doctor 尚未实现（八项检查清单见设计文档 §14.3）。")
+    """诊断（§14.3 八项检查清单；排障主入口）。"""
+    from sau_wrap import doctor as doctor_mod
+
+    sys.exit(doctor_mod.run())
 
 
 @cli.command("machine-code")
@@ -197,15 +216,49 @@ def main(argv: list[str] | None = None) -> None:
 
     特别处理：SCM 拉起时命令行带 ``--startup auto``（pywin32 服务宿主惯例），
     此时直接进入服务宿主，而不经过子命令分发（§4.1）。
+
+    控制台窗口策略（§7.5 实施验证点 2）：产物以 --windows-console-mode=disable
+    构建（无双击黑窗，终端调用时 stdout 继承可见）；未附控制台时的致命异常
+    经 ``AllocConsole`` 兜底弹窗排障。
     """
     if argv is None:
         argv = sys.argv[1:]
-    if "--startup" in argv:
-        from sau_wrap.service import host
+    try:
+        if "--startup" in argv:
+            from sau_wrap.service import host
 
-        host.main(list(argv))
-        return
-    cli(args=argv)
+            host.main(list(argv))
+            return
+        cli(args=argv)
+    except Exception:
+        _fatal_with_console_fallback()
+        raise
+
+
+def _fatal_with_console_fallback() -> None:
+    """无控制台时（disable 模式）AllocConsole 兜底，把异常打到新控制台。
+
+    判定注意：GUI 子系统下 Python 3.6+ 的 stdout/stderr 是非 None 哑流，
+    不能以 ``is None`` 判断；改用 ``GetConsoleWindow()`` 判是否已附控制台。
+    """
+    try:
+        import ctypes
+        if ctypes.windll.kernel32.GetConsoleWindow():
+            return  # 终端调用：输出已在调用方终端可见，无需兜底
+    except Exception:
+        pass  # 判定失败则保守走兜底分支（AllocConsole 重复调用无副作用）
+    try:
+        import ctypes
+        if ctypes.windll.kernel32.AllocConsole():
+            sys.stdout = open("CONOUT$", "w", encoding="utf-8", errors="replace")
+            sys.stderr = open("CONOUT$", "w", encoding="utf-8", errors="replace")
+            sys.stdin = open("CONIN$", "r", encoding="utf-8", errors="replace")
+            import traceback
+            print("sau.exe 发生致命异常：", file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+            input("按回车键退出...")
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":  # pragma: no cover

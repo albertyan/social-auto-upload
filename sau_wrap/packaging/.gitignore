@@ -1,0 +1,5 @@
+# 打包产物不入库（sau.dist 约 228 MB，安装包 50+ MB，误 add 会撑爆仓库）
+# —— 对应任务 #20 收尾项 / review 建议 4
+out/
+installer/Output/
+packaging/
