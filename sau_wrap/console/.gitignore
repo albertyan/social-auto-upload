@@ -1,0 +1,4 @@
+# 构建产物与依赖（设计文档 §6.6：.gitignore；打包时由 S8 构建链路
+# `npm ci && vite build` 现场产出，经 Nuitka --include-data-dir 进安装包）
+node_modules/
+dist/

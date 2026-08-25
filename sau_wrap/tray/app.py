@@ -2,8 +2,10 @@
 """瘦托盘（实施计划 S5；设计文档第 5 章：三菜单、无启停、轮询、Mutex）。
 
 设计要点（v1.2 定案）：
-- **三菜单**：① 打开控制台（浏览器访问 ``http://127.0.0.1:{port}/ui/``；
-  控制台页面与一次性令牌链路属后续步骤，此处直接打开根 URL）；
+- **三菜单**：① 打开控制台（浏览器访问 ``http://127.0.0.1:{port}/ui/t/<票据>``；
+  托盘先持 ``X-SAU-Local-Token`` 调 ``POST /ui-ticket`` 换一次性票据，
+  浏览器以票据换 Cookie 会话，§6.3；票据获取失败时回退打开 ``/ui/``
+  根路径并记日志）；
   ② 打开日志目录（``%ProgramData%\\SAU\\logs``，排障入口）；③ 退出托盘
   （仅退出托盘进程，不影响服务）。**无启停菜单**——服务只靠延迟自启 +
   故障自动重启恢复（§4.2 / 第 5 章编者注）；
@@ -90,14 +92,32 @@ def load_local_token() -> str | None:
 
 
 def build_console_url(port: int) -> str:
-    """控制台 URL。
-
-    控制台页面尚未实现（S6），本步直接打开 ``/ui/`` 根路径——服务端已为该
-    端点族占位 501。后续控制台步骤将接一次性令牌链路：
-    ``/ui/t/<token>``（托盘先向 5409 申请令牌再拼入 URL，见设计文档 §5.1
-    与 §6.5），此处预留接入点。
-    """
+    """控制台回退 URL（``/ui/`` 根路径；票据链路失败时的降级入口，§6.3）。"""
     return f"http://127.0.0.1:{port}/ui/"
+
+
+def request_ui_ticket(port: int, token: str | None,
+                      timeout: float = POLL_TIMEOUT) -> str | None:
+    """``POST /ui-ticket`` 换一次性票据（§6.3 鉴权链路第一步）。
+
+    托盘持 ``X-SAU-Local-Token`` 调用；失败（服务不可达/401/异常）返回 None，
+    由调用方回退打开 ``/ui/``。
+    """
+    url = f"http://127.0.0.1:{port}/ui-ticket"
+    req = urllib.request.Request(url, method="POST",
+                                 headers={"X-SAU-Local-Token": token or ""})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    ticket = body.get("ticket")
+    return ticket if isinstance(ticket, str) and ticket else None
+
+
+def build_ticket_url(port: int, ticket: str) -> str:
+    """票据核销入口 URL（§6.3：浏览器 GET 后种会话 Cookie 并 302 到 /ui/）。"""
+    return f"http://127.0.0.1:{port}/ui/t/{ticket}"
 
 
 def build_tooltip(state: str, body: dict | None) -> str:
@@ -220,9 +240,21 @@ def acquire_mutex(name: str = MUTEX_NAME):
 
 
 def open_console(port: int, logger: logging.Logger) -> None:
-    """菜单①：打开控制台（ShellExecute，无需提权，§3.7）。"""
-    url = build_console_url(port)
-    logger.info("打开控制台: %s", url)
+    """菜单①：打开控制台（§6.3 完整链路，无需提权）。
+
+    先 ``POST /ui-ticket`` 换一次性票据，再打开 ``/ui/t/<票据>``（浏览器换会话）；
+    票据获取失败（服务不可达等）时回退打开 ``/ui/`` 根路径并记日志（前端会展示
+    401 引导页）。
+    """
+    token = load_local_token()
+    ticket = request_ui_ticket(port, token)
+    if ticket:
+        url = build_ticket_url(port, ticket)
+        logger.info("打开控制台（一次性票据链路）: %s", url)
+    else:
+        url = build_console_url(port)
+        logger.warning("获取控制台票据失败（服务不可达或令牌不匹配），"
+                       "回退打开控制台根路径: %s", url)
     webbrowser.open(url)  # Windows 下即 ShellExecute 默认浏览器
 
 
