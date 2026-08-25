@@ -8,6 +8,7 @@ click>=8.1          # CLI 子命令分发框架（§2.4.1 定案方向：Typer/C
 websockets>=13.0    # WS Agent 核心（S2：websockets.asyncio.client，应用层心跳；
                     # 13.0 起 connect 参数名为 additional_headers，12.x 是 extra_headers）
 aiohttp>=3.9        # 5409 本地 API（S3：仅监听 127.0.0.1，§3.5/§4.4）
+pystray>=0.19       # 瘦托盘（S5：原生菜单，§5）
+Pillow>=10.0        # 托盘图标代码生成（S5：色块图标，无图片资源文件）
 #
 # 后续步骤按需追加（当前不安装，避免提前引入）：
-# pystray           # 瘦托盘（S5）

@@ -8,7 +8,7 @@ CLI 框架选型：文档 §2.4.1 建议「Typer 或 Click」，本实现采用 
 
     sau agent                服务进程本体（SCM ImagePath 指向本命令）
     sau service <verb>       install|remove|start|stop|status|upgrade
-    sau tray                 瘦托盘（本步占位）
+    sau tray                 瘦托盘（S5：三菜单 + Mutex + /status 轮询）
     sau browser install      浏览器内核安装（本步占位）
     sau doctor               诊断（本步占位）
     sau machine-code|bind    机器码 / 绑定（S2 已实现）
@@ -120,9 +120,10 @@ def service_upgrade() -> None:
 
 @cli.command()
 def tray() -> None:
-    """瘦托盘（本步占位；实施计划 S5：三菜单 + Mutex + /status 轮询）。"""
-    click.echo("sau tray 尚未实现（实施计划 S5，见设计文档第 5 章）。")
-    click.echo("目标形态：原生菜单三项——打开控制台 / 打开日志目录 / 退出。")
+    """瘦托盘（S5：三菜单 + Mutex 单实例 + /status 轮询，设计文档第 5 章）。"""
+    from sau_wrap.tray.app import run
+
+    sys.exit(run())
 
 
 # ---------------------------------------------------------------- browser

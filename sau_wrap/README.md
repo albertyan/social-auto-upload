@@ -1,8 +1,9 @@
-# sau_wrap —— SAU 客户端包装层（S1 已落，S2：Agent WS 核心，S3：5409 本地 API，S4：任务执行核心）
+# sau_wrap —— SAU 客户端包装层（S1 已落，S2：Agent WS 核心，S3：5409 本地 API，S4：任务执行核心，S5：瘦托盘）
 
 按《SAU客户端重建方案-单EXE与包装层设计》实施计划推进：
 单一入口子命令分发 + pywin32 服务宿主 + **Agent WS 主循环（S2）** +
-**5409 本地 API（S3）** + **任务执行核心（S4：dispatcher）**。
+**5409 本地 API（S3）** + **任务执行核心（S4：dispatcher）** +
+**瘦托盘（S5：pystray）**。
 **上游源码零修改**（只新增本目录）。
 
 ## 实现状态
@@ -16,10 +17,12 @@
 | `agent` | ✅ WS 主循环（S2）：注册/心跳/重连退避/凭证类关闭码挂起/任务落库/结果补发；服务异常以失败态退出触发 SCM 重启 |
 | 任务执行核心（S4） | ✅ dispatcher：并发信号量（默认 2 可配）/账号解析/素材下载（403 重签）/上游上传器适配/异常分类/结果回报/重启恢复 |
 | 5409 本地 API（S3） | ✅ `GET /status`、`GET/POST /config`、`POST /reload`、`POST /bind`；令牌鉴权；写操作审计；绑定失败明确报错（§4.4） |
-| `/ui/*`、登录/账号/升级端点 | ⬜ 占位 501（S5/S6/S7） |
+| `/ui/*`、登录/账号/升级端点 | ⬜ 占位 501（S6/S7） |
+| 瘦托盘（S5） | ✅ `sau tray`：三菜单（打开控制台/打开日志目录/退出，无启停）+ `/status` 轮询（5s）+ 图标状态/气泡提示 + Mutex 单实例 |
 | `machine-code` | ✅ 真实机器码（SHA-256(MachineGuid+卷序列号+CPU ID) 前 32 位，§5.7） |
 | `bind` | ✅ 写 `config.json` + `credential.bin`（DPAPI LOCAL_MACHINE） |
-| `tray / browser / doctor` | ⬜ 占位 |
+| `tray` | ✅ 瘦托盘（S5，见上） |
+| `browser / doctor` | ⬜ 占位 |
 | 版本号 | ✅ `version.py` 的 `APP_VERSION`（可被环境变量 `SAU_VERSION` 覆盖），`--version` 显示 |
 | 日志 | ✅ `%ProgramData%\SAU\logs\service.log`（10MB × 5 轮转） |
 
@@ -72,6 +75,26 @@
 - **可测试性**：`upstream_adapter.register_uploader()` 注入假上传函数、`TaskDispatcher(downloader=…)` 注入假下载器；真实路径保留（惰性 import 上游）。
 - **真实发布依赖**：需平台 cookie。cookie 由上游既有能力获取：`python sau_cli.py <platform> login`（浏览器扫码/登录），包装层不实现登录、只消费其产出。
   **cookies 目录位置差异处理策略**：上游默认写仓库内 `cookies/`（`conf.BASE_DIR`），包装层主目录为 `%ProgramData%\SAU\cookies\`——`accounts.py` 采取**双目录兼容扫描**：主目录优先，同名 `{platform}_{account}` 以主目录为准，上游目录只读回退（不修改不搬迁）；后续步骤可提供迁移/同步命令将常用账号收敛到主目录。
+
+## S5（瘦托盘）范围与语义（设计文档第 5 章）
+
+- **三菜单（定案，无启停）**：① 打开控制台（浏览器访问 `http://127.0.0.1:{port}/ui/`；控制台页面属 S6，本步直接打开根 URL，服务端已占位 501；一次性令牌链路 `/ui/t/<token>` 预留注释）② 打开日志目录（`%ProgramData%\SAU\logs`，不存在则创建）③ 退出（仅退出托盘，不影响服务）。服务恢复全靠延迟自启 + 故障自动重启（§4.2）；
+- **状态轮询**：每 5 秒（`SAU_TRAY_POLL_SECONDS` 可覆盖）调 `GET /status`，带 `X-SAU-Local-Token`（每轮重读 `local_token.bin`，服务重启换令牌自愈）；
+- **状态矩阵**：在线（200 + `ws_connected` 且未挂起）→ 绿色图标；离线（200 但未连接/挂起）/401（令牌不匹配，通常服务刚重启）/不可达（服务未运行）→ 灰色图标；tooltip 含版本/连接态/活跃任务数；
+- **离线提示**：正常→异常翻转时气泡「服务未运行，系统会自动恢复」（§5.2 定案措辞一字一致；挂起态走同一提示）；异常→正常再提示一次恢复；同态重复与首轮不提示；
+- **单实例**：命名互斥量 `SAUTrayMutex`（§5.3），已存在直接退出并记日志。会话本地命名（不带 `Global\` 前缀）：全局命名空间需 SeCreateGlobalPrivilege，标准用户会话下创建会被拒；托盘每用户会话一个，无需跨会话。非 183 创建失败时报错退出，不误报「已在运行」；
+- **日志**：`tray.log`（5MB × 3，§14.1）；托盘异常全部捕获记日志，与服务进程架构隔离，崩溃不影响服务；
+- **权限**：普通用户运行——仅读 `local_token.bin`（users 可读）与写 `logs/`（users-full），全程无提权操作；开机自启注册表 `HKCU\...\Run\SAUTray` 由安装包写入（§5.4，属 S8 打包步骤，本目录不涉及）。
+
+### S5 手动验证步骤（交互会话，自动验证无法覆盖）
+
+1. 启动服务：`python -m sau_wrap agent run-fg`（另开终端）；
+2. 启动托盘：`python -m sau_wrap tray` → 系统托盘出现灰色图标（未绑定/未连接），数秒后若服务已连接则变绿；悬停看 tooltip（版本/连接态/活跃任务）；
+3. 右键菜单：「打开控制台」→ 浏览器打开 `http://127.0.0.1:5409/ui/`（当前 501 占位属预期）；「打开日志目录」→ 资源管理器打开 `%ProgramData%\SAU\logs`；
+4. 停掉服务（Ctrl+C）→ 约 5 秒内图标变灰 + 气泡「服务未运行，系统会自动恢复」；重启服务→ 图标变绿 + 气泡「服务已恢复在线」；
+5. 再开一个 `python -m sau_wrap tray` → 提示已在运行并直接退出（tray.log 有记录）；
+6. 「退出」菜单 → 托盘消失，服务不受影响；
+7. （建议）在**标准用户会话**（非管理员）下重复步骤 2 与 5：验证托盘可正常启动（互斥量为会话本地命名，无 SeCreateGlobalPrivilege 依赖）与单实例语义。
 
 ## 运行方式（开发环境，仓库根目录）
 
@@ -127,8 +150,8 @@ sau_wrap/
 │   ├── accounts.py            账号快照扫描（双目录兼容，S4）
 │   └── upstream_adapter.py    上游上传器适配层（平台×内容类型映射，S4）
 ├── service/                   host.py 服务宿主（asyncio 接线，含 dispatcher 挂载）；ops.py 服务管理；local_api.py 5409 本地 API（S3）
-├── tests/                     mock_ws_server.py + verify_s2/s3/s4.py（本地验证，不触碰上游）
-├── tray/                      占位（S5）
+├── tests/                     mock_ws_server.py + verify_s2/s3/s4/s5.py（本地验证，不触碰上游）
+├── tray/                      瘦托盘（S5：app.py 主体，pystray + Pillow 代码生成图标）
 ├── console/                   占位（S6）
 ├── upgrade/                   占位（S7）
 ├── packaging/                 占位（S8）
@@ -141,6 +164,7 @@ sau_wrap/
 python sau_wrap\tests\verify_s2.py   # S2：WS 主循环，14/14 通过（结果写 tests\_verify_report.txt）
 python sau_wrap\tests\verify_s3.py   # S3：5409 本地 API，14/14 通过（结果写 tests\_verify_report_s3.txt）
 python sau_wrap\tests\verify_s4.py   # S4：任务执行核心，16/16 通过（结果写 tests\_verify_report_s4.txt）
+python sau_wrap\tests\verify_s5.py   # S5：瘦托盘（模块级），26/26 通过（结果写 tests\_verify_report_s5.txt）
 ```
 
 - **verify_s2**（五场景）：①注册握手 + 心跳往返 + publish_task 落库 + 优雅停止；②断线重连退避
@@ -149,4 +173,5 @@ python sau_wrap\tests\verify_s4.py   # S4：任务执行核心，16/16 通过（
 退避重连不退出主循环。
 - **verify_s3**（六场景）：①令牌文件生成；②401/200 鉴权 + /status 契约字段 + /config 读写（未绑定 409）+ /bind 落盘 + 占位 501 + 审计日志；③4401 挂起 → `POST /reload` 唤醒重连；④端口占用 → `LocalApiBindError` + 明确日志；⑤退避可被热重载打断；⑥退避期间 /config 写入即时唤醒。
 - **verify_s4**（五场景，全假注入不拉起上游）：①成功链路（落库→running→mock 上传→task_result success→downloads 清理→account_sync；含成功后重推不重复执行）；②403→file_renew→file_renewed 换 URL 重试成功；③cookie 错误分类 → failed 不重试（attempts=1）；④并发信号量（3 任务峰值并发=2）；⑤重启恢复（recover_pending 扫 queued/running 重新入队执行成功）。
+- **verify_s5**（六场景，模块级不启动 GUI）：①状态轮询四态（在线/离线含挂起/401/不可达，mock /status）；②状态翻转与气泡触发（进入异常提示一次且措辞与 §5.2 一字一致、同态不重复、恢复再提示、首轮不提示）；③Mutex 单实例（会话本地命名；183→None；错误注入非 183 创建失败必须报错不得误报已在运行）；④日志轮转配置（5MB×3）；⑤控制台 URL/日志目录/tooltip 构造与令牌读回；⑥图标色块生成（绿/灰 + 状态→颜色映射）。真实托盘交互验证见上节「S5 手动验证步骤」。
 - 数据隔离于 `tests\_tmpdata*`（`SAU_DATA_ROOT` 覆盖，不触碰 `%ProgramData%\SAU`）。
