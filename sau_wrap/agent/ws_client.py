@@ -81,6 +81,7 @@ class WSClient:
         self._stop = stop_event
         self._resume = resume_event
         self._dispatcher = dispatcher
+        self._updater = None  # S7：升级状态机（host 接线）
         self._clock = ClockTracker()
         self._registered = False
         self._token_expired = False
@@ -104,6 +105,10 @@ class WSClient:
     def attach_dispatcher(self, dispatcher) -> None:
         """挂载任务执行器（S4）；未挂载时 publish_task 仅落库（S2 骨架语义）。"""
         self._dispatcher = dispatcher
+
+    def attach_updater(self, updater) -> None:
+        """挂载升级状态机（S7）；未挂载时 upgrade_notice 仅记日志（向后兼容）。"""
+        self._updater = updater
 
     async def run(self) -> None:
         """外层主循环：退避重连 + 凭证类关闭码挂起，直至 stop。"""
@@ -319,10 +324,19 @@ class WSClient:
                         run_at=_ms_to_iso(data.get("scheduled_at")),
                     )
         elif msg_type == "upgrade_notice":
-            self._logger.info(
-                "收到 upgrade_notice: version=%s（升级状态机见 S7，本步仅记录）",
-                data.get("version"),
-            )
+            # S7：交升级状态机（校验三字段/严格版本大于/域名白名单；不合法拒绝）
+            if self._updater is not None:
+                accepted = self._updater.handle_notice(data)
+                self._logger.info(
+                    "收到 upgrade_notice: version=%s → %s",
+                    data.get("version"),
+                    "受理（状态机推进）" if accepted else "拒绝/忽略（详见日志）",
+                )
+            else:
+                self._logger.info(
+                    "收到 upgrade_notice: version=%s（未挂载 updater，仅记录）",
+                    data.get("version"),
+                )
         elif msg_type == "token_expired":
             self._token_expired = True
             self._logger.warning("收到 token_expired: %s（服务端将以 4410 关闭）", data)

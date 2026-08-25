@@ -25,13 +25,15 @@
   hash 路由无需服务端回退；dist 不存在返回友好提示页；
 - 本步端点：``GET /status``、``GET/POST /config``、``POST /reload``、``POST /bind``、
   ``GET /machine-code``、``GET /nonce``、``POST /ui-ticket``、``GET /ui/t/<ticket>``、
-  ``GET /ui/*``；``/login/*``、``/accounts/*``、``/upgrade*`` **占位 501**
-  （登录扫码会话链路 §6.5 与升级编排 §7.4 留待后续步骤）；
+  ``GET /ui/*``；S7 起升级族落地：``GET /upgrade``（只读快照）、
+  ``POST /upgrade/apply``（用户确认触发编排）、``POST /upgrade/snooze``（稍后提醒）；
+  ``/login/*``、``/accounts/*`` **占位 501**（登录扫码会话链路 §6.5 留待后续）；
 - 写操作审计：绑定/配置写入记一行审计日志（时间、操作、来源恒 127.0.0.1、结果、鉴权方式）。
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import mimetypes
@@ -60,9 +62,10 @@ SESSION_COOKIE = "sau_session"
 #: Nonce 短窗去重保留时长（秒）：已签发未消费的 nonce 超过该时长作废
 NONCE_WINDOW = 600.0
 
-#: Cookie 会话写操作必须携带 Nonce 的路径（§6.3：/config、/upgrade/apply、
-#: 登录/删除账号等；本步落地的写端点为 config/bind/reload，升级/登录族实现时并入）
-_NONCE_REQUIRED = frozenset({"/config", "/bind", "/reload"})
+#: Cookie 会话写操作必须携带 Nonce 的路径（§6.3：/config、/upgrade/apply 等；
+#: S7 起升级写端点并入；令牌鉴权豁免，见中间件）
+_NONCE_REQUIRED = frozenset({"/config", "/bind", "/reload",
+                             "/upgrade/apply", "/upgrade/snooze"})
 
 #: 401 引导页（§6.3：未认证访问控制台 → 说明从托盘「打开控制台」进入）
 _UNAUTH_HTML = """<!DOCTYPE html>
@@ -129,6 +132,7 @@ class LocalApiServer:
         ui_dist_dir: Path | None = None,
         ticket_ttl: float = UI_TICKET_TTL,
         session_timeout: float = SESSION_TIMEOUT,
+        updater=None,
     ) -> None:
         self._logger = logger
         self._client = ws_client
@@ -138,6 +142,11 @@ class LocalApiServer:
         self.ui_dist_dir = ui_dist_dir or resolve_ui_dist_dir()
         self.ticket_ttl = ticket_ttl
         self.session_timeout = session_timeout
+        #: S7：升级状态机（host 接线；未挂载时 GET /upgrade 读持久化快照，
+        #: apply/snooze 返回 503）
+        self._updater = updater
+        #: S7：升级编排器（host 接线；可注入执行器，见 upgrade.orchestrator）
+        self._orchestrator = None
         # ---- S6 会话状态（内存表，服务重启失效可接受，§6.4）----
         self._tickets: dict[str, float] = {}   # 一次性票据 → 过期时间戳
         self._sessions: dict[str, float] = {}  # 会话 id → 最近活动时间戳
@@ -186,6 +195,10 @@ class LocalApiServer:
         self.token = secrets.token_urlsafe(32)
         paths.ensure_dir(paths.DATA_ROOT)
         paths.LOCAL_TOKEN_FILE.write_bytes(self.token.encode("utf-8"))
+
+    def attach_orchestrator(self, orchestrator) -> None:
+        """挂载升级编排器（S7，host 接线；可注入执行器便于开发验证）。"""
+        self._orchestrator = orchestrator
 
     # ------------------------------------------------------------ 鉴权中间件
 
@@ -324,7 +337,11 @@ class LocalApiServer:
         app.router.add_get("/ui", self._get_ui_root)
         app.router.add_get("/ui/t/{ticket}", self._get_ui_exchange)
         app.router.add_get("/ui/{tail:.*}", self._get_ui_static)
-        # 占位端点（后续步骤实现；登录扫码会话链路 §6.5、升级编排 §7.4）
+        # S7：升级族（§7.4：快照只读 / apply 确认编排 / snooze 稍后提醒）
+        app.router.add_get("/upgrade", self._get_upgrade)
+        app.router.add_post("/upgrade/apply", self._post_upgrade_apply)
+        app.router.add_post("/upgrade/snooze", self._post_upgrade_snooze)
+        # 占位端点（后续步骤实现；登录扫码会话链路 §6.5）
         for method, path, note in _PLACEHOLDER_ROUTES:
             app.router.add_route(method, path, self._make_placeholder(note))
 
@@ -424,6 +441,102 @@ class LocalApiServer:
         else:
             headers = {"Cache-Control": "max-age=86400"}
         return web.Response(body=data, content_type=ctype, headers=headers)
+
+    # ------------------------------------------------------------ S7 升级端点（§7.4）
+
+    async def _get_upgrade(self, request: web.Request) -> web.Response:
+        """``GET /upgrade``：只读快照（阶段/目标版本/下载进度/校验结果/错误）。
+
+        未挂载 updater 时退化为读持久化状态文件（服务重启后仍可展示历史状态）。
+        """
+        if self._updater is not None:
+            return web.json_response(self._updater.snapshot())
+        from sau_wrap.upgrade.updater import read_state_file, _empty_state, PHASES  # noqa: PLC0415
+        st = read_state_file() or _empty_state()
+        return web.json_response({
+            "phase": st.get("phase"), "version": st.get("version"),
+            "download_url": st.get("download_url"),
+            "installer_path": st.get("installer_path"),
+            "progress": {"downloaded_bytes": st.get("downloaded_bytes") or 0,
+                          "total_bytes": st.get("total_bytes") or 0,
+                          "percent": None},
+            "verified": bool(st.get("verified")), "error": st.get("error"),
+            "last_rejected": st.get("last_rejected"),
+            "updated_at": st.get("updated_at"),
+            "note": "升级模块未挂载，仅持久化快照" if st.get("phase") in PHASES
+                    else "尚未收到升级通知",
+        })
+
+    async def _post_upgrade_apply(self, request: web.Request) -> web.Response:
+        """``POST /upgrade/apply``：用户确认触发编排（控制台是唯一确认入口，§7.4）。
+
+        编排为同步阻塞流程（真实环境含停服/安装），以 ``to_thread`` 后台执行；
+        本步开发验证注入假执行器（真机链路留待 S8 打包后）。
+
+        单飞语义（review 修正）：端点检查通过后**同步**置 ``applying`` 再返回，
+        重复 apply 因 phase 已非 ready/snoozed 直接 409；编排器内部另有线程锁兜底。
+        """
+        if self._updater is None:
+            return web.json_response(
+                {"error": "updater_not_attached", "message": "升级模块未挂载"},
+                status=503)
+        if self._orchestrator is None:
+            return web.json_response(
+                {"error": "orchestrator_not_attached",
+                 "message": "升级编排器未挂载（服务重启后将自动重建）"},
+                status=503)
+        updater = self._updater
+        phase = updater.state.get("phase")
+        if phase not in ("ready", "snoozed"):
+            return web.json_response(
+                {"error": "upgrade_not_ready",
+                 "message": f"当前状态 {phase or '无'} 不可执行升级（需 ready/snoozed）",
+                 "phase": phase},
+                status=409)
+        # 同步置 applying 再后台执行：编排第一步即停服，本进程可能在步骤中退出，
+        # 状态已持久化 → 重启后由启动自检三分支收敛（§15.2）。
+        updater.set_phase("applying", error=None)
+        orchestrator = self._orchestrator
+        asyncio.get_running_loop().create_task(
+            asyncio.to_thread(self._run_orchestration, orchestrator, request))
+        return web.json_response({"ok": True, "phase": "applying",
+                                   "message": "升级已确认，编排已启动"})
+
+    def _run_orchestration(self, orchestrator, request: web.Request) -> None:
+        """编排后台线程包装：异常兜底落 failed + 审计。"""
+        try:
+            result = orchestrator.apply()
+            self._audit("upgrade_apply",
+                        "success" if result.get("ok") else "fail",
+                        f"phase={result.get('phase')} "
+                        f"failed_step={result.get('failed_step', '-')}"
+                        f" rollback_failed_at={result.get('rollback_failed_at', '-')}",
+                        request)
+        except Exception as exc:
+            self._updater.set_phase("failed", error=f"编排异常：{exc}")
+            self._logger.exception("升级编排异常")
+            self._audit("upgrade_apply", "fail", f"exception={exc}", request)
+
+    async def _post_upgrade_snooze(self, request: web.Request) -> web.Response:
+        """``POST /upgrade/snooze``：稍后提醒（``ready → snoozed``，§7.4）。"""
+        if self._updater is None:
+            return web.json_response(
+                {"error": "updater_not_attached", "message": "升级模块未挂载"},
+                status=503)
+        updater = self._updater
+        if updater.state.get("phase") == "snoozed":
+            return web.json_response({"ok": True, "phase": "snoozed",
+                                       "message": "已处于稍后提醒状态"})
+        if updater.state.get("phase") != "ready":
+            return web.json_response(
+                {"error": "upgrade_not_ready",
+                 "message": "仅 ready 状态可稍后提醒",
+                 "phase": updater.state.get("phase")},
+                status=409)
+        updater.set_phase("snoozed")
+        self._audit("upgrade_snooze", "success",
+                    f"version={updater.state.get('version')}", request)
+        return web.json_response({"ok": True, "phase": "snoozed"})
 
     # ------------------------------------------------------------ 既有端点实现
 
@@ -552,13 +665,10 @@ class LocalApiServer:
 
 
 #: 占位端点（本步返回 501 + 说明，后续步骤实现；
-#: /ui/* 与票据链路已由 S6 实现，从此清单移除）
+#: /ui/* 与票据链路已由 S6 实现、升级族已由 S7 实现，从此清单移除）
 _PLACEHOLDER_ROUTES = (
     ("POST", "/login", "扫码登录会话（后续步骤：§6.5 登录会话族）"),
     ("POST", "/accounts/recheck", "账号状态复核（后续步骤）"),
     ("GET", "/accounts/status", "账号状态查询（后续步骤）"),
     ("DELETE", "/accounts", "账号删除（后续步骤）"),
-    ("GET", "/upgrade", "升级状态快照（S7：§7.4）"),
-    ("POST", "/upgrade/apply", "升级确认（S7：§7.4）"),
-    ("POST", "/upgrade/snooze", "升级稍后提醒（S7：§7.4）"),
 )

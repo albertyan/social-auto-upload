@@ -56,6 +56,8 @@ def _run_agent_blocking(logger, request_async_stop) -> None:
             LocalApiBindError,
             LocalApiServer,
         )
+        from sau_wrap.upgrade.orchestrator import Orchestrator, real_executors
+        from sau_wrap.upgrade.updater import Updater
 
         client = WSClient(logger, stop_event, resume_event)
 
@@ -74,13 +76,26 @@ def _run_agent_blocking(logger, request_async_stop) -> None:
                 after_task_hook=client.send_account_sync,  # 任务结束后同步账号快照
             )
             client.attach_dispatcher(dispatcher)
-            api = LocalApiServer(logger, client, port)
+            # S7：升级状态机（通知校验/后台下载/八态持久化）+ 启动清理（>24h）
+            updater = Updater(logger)
+            updater.cleanup_expired()
+            client.attach_updater(updater)
+            api = LocalApiServer(logger, client, port, updater=updater)
             try:
                 await api.start()
             except LocalApiBindError:
                 # 已明确报错并记日志（§4.4）；服务主体继续运行，/status 等不可用，
                 # 排障依 service.log 与 doctor。
                 api = None
+            # S7：编排器（真实执行器；开发验证可注入假执行器）+ 启动自检三分支
+            # （§15.2：断电/崩溃场景自动收敛；需先有令牌供校验轮询）
+            orch = Orchestrator(
+                logger, updater,
+                real_executors(logger, port, api.token if api else ""),
+                local_api_port=port)
+            if api is not None:
+                api.attach_orchestrator(orch)
+            orch.startup_selfcheck()
             try:
                 # 重启恢复延迟到首次 registered 后触发（ws_client 内调
                 # dispatcher.recover_pending_once）：保证 403 重签时 file_renew 可发。

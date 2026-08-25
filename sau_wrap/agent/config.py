@@ -16,7 +16,7 @@ import ctypes.wintypes
 import json
 import os
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from sau_wrap import paths
 
@@ -105,6 +105,8 @@ class AgentConfig:
     local_api_port: int = 5409
     #: 任务执行并发上限（S4：asyncio.Semaphore，现状默认 2）
     max_concurrency: int = 2
+    #: 升级下载域名白名单（S7，现状文档 §7.3）：缺省回退 server_url 的 host，支持子域
+    update_domain_whitelist: list[str] = field(default_factory=list)
 
 
 def load_config() -> AgentConfig | None:
@@ -130,10 +132,14 @@ def load_config() -> AgentConfig | None:
         concurrency = max(1, int(obj.get("max_concurrency") or 2))
     except (TypeError, ValueError):
         concurrency = 2
+    raw_whitelist = obj.get("update_domain_whitelist") or []
+    if not isinstance(raw_whitelist, list):
+        raw_whitelist = []
+    whitelist = [str(d).strip() for d in raw_whitelist if str(d).strip()]
     return AgentConfig(
         server_url=server_url, agent_id=agent_id,
         heartbeat_interval=interval, local_api_port=port,
-        max_concurrency=concurrency,
+        max_concurrency=concurrency, update_domain_whitelist=whitelist,
     )
 
 
@@ -145,6 +151,7 @@ def save_config(config: AgentConfig) -> None:
         "heartbeat_interval": config.heartbeat_interval,
         "local_api_port": config.local_api_port,
         "max_concurrency": config.max_concurrency,
+        "update_domain_whitelist": list(config.update_domain_whitelist or []),
     }
     _atomic_write(
         paths.CONFIG_FILE, json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8")
@@ -196,6 +203,8 @@ def bind(server_url: str, token: str, agent_id: str | None = None) -> AgentConfi
         heartbeat_interval=existing.heartbeat_interval if existing else 30,
         local_api_port=existing.local_api_port if existing else 5409,
         max_concurrency=existing.max_concurrency if existing else 2,
+        update_domain_whitelist=(existing.update_domain_whitelist
+                                 if existing else []),
     )
     save_config(config)
     save_token(token)

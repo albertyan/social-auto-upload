@@ -7,7 +7,8 @@
 3. ``GET/POST /config``：读/写 server_url，写入触发审计与热重载；
 4. ``POST /bind`` 复用 ``sau bind`` 逻辑（config.json + credential.bin 落盘）；
 5. 4401 挂起 → ``POST /reload`` 唤醒重连（复用 mock WS 服务端，含挂起态 ws_connected=False 断言）；
-6. 占位端点（/login、/upgrade 等）→ 501 + 说明（/ui/* 自 S6 起已由静态托管实现）；
+6. 占位端点（/login 等）→ 501 + 说明（/ui/* 自 S6 起已由静态托管实现；
+   /upgrade 自 S7 起已由升级状态机实现，返回快照 200）；
 7. 端口被占用 → 明确报错（``LocalApiBindError`` + 日志），禁止静默失败（§4.4）；
 8. 退避期间（8s 档）``POST /config`` 热重载打断退避立即重连（<2s）。
 
@@ -155,12 +156,13 @@ async def scenario_api_basics() -> None:
               and cfg2.heartbeat_interval == 25,
               f"resp={rw_body} 落盘server_url={cfg2.server_url if cfg2 else '-'}")
 
-        # 占位 501（/ui/* 自 S6 起已实现：静态托管 200 或产物缺失提示 503）
+        # 占位 501（/ui/* 自 S6 起已实现：静态托管 200 或产物缺失提示 503；
+        # /upgrade 自 S7 起已实现：快照 200）
         pu = await sess.get(f"{base}/ui/", headers=headers)
         pl = await sess.post(f"{base}/login", headers=headers)
         pg = await sess.get(f"{base}/upgrade", headers=headers)
-        check("占位端点 /login/upgrade → 501；/ui/ 已静态托管（200/503）",
-              pu.status in (200, 503) and pl.status == 501 and pg.status == 501,
+        check("占位端点 /login → 501；/ui/ 已静态托管；/upgrade 已实现（200）",
+              pu.status in (200, 503) and pl.status == 501 and pg.status == 200,
               f"status={(pu.status, pl.status, pg.status)} body={(await pl.json())}")
 
     audit_lines = [ln for ln in logbuf.getvalue().splitlines() if "[AUDIT]" in ln]

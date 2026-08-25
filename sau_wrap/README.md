@@ -3,7 +3,8 @@
 按《SAU客户端重建方案-单EXE与包装层设计》实施计划推进：
 单一入口子命令分发 + pywin32 服务宿主 + **Agent WS 主循环（S2）** +
 **5409 本地 API（S3）** + **任务执行核心（S4：dispatcher）** +
-**瘦托盘（S5：pystray）** + **本地 Web 控制台（S6：Vue3 + 静态托管 + 票据/会话鉴权）**。
+**瘦托盘（S5：pystray）** + **本地 Web 控制台（S6：Vue3 + 静态托管 + 票据/会话鉴权）** +
+**半自动升级编排（S7：八态状态机 + 可注入执行器编排 + 启动自检自愈）**。
 **上游源码零修改**（只新增本目录；控制台不复用上游 sau_frontend，冲突 1 定案）。
 
 ## 实现状态
@@ -18,7 +19,8 @@
 | 任务执行核心（S4） | ✅ dispatcher：并发信号量（默认 2 可配）/账号解析/素材下载（403 重签）/上游上传器适配/异常分类/结果回报/重启恢复 |
 | 5409 本地 API（S3） | ✅ `GET /status`、`GET/POST /config`、`POST /reload`、`POST /bind`；令牌鉴权；写操作审计；绑定失败明确报错（§4.4） |
 | Web 控制台（S6） | ✅ 静态托管 `/ui/*` + 票据换 Cookie 鉴权 + Nonce 写防护 + 四页面（状态/绑定/账号/升级） |
-| 登录/账号/升级端点 | ⬜ 占位 501（登录会话族 §6.5、升级 §7.4 留后续步骤） |
+| 升级编排（S7） | ✅ `upgrade_notice` 校验（防投毒）+ 后台下载（边下边算 SHA-256/重试/单飞）+ 八态状态机持久化 + `/upgrade` 快照 + `/upgrade/apply`（可注入执行器编排 + 自动回滚）+ `/upgrade/snooze` + 启动自检三分支（§15.2）；真实停服/安装真机验证留待 S8 打包后 |
+| 登录/账号端点 | ⬜ 占位 501（登录会话族 §6.5 留后续步骤） |
 | 瘦托盘（S5） | ✅ `sau tray`：三菜单（打开控制台/打开日志目录/退出，无启停）+ `/status` 轮询（5s）+ 图标状态/气泡提示 + Mutex 单实例；「打开控制台」已接票据链路（S6） |
 | `machine-code` | ✅ 真实机器码（SHA-256(MachineGuid+卷序列号+CPU ID) 前 32 位，§5.7） |
 | `bind` | ✅ 写 `config.json` + `credential.bin`（DPAPI LOCAL_MACHINE） |
@@ -51,7 +53,8 @@
   - `POST /reload`：热重载——唤醒挂起态 / 断开当前连接以新配置重连（凭证类挂起后的人工恢复入口）；
   - `POST /bind`：复用 `sau bind` 同一逻辑（config.json + DPAPI 凭证）后热重载；
   - S6 起新增：`GET /ui/*`（静态托管）、`POST /ui-ticket`、`GET /ui/t/<ticket>`、`GET /nonce`、`GET /machine-code`（见下节）；
-  - `/login`、`/accounts/*`、`/upgrade*`：占位 501 + 说明（登录会话族/升级留后续步骤）；
+  - S7 起新增：`GET /upgrade`（只读快照）、`POST /upgrade/apply`（确认编排，写操作走 Nonce 链路）、`POST /upgrade/snooze`（见 S7 节）；
+  - `/login`、`/accounts/*`：占位 501 + 说明（登录会话族留后续步骤）；
 - **审计**：绑定/配置写入/热重载在 service.log 记一行 `[AUDIT] op=… source=127.0.0.1 result=… detail=… via=token|cookie`（S6 起附鉴权方式）。
 
 ## S4（任务执行核心）范围与语义（§5.3 流水线 / §4.5 素材重签）
@@ -101,7 +104,7 @@
 ## S6（本地 Web 控制台）范围与语义（设计文档第 6 章）
 
 - **技术选型**：包装层自建 `sau_wrap/console/`（Vue3 + Vite + hash 路由，冲突 1 定案：不复用上游 `sau_frontend`）；原生样式无组件库，控制依赖面；前端只做「5409 本地 API 的浏览器皮肤」；
-- **四页面**：状态总览（`/status` 全字段 5s 自动刷新）/ 绑定（`/machine-code` 展示 + `/config` 读写 + `/bind` + `/reload`）/ 账号（`/status` 快照展示，登录按钮置灰「登录功能建设中」）/ 升级（`/upgrade` 501 → 优雅展示「升级功能建设中」）；
+- **四页面**：状态总览（`/status` 全字段 5s 自动刷新）/ 绑定（`/machine-code` 展示 + `/config` 读写 + `/bind` + `/reload`）/ 账号（`/status` 快照展示，登录按钮置灰「登录功能建设中」）/ 升级（S7 起接入真实快照与确认/暂缓按钮，见下节；S6 本步为 501 优雅展示）；
 - **静态托管**（§6.4）：`GET /ui/*` 从 `sau_wrap/console/dist`（打包后 `{app}\ui`，§6.7）提供；路径穿越防护；`index.html` no-cache / 资源长缓存；产物缺失返回友好提示页（含构建指引）；hash 路由无需服务端回退；
 - **鉴权链路**（§6.3 定案，双鉴权并存）：
   - 托盘/CLI：`X-SAU-Local-Token` 头（既有机制不变）；
@@ -109,7 +112,7 @@
 - **写操作 Nonce 双重防护**（§6.3）：Cookie 会话的写操作（`/config`、`/bind`、`/reload`）必须先 `GET /nonce` 领取一次性 Nonce 经 `X-Console-Nonce` 头提交（一次性消费、短窗去重，缺失 403 / 重复 409）；令牌鉴权（托盘/CLI）无浏览器 CSRF 面，豁免；
 - **401 统一拦截**：未认证浏览器式请求 → 401 引导页（从托盘「打开控制台」进入）；前端 fetch 封装拦截 401 → 跳引导视图，禁止失效态发起写操作；
 - **审计**：控制台写操作沿用既有 `[AUDIT]` 行，新增 `via=token|cookie` 区分来源；
-- **本步边界**：登录扫码会话链路（§6.5）与升级编排（§7.4）**不在本步**——`/login/*`、`/accounts/*`、`/upgrade*` 保持 501 占位，账号页仅展示快照、升级页优雅展示建设中；
+- **本步边界**：登录扫码会话链路（§6.5）不在本步——`/login/*`、`/accounts/*` 保持 501 占位，账号页仅展示快照；升级编排 §7.4 由 S7 实施（见下节）；
 - **构建与分发**（§6.7）：`cd sau_wrap/console && npm install && npm run build` → `dist/`；dist 与 node_modules **不入库**（`console/.gitignore`），打包时由 S8 构建链路经 Nuitka `--include-data-dir` 进安装包；
 - **开发体验**（§6.8）：`npm run dev`（5173）+ vite.config.js 代理 API 到 127.0.0.1:5409（可设 `SAU_DEV_TOKEN` 由代理注入令牌头，仅限开发机）。
 
@@ -129,6 +132,24 @@
 3. 浏览器打开 `http://127.0.0.1:5409/ui/t/<ticket>`（60 秒内、仅一次）。
 
 > 直接访问 `http://127.0.0.1:5409/ui/` 也可加载页面（静态资源公开），但任何业务请求会 401 → 前端展示引导页（属预期，验证 401 链路用）。
+> `GET /ui`（无尾斜杠）302 → `/ui/`；票据核销失败（无效/过期）对浏览器导航返回引导 HTML（按 Accept 判断，与 401 引导页同源逻辑），API 式请求返回 JSON。
+
+## S7（半自动升级编排）范围与语义（重建方案 §3.8/§7.4/§15，现状文档 §7）
+
+- **通知接收与校验（防投毒）**：`upgrade_notice` 三字段（version/download_url/file_hash）非空；`file_hash` 64 位小写 hex；版本语义化且**严格大于**当前 `APP_VERSION`（预发布版低于正式版：`2.0.0a0 < 2.0.0`）；`download_url` 强制 `https`；域名 ∈ 白名单——`config.json` 的 `update_domain_whitelist`（可显式配置），缺省回退 `server_url` 的 host 及其子域；不合法 → 记日志拒绝、`last_rejected` 落状态供端点展示，不进入下载；
+- **后台下载**：落盘 `updates/sau-{version}.exe`；`.part` 临时文件 + 1MB 分块边下边算 SHA-256；失败 3 次尝试指数退避（2s→4s），哈希不符**不重试**（删 `.part` 回 `noticed` 等下次推送）；总超时 1800s；`asyncio.Lock` 单飞（并发触发仅一次真实下载）；成功后置 `ready` 并记 `installer_path`；
+- **状态机八态**（现状文档 §7.3 原样保留）：`noticed → downloading → ready ⇄ snoozed → applying → success / failed / rolled_back`；下载失败/哈希不符回 `noticed`；持久化 `%ProgramData%\SAU\etc\upgrade_state.json`（tmp + `os.replace` 原子写），服务启动读回供自检与端点快照；
+- **端点**（替换原 501 占位）：
+  - `GET /upgrade`：只读快照（phase/目标版本/当前版本/下载进度/校验结果/错误/最近拒绝通知）；
+  - `POST /upgrade/apply`：仅 `ready|snoozed` 可触发（其余 409 `upgrade_not_ready`）→ 置 `applying` → 后台线程执行编排（真实环境会停本服务，靠启动自检收敛终态）；
+  - `POST /upgrade/snooze`：`ready → snoozed`（幂等），其余 409；
+  - 两个写端点并入 Nonce 清单（Cookie 会话必须 `X-Console-Nonce`，令牌鉴权豁免）；
+- **编排六步（SYSTEM 无 UAC，可注入执行器）**：`[1/6]` 停服等 30s → `[2/6]` robocopy 备份安装目录（`/E /PURGE`，exit≥8 判败并保留旧备份）→ `[3/6]` 杀托盘 → `[4/6]` 静默安装 `{installer} /SILENT /SUPPRESSMSGBOXES /NORESTART /LOG`（exit 0/1 为成功）→ `[5/6]` 幂等启服等 30s → `[6/6]` 轮询 `GET /status` 校验 `version==目标 && service_running`；
+- **自动回滚**：任一步失败 → 停服 → robocopy 恢复备份 → 重启服务 → 二次校验 → `rolled_back`；回滚亦失败 → `failed` + 人工救援指引（`MANUAL_RESCUE_GUIDE`：备份目录位置/手动安装/日志路径）；控制台 `failed|rolled_back` 展示「下载安装包手动安装」兜底直链（§7.4）；
+- **启动自检三分支**（§15.2）：读 `upgrade_state.json`，仅 `applying` 态触发——分支1：当前版本==目标 → 补做 `/status` 校验 → `success` + 清备份（校验未过保持 `applying` 待下次自检）；分支2：版本不符（半替换）且备份存在 → 自动回滚 → `rolled_back`；分支3：无备份 → `failed` + 人工救援指引；
+- **启动清理**：删除 >24h 的备份目录与旧版本安装包（目标版本安装包保留）；
+- **可测试性**：编排全部经 `UpgradeExecutor`（7 个可调用 + `resolve_install_dir`）注入——开发/测试用假执行器全路径覆盖；`real_executors()`（win32serviceutil 停启服 / robocopy / wmic 杀托盘 / Inno 静默安装 / urllib 轮询校验）仅在服务宿主接线；
+- **真机验证缺口**：开发环境无服务注册与安装器，停服/安装/回滚全以假执行器覆盖；真实停启、Inno 安装、robocopy 备份恢复的真机验证留待 S8 打包出安装包后执行。
 
 ## 运行方式（开发环境，仓库根目录）
 
@@ -184,10 +205,10 @@ sau_wrap/
 │   ├── accounts.py            账号快照扫描（双目录兼容，S4）
 │   └── upstream_adapter.py    上游上传器适配层（平台×内容类型映射，S4）
 ├── service/                   host.py 服务宿主（asyncio 接线，含 dispatcher 挂载）；ops.py 服务管理；local_api.py 5409 本地 API（S3；S6：静态托管/票据/会话/Nonce）
-├── tests/                     mock_ws_server.py + verify_s2/s3/s4/s5/s6.py（本地验证，不触碰上游）
+├── tests/                     mock_ws_server.py + verify_s2/s3/s4/s5/s6/s7.py（本地验证，不触碰上游）
 ├── tray/                      瘦托盘（S5：app.py 主体，pystray + Pillow 代码生成图标；S6：票据链路）
 ├── console/                   Web 控制台源码（S6：Vue3 + Vite；dist/node_modules 不入库，见 console/.gitignore）
-├── upgrade/                   占位（S7）
+├── upgrade/                   半自动升级编排（S7：updater.py 通知校验/下载/八态状态机；orchestrator.py 可注入执行器六步编排/回滚/启动自检）
 ├── packaging/                 占位（S8）
 └── requirements.txt           包装层独立依赖清单（§8.1）
 ```
@@ -199,15 +220,17 @@ python sau_wrap\tests\verify_s2.py   # S2：WS 主循环，14/14 通过（结果
 python sau_wrap\tests\verify_s3.py   # S3：5409 本地 API，14/14 通过（结果写 tests\_verify_report_s3.txt）
 python sau_wrap\tests\verify_s4.py   # S4：任务执行核心，16/16 通过（结果写 tests\_verify_report_s4.txt）
 python sau_wrap\tests\verify_s5.py   # S5：瘦托盘（模块级），29/29 通过（结果写 tests\_verify_report_s5.txt）
-python sau_wrap\tests\verify_s6.py   # S6：本地 Web 控制台，29/29 通过（需先 npm run build；结果写 tests\_verify_report_s6.txt）
+python sau_wrap\tests\verify_s6.py   # S6：本地 Web 控制台，31/31 通过（需先 npm run build；结果写 tests\_verify_report_s6.txt）
+python sau_wrap\tests\verify_s7.py   # S7：半自动升级编排，34/34 通过（结果写 tests\_verify_report_s7.txt）
 ```
 
 - **verify_s2**（五场景）：①注册握手 + 心跳往返 + publish_task 落库 + 优雅停止；②断线重连退避
 （1011 → 实测间隔 2.02s/4.03s）；③4401 挂起零重连（6s 无新连接）+ 热重载唤醒重连；
 ④result_queue 离线积压（含 60 项多批）→ 补发 → 队列清空；⑤服务端主动 1000 关闭 →
 退避重连不退出主循环。
-- **verify_s3**（六场景）：①令牌文件生成；②401/200 鉴权 + /status 契约字段 + /config 读写（未绑定 409）+ /bind 落盘 + 占位 501（/login、/upgrade；/ui/* 自 S6 已实现）+ 审计日志；③4401 挂起 → `POST /reload` 唤醒重连；④端口占用 → `LocalApiBindError` + 明确日志；⑤退避可被热重载打断；⑥退避期间 /config 写入即时唤醒。
+- **verify_s3**（六场景）：①令牌文件生成；②401/200 鉴权 + /status 契约字段 + /config 读写（未绑定 409）+ /bind 落盘 + 占位 501（/login、/accounts/*；/ui/* 自 S6、/upgrade* 自 S7 已实现）+ 审计日志；③4401 挂起 → `POST /reload` 唤醒重连；④端口占用 → `LocalApiBindError` + 明确日志；⑤退避可被热重载打断；⑥退避期间 /config 写入即时唤醒。
 - **verify_s4**（五场景，全假注入不拉起上游）：①成功链路（落库→running→mock 上传→task_result success→downloads 清理→account_sync；含成功后重推不重复执行）；②403→file_renew→file_renewed 换 URL 重试成功；③cookie 错误分类 → failed 不重试（attempts=1）；④并发信号量（3 任务峰值并发=2）；⑤重启恢复（recover_pending 扫 queued/running 重新入队执行成功）。
 - **verify_s5**（六场景，模块级不启动 GUI）：①状态轮询四态（在线/离线含挂起/401/不可达，mock /status）；②状态翻转与气泡触发（进入异常提示一次且措辞与 §5.2 一字一致、同态不重复、恢复再提示、首轮不提示）；③Mutex 单实例（会话本地命名；183→None；错误注入非 183 创建失败必须报错不得误报已在运行）；④日志轮转配置（5MB×3）；⑤控制台 URL/日志目录/tooltip 构造与令牌读回；⑥图标色块生成（绿/灰 + 状态→颜色映射）。真实托盘交互验证见上节「S5 手动验证步骤」。
-- **verify_s6**（九组场景，需先 `npm run build`）：①构建产物存在性；②静态托管（/ui/ no-cache、资源长缓存、404、路径穿越编码/明文变体均拒绝）；③dist 缺失 → 503 友好提示页；④票据全链路（签发 401 拦截/60s/核销种 Cookie（HttpOnly+SameSite=Strict）→认证访问、单次核销、过期、托盘链路：build_ticket_url/死端口回退 None/持令牌换票据）；⑤单实例顶替（旧 Cookie 401 + 日志）；⑥会话超时；⑦401 引导页（浏览器式 HTML vs API JSON）；⑧Nonce 写防护（缺失 403/一次性/重复 409/令牌豁免/审计 via=）；⑨机器码端点。控制台真实交互验证见上节「控制台访问方式」。
+- **verify_s6**（九组场景，需先 `npm run build`）：①构建产物存在性；②静态托管（/ui/ no-cache、资源长缓存、404、路径穿越编码/明文变体均拒绝）；③dist 缺失 → 503 友好提示页；④票据全链路（签发 401 拦截/60s/核销种 Cookie（HttpOnly+SameSite=Strict）→认证访问、单次核销、过期、托盘链路：build_ticket_url/死端口回退 None/持令牌换票据）；⑤单实例顶替（旧 Cookie 401 + 日志）；⑥会话超时；⑦401 引导页（浏览器式 HTML vs API JSON；含 /ui 无尾斜杠 302 与票据核销失败引导响应）；⑧Nonce 写防护（缺失 403/一次性/重复 409/令牌豁免/审计 via=）；⑨机器码端点。控制台真实交互验证见上节「控制台访问方式」。
+- **verify_s7**（八场景，全假注入不真实停服/安装）：①通知校验与版本比较（三字段/64 位小写 hex/语义化严格大于/强制 https/域名白名单及回退）；②后台下载（本地 http 假文件源：成功落盘校验/失败 2 次重试后成功/哈希不符删文件回 noticed 不重试）；③并发单飞锁（3 并发仅 1 次真实下载）；④状态机迁移全路径 + 原子持久化；⑤编排六步假执行器（成功序列/安装失败→自动回滚→rolled_back/回滚亦失败→failed+人工救援指引/非 ready 拒绝）；⑥启动自检三分支（§15.2：补校验 success+清备份/半替换回滚/无备份人工指引；含校验未过保持 applying、回滚失败 failed 变体）；⑦启动清理（>24h 备份与旧安装包删除、目标安装包保留）；⑧端点（/upgrade 快照、apply 未就绪 409/就绪触发编排+审计、snooze 幂等、Cookie 会话 Nonce 防护、双鉴权共存）。真机验证缺口见 S7 节。
 - 数据隔离于 `tests\_tmpdata*`（`SAU_DATA_ROOT` 覆盖，不触碰 `%ProgramData%\SAU`）。
