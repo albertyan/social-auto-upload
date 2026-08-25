@@ -1,51 +1,51 @@
 # -*- coding: utf-8 -*-
-"""Agent 核心骨架（任务 #12 第一步：空跑原型）。
+"""Agent 核心共享组件（原任务 #12 空跑骨架已退役，整合进 :mod:`ws_client`）。
 
-本步行为（验收要求）：
-- 打印启动日志（版本号 / PID / 数据目录）；
-- 保持运行，周期性记录存活心跳；
-- 响应停止信号，打印停止日志后退出。
+保留本模块承载与传输层解耦的共享逻辑：
 
-【后续步骤实现】（实施计划 S2）：
-- 建立到 opcgeo 的 WS 主循环（重连退避 2s→300s、凭证类关闭码挂起零重连）；
-- 任务调度与回执上报（result_queue 断线补发）；
-- 5409 本地 API 由 service/server.py 承载（S3）。
+- :class:`ClockTracker`：服务端时钟偏差估计（现状文档 §3.8 可靠性语义 #1）——
+  ``heartbeat_ack.server_time``（毫秒）与本机时间的差值做**滑动窗口 10 样本平均**，
+  偏差绝对值 > 5 分钟 → 置调度暂停标志（本步仅标志位，真实调度后续步骤接入）。
 """
 
 from __future__ import annotations
 
-import logging
-import os
+import time
+from collections import deque
 
-import win32event
+#: 滑动窗口样本数（§3.8 #1：10 样本平均）
+CLOCK_WINDOW_SIZE = 10
 
-from sau_wrap.version import APP_VERSION
-
-#: 心跳日志间隔（秒）——骨架阶段用于验证服务持续运行
-HEARTBEAT_SECONDS = 10
-#: 停止信号轮询粒度（毫秒）
-_POLL_MS = 500
+#: 时钟偏差阈值（秒）：超过则暂停任务调度（§3.8 #1：5 分钟）
+CLOCK_DRIFT_PAUSE_SECONDS = 300.0
 
 
-class AgentSkeleton:
-    """空跑 Agent：仅日志 + 等待停止，不建立任何网络连接。"""
+class ClockTracker:
+    """时钟偏差跟踪器：滑动窗口平均估计客户端与服务端的时钟偏差。"""
 
-    def __init__(self, logger: logging.Logger) -> None:
-        self._logger = logger
+    def __init__(self, window_size: int = CLOCK_WINDOW_SIZE) -> None:
+        self._samples: deque[float] = deque(maxlen=window_size)
+        #: 偏差超阈值时为 True（本步仅标志位，供后续调度层消费）
+        self.scheduling_paused = False
 
-    def run(self, stop_event_handle: int) -> None:
-        """阻塞运行，直到 ``stop_event_handle`` 被置位（服务停止）。"""
-        self._logger.info(
-            "agent 骨架启动: version=%s pid=%s (本步为空跑原型，不连接 WS)",
-            APP_VERSION,
-            os.getpid(),
-        )
-        elapsed_seconds = 0
-        while True:
-            rc = win32event.WaitForSingleObject(stop_event_handle, _POLL_MS)
-            if rc == win32event.WAIT_OBJECT_0:
-                break
-            elapsed_seconds += _POLL_MS / 1000
-            if elapsed_seconds % HEARTBEAT_SECONDS == 0:
-                self._logger.debug("agent 骨架存活: 已运行 %.0f 秒", elapsed_seconds)
-        self._logger.info("agent 骨架收到停止信号，退出主循环")
+    def update(self, server_time_ms: int | float) -> float:
+        """喂入一个 ``heartbeat_ack.server_time``（毫秒），返回当前平均偏差（秒）。
+
+        偏差定义：``服务端时间 - 本机时间``（正数表示本机时钟偏慢）。
+        """
+        offset = float(server_time_ms) / 1000.0 - time.time()
+        self._samples.append(offset)
+        avg = sum(self._samples) / len(self._samples)
+        self.scheduling_paused = abs(avg) > CLOCK_DRIFT_PAUSE_SECONDS
+        return avg
+
+    @property
+    def offset_seconds(self) -> float:
+        """当前平均偏差（秒）；无样本时 0。心跳 ``clock_offset_seconds`` 字段取值。"""
+        if not self._samples:
+            return 0.0
+        return sum(self._samples) / len(self._samples)
+
+    @property
+    def sample_count(self) -> int:
+        return len(self._samples)

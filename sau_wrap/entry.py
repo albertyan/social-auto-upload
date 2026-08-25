@@ -10,12 +10,15 @@ CLI 框架选型：文档 §2.4.1 建议「Typer 或 Click」，本实现采用 
     sau service <verb>       install|remove|start|stop|status|upgrade
     sau tray                 瘦托盘（本步占位）
     sau browser install      浏览器内核安装（本步占位）
-    sau doctor|machine-code|bind   诊断 / 机器码 / 绑定（本步占位）
+    sau doctor               诊断（本步占位）
+    sau machine-code|bind    机器码 / 绑定（S2 已实现）
     sau <平台> ...           透传上游 sau_cli.py（后续步骤实现）
 
-本步（任务 #12 第一步）实现状态：
-- agent           ✅ 空跑骨架（写日志、等待停止）
+本步（任务 #13 第二步 / S2）实现状态：
+- agent           ✅ WS 主循环（注册/心跳/重连退避/挂起/任务落库/结果补发）
 - service 五项     ✅ install/remove/start/stop/status（upgrade 占位）
+- machine-code    ✅ 真实机器码（§5.7）
+- bind            ✅ 写 config.json + credential.bin（DPAPI）
 - 其余            ⬜ 占位提示
 """
 
@@ -152,14 +155,37 @@ def doctor() -> None:
 
 @cli.command("machine-code")
 def machine_code() -> None:
-    """【占位】显示机器码（绑定链路）。"""
-    click.echo("sau machine-code 尚未实现。")
+    """显示本机机器码（32 位十六进制，绑定链路，§5.7）。"""
+    from sau_wrap.agent.machine import get_machine_code
+
+    try:
+        click.echo(get_machine_code())
+    except RuntimeError as exc:
+        click.echo(f"[错误] 机器码生成失败：{exc}", err=True)
+        sys.exit(1)
 
 
 @cli.command()
-def bind() -> None:
-    """【占位】绑定 opcgeo（Server URL + Token）。"""
-    click.echo("sau bind 尚未实现。")
+@click.option("--server", "server_url", required=True,
+              help="服务端 WS 基址，如 wss://host/opcgeo/agent/ws")
+@click.option("--token", "token", required=True, help="管理端创建 Agent 时的一次性 token")
+@click.option("--agent-id", "agent_id", default=None,
+              help="可选；缺省自动生成/沿用（32 位 UUID hex）")
+def bind(server_url: str, token: str, agent_id: str | None) -> None:
+    """绑定 opcgeo：写 config.json + credential.bin（DPAPI LOCAL_MACHINE）。"""
+    from sau_wrap.agent import config as agent_config
+
+    try:
+        cfg = agent_config.bind(server_url, token, agent_id)
+    except (ValueError, RuntimeError) as exc:
+        click.echo(f"[错误] 绑定失败：{exc}", err=True)
+        sys.exit(1)
+    click.echo("绑定成功：")
+    click.echo(f"  server_url: {cfg.server_url}")
+    click.echo(f"  agent_id:   {cfg.agent_id}")
+    click.echo(f"  配置:       {agent_config.paths.CONFIG_FILE}")
+    click.echo(f"  凭证:       {agent_config.paths.CREDENTIAL_FILE}（DPAPI 加密）")
+    click.echo("下一步: sau service start（或 sau agent run-fg 前台验证）")
 
 
 # ---------------------------------------------------------------- main

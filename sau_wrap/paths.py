@@ -23,8 +23,11 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-#: 运行时数据根目录（%ProgramData%\SAU）
-DATA_ROOT: Path = Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "SAU"
+#: 运行时数据根目录（%ProgramData%\SAU）；SAU_DATA_ROOT 环境变量可覆盖（测试隔离）
+DATA_ROOT: Path = Path(
+    os.environ.get("SAU_DATA_ROOT")
+    or (Path(os.environ.get("ProgramData", r"C:\ProgramData")) / "SAU")
+)
 
 #: 日志目录（§3.6 / §14.1）
 LOGS_DIR: Path = DATA_ROOT / "logs"
@@ -54,6 +57,16 @@ TRAY_LOG_FILE: Path = LOGS_DIR / "tray.log"
 UPGRADE_LOG_FILE: Path = LOGS_DIR / "upgrade.log"
 
 
+#: 配置文件（§3.6：绑定与运行配置）
+CONFIG_FILE: Path = DATA_ROOT / "config.json"
+
+#: Agent 凭证文件（DPAPI LOCAL_MACHINE 加密，§5.8）
+CREDENTIAL_FILE: Path = DATA_ROOT / "credential.bin"
+
+#: 本地 SQLite 数据库文件（WAL，§5.5）
+DB_FILE: Path = DB_DIR / "sau.db"
+
+
 def ensure_dir(path: Path) -> Path:
     """确保目录存在（不存在则递归创建），返回该目录。"""
     path.mkdir(parents=True, exist_ok=True)
@@ -63,3 +76,8 @@ def ensure_dir(path: Path) -> Path:
 def ensure_logs_dir() -> Path:
     """确保日志目录存在并返回（服务/托盘/CLI 启动时调用）。"""
     return ensure_dir(LOGS_DIR)
+
+
+def ensure_db_dir() -> Path:
+    """确保本地库目录存在并返回。"""
+    return ensure_dir(DB_DIR)

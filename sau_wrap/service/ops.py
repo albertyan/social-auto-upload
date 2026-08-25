@@ -192,6 +192,13 @@ def cmd_install() -> None:
                 err=True,
             )
             sys.exit(1)
+        if exc.winerror == 1073:  # ERROR_SERVICE_EXISTS：重复 install 给友好提示
+            click.echo(
+                f"[提示] 服务 {SERVICE_NAME} 已存在，无需重复安装。"
+                "如需重装，请先执行: sau service remove",
+                err=True,
+            )
+            sys.exit(1)
         raise
     click.echo("服务注册成功。")
     problems = _apply_reliability_policy()
