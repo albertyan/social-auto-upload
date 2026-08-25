@@ -107,9 +107,13 @@ async def scenario_handshake_heartbeat() -> None:
 
     ok = await wait_until(lambda: len(server.received_of("heartbeat")) >= 2, timeout=10)
     regs = server.received_of("register")
+    # S4 起：platforms 为平台注册表（含 douyin 共 7 项），accounts 为快照 list
+    #（SAU_DATA_ROOT 隔离且无 cookie 文件 → 空列表；上游仓库 cookies/ 无 .json）
     check("register 首包字段", bool(regs) and regs[0]["data"]["agent_id"]
           and len(regs[0]["data"]["machine_code"]) == 32
-          and regs[0]["data"]["platforms"] == [] and regs[0]["data"]["accounts"] == [],
+          and "douyin" in regs[0]["data"]["platforms"]
+          and len(regs[0]["data"]["platforms"]) == 7
+          and regs[0]["data"]["accounts"] == [],
           f"register.data={json.dumps(regs[0]['data'], ensure_ascii=False)[:200] if regs else '无'}")
     hbs = server.received_of("heartbeat")
     check("心跳 ≥2 次且含 clock_offset_seconds/active_tasks",

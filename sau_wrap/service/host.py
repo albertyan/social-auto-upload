@@ -49,6 +49,7 @@ def _run_agent_blocking(logger, request_async_stop) -> None:
         request_async_stop(lambda: loop.call_soon_threadsafe(stop_event.set))
 
         from sau_wrap.agent import config as agent_config
+        from sau_wrap.agent.dispatcher import TaskDispatcher
         from sau_wrap.agent.ws_client import WSClient
         from sau_wrap.service.local_api import (
             DEFAULT_PORT,
@@ -61,6 +62,18 @@ def _run_agent_blocking(logger, request_async_stop) -> None:
         async def _main() -> None:
             cfg = agent_config.load_config()
             port = cfg.local_api_port if cfg else DEFAULT_PORT
+            # S4：任务执行核心（并发数可配；时钟暂停/凭证过期时新任务保持 queued）
+            dispatcher = TaskDispatcher(
+                logger,
+                result_sender=client.submit_task_result,
+                file_renew_sender=client.send_file_renew,
+                # 轻量谓词：不读 DB/磁盘，可高频调用（不双调 status_snapshot）
+                scheduling_paused=client.is_scheduling_paused,
+                stop_event=stop_event,
+                max_concurrency=cfg.max_concurrency if cfg else 2,
+                after_task_hook=client.send_account_sync,  # 任务结束后同步账号快照
+            )
+            client.attach_dispatcher(dispatcher)
             api = LocalApiServer(logger, client, port)
             try:
                 await api.start()
@@ -69,6 +82,8 @@ def _run_agent_blocking(logger, request_async_stop) -> None:
                 # 排障依 service.log 与 doctor。
                 api = None
             try:
+                # 重启恢复延迟到首次 registered 后触发（ws_client 内调
+                # dispatcher.recover_pending_once）：保证 403 重签时 file_renew 可发。
                 await client.run()
             finally:
                 if api is not None:
@@ -91,8 +106,8 @@ class SAUAgentService(win32serviceutil.ServiceFramework):
     _svc_display_name_ = "SAU Agent Service"
     #: 服务描述（注册后写入，便于 services.msc 辨识）
     _svc_description_ = (
-        "SAU 包装层 Agent 服务：WS 主循环 + 5409 本地 API。"
-        "当前为 S3：Agent WS 核心 + 本地控制 API。"
+        "SAU 包装层 Agent 服务：WS 主循环 + 5409 本地 API + 任务执行。"
+        "当前为 S4：任务执行核心（dispatcher）。"
     )
 
     def __init__(self, args):

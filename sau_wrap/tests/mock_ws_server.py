@@ -122,6 +122,15 @@ class MockAgentServer:
             self._log_event("server_close", f"code={code}")
             await ws.close(code, reason)
 
+    async def send_to_client(self, msg_type: str, data: dict) -> bool:
+        """主动向当前会话下发消息（如 file_renewed / publish_task，S4 验证用）。"""
+        ws = self._current_ws
+        if ws is None:
+            return False
+        await ws.send(_msg(msg_type, data))
+        self._log_event("server_send", msg_type)
+        return True
+
     def received_types(self) -> list[str]:
         return [m.get("type", "?") for m in self.received]
 

@@ -103,6 +103,8 @@ class AgentConfig:
     heartbeat_interval: int = 30
     #: 本地 API 端口（§4.4：默认 5409，config.json 可覆盖防撞端口）
     local_api_port: int = 5409
+    #: 任务执行并发上限（S4：asyncio.Semaphore，现状默认 2）
+    max_concurrency: int = 2
 
 
 def load_config() -> AgentConfig | None:
@@ -124,9 +126,14 @@ def load_config() -> AgentConfig | None:
         port = int(obj.get("local_api_port") or 5409)
     except (TypeError, ValueError):
         port = 5409
+    try:
+        concurrency = max(1, int(obj.get("max_concurrency") or 2))
+    except (TypeError, ValueError):
+        concurrency = 2
     return AgentConfig(
         server_url=server_url, agent_id=agent_id,
         heartbeat_interval=interval, local_api_port=port,
+        max_concurrency=concurrency,
     )
 
 
@@ -137,6 +144,7 @@ def save_config(config: AgentConfig) -> None:
         "agent_id": config.agent_id,
         "heartbeat_interval": config.heartbeat_interval,
         "local_api_port": config.local_api_port,
+        "max_concurrency": config.max_concurrency,
     }
     _atomic_write(
         paths.CONFIG_FILE, json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8")
@@ -187,6 +195,7 @@ def bind(server_url: str, token: str, agent_id: str | None = None) -> AgentConfi
         agent_id=agent_id,
         heartbeat_interval=existing.heartbeat_interval if existing else 30,
         local_api_port=existing.local_api_port if existing else 5409,
+        max_concurrency=existing.max_concurrency if existing else 2,
     )
     save_config(config)
     save_token(token)

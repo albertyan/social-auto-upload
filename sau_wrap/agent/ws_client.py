@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
 
+from sau_wrap.agent import accounts as accounts_mod
 from sau_wrap.agent import config as agent_config
 from sau_wrap.agent import db
 from sau_wrap.agent.core import ClockTracker
@@ -74,10 +75,12 @@ class WSClient:
         logger: logging.Logger,
         stop_event: asyncio.Event,
         resume_event: asyncio.Event,
+        dispatcher=None,
     ) -> None:
         self._logger = logger
         self._stop = stop_event
         self._resume = resume_event
+        self._dispatcher = dispatcher
         self._clock = ClockTracker()
         self._registered = False
         self._token_expired = False
@@ -97,6 +100,10 @@ class WSClient:
         self._current_ws = None
 
     # ------------------------------------------------------------ 主循环
+
+    def attach_dispatcher(self, dispatcher) -> None:
+        """挂载任务执行器（S4）；未挂载时 publish_task 仅落库（S2 骨架语义）。"""
+        self._dispatcher = dispatcher
 
     async def run(self) -> None:
         """外层主循环：退避重连 + 凭证类关闭码挂起，直至 stop。"""
@@ -192,8 +199,8 @@ class WSClient:
                     "agent_id": cfg.agent_id,
                     "machine_code": machine,
                     "version": APP_VERSION,
-                    "platforms": [],   # 平台注册表：后续步骤填充
-                    "accounts": [],    # 账号快照：后续步骤由 Scanner 提供
+                    "platforms": list(accounts_mod.PLATFORM_KEYS),  # 平台注册表（S4）
+                    "accounts": accounts_mod.scan_accounts(),       # 账号快照（S4）
                 }))
             except ConnectionClosed:
                 # 注册阶段连接即被服务端关闭（如握手后立即 4401/4409）：
@@ -254,7 +261,7 @@ class WSClient:
             data = {
                 "agent_id": cfg.agent_id,
                 "active_tasks": db.count_active_tasks(),
-                "accounts": [],  # 账号快照：后续步骤填充
+                "accounts": accounts_mod.scan_accounts(),  # 账号快照（S4）
                 "clock_offset_seconds": round(self._clock.offset_seconds, 3),
             }
             if not await self._send(ws, "heartbeat", data):
@@ -279,6 +286,10 @@ class WSClient:
                 data.get("agent_id"), data.get("machine_bound"), self.expire_at,
             )
             await self._flush_result_queue(ws)
+            if self._dispatcher is not None:
+                # 重启恢复延迟到会话就绪（幂等，仅首次）：保证下载 403 需重签时
+                # file_renew 有连接可发，避免恢复任务因离线发送失败直接 failed。
+                self._dispatcher.recover_pending_once()
         elif msg_type == "heartbeat_ack":
             server_time = data.get("server_time")
             if server_time is not None:
@@ -293,16 +304,20 @@ class WSClient:
         elif msg_type == "publish_task":
             task_id = str(data.get("task_id") or "")
             self._logger.info(
-                "收到 publish_task: task_id=%s platform=%s content_type=%s"
-                "（本步仅落库骨架，真实执行后续步骤实现）",
+                "收到 publish_task: task_id=%s platform=%s content_type=%s",
                 task_id, data.get("platform_key"), data.get("content_type"),
             )
             if task_id:
-                db.upsert_task(
-                    task_id,
-                    json.dumps(data, ensure_ascii=False),
-                    run_at=_ms_to_iso(data.get("scheduled_at")),
-                )
+                if self._dispatcher is not None:
+                    # S4：交执行器（幂等落库 + 并发执行 + 结果回报）
+                    self._dispatcher.submit(data)
+                else:
+                    # 未挂载执行器：仅落库骨架（S2 语义，向后兼容）
+                    db.upsert_task(
+                        task_id,
+                        json.dumps(data, ensure_ascii=False),
+                        run_at=_ms_to_iso(data.get("scheduled_at")),
+                    )
         elif msg_type == "upgrade_notice":
             self._logger.info(
                 "收到 upgrade_notice: version=%s（升级状态机见 S7，本步仅记录）",
@@ -315,15 +330,19 @@ class WSClient:
             self._logger.warning("收到 bind_rejected: reason=%s", data.get("reason"))
         elif msg_type == "file_renewed":
             self._logger.info(
-                "收到 file_renewed: task_id=%s（素材重签，下载逻辑后续步骤实现）",
+                "收到 file_renewed: task_id=%s（素材重签新 URL，§4.5）",
                 data.get("task_id"),
             )
+            if self._dispatcher is not None:
+                self._dispatcher.on_file_renewed(data)
         else:
             self._logger.info("收到未处理消息类型: %s", msg_type)
 
     # ------------------------------------------------------------ 发送
 
     async def _send(self, ws, msg_type: str, data: dict) -> bool:
+        if ws is None:
+            return False
         try:
             await ws.send(_msg(msg_type, data))
             return True
@@ -340,7 +359,8 @@ class WSClient:
         publish_url: str = "",
         remarks: str = "",
     ) -> bool:
-        """task_result 上报（§5.4）：先落 result_queue，发送成功后删除队列项。"""
+        """task_result 上报（§5.4）：先落 result_queue，发送成功后删除队列项。
+        ``ws`` 为 None（离线）时仅落库，留待重连补发。"""
         data = {
             "task_id": task_id,
             "status": status,
@@ -387,6 +407,33 @@ class WSClient:
         if total_sent:
             self._logger.info("result_queue 补发完成，共 %d 项，队列已清空", total_sent)
 
+    # ------------------------------------------------------------ 上行辅助（S4）
+
+    async def submit_task_result(
+        self,
+        task_id: str,
+        status: str,
+        error: str = "",
+        publish_url: str = "",
+        remarks: str = "",
+    ) -> bool:
+        """任务结果回报统一入口（供 dispatcher 注入）：先落 result_queue，
+        在线即发、离线留存，重连后由补发循环清完（§5.4）。"""
+        return await self.send_task_result(
+            self._current_ws, task_id, status, error, publish_url, remarks
+        )
+
+    async def send_file_renew(self, task_id: str) -> bool:
+        """上行 ``file_renew{task_id}``（素材 403 重签，§4.5）。"""
+        return await self._send(self._current_ws, "file_renew", {"task_id": task_id})
+
+    async def send_account_sync(self) -> bool:
+        """上行 ``account_sync{accounts}``（§3.3）：账号快照变更同步。"""
+        if self._current_ws is None:
+            return False
+        snapshot = accounts_mod.scan_accounts()
+        return await self._send(self._current_ws, "account_sync", {"accounts": snapshot})
+
     # ------------------------------------------------------------ 热重载（S3 本地 API 触发）
 
     def trigger_reload(self) -> str:
@@ -408,6 +455,11 @@ class WSClient:
 
     # ------------------------------------------------------------ 可观测快照（§3.7 契约）
 
+    def is_scheduling_paused(self) -> bool:
+        """轻量谓词（供 dispatcher 的 scheduling_paused 注入）：时钟偏差暂停或
+        凭证过期时为 True。不读 DB/磁盘，可高频调用。"""
+        return self._clock.scheduling_paused or self._token_expired
+
     def status_snapshot(self) -> dict:
         """只读状态快照（供 5409 本地 API ``GET /status``），
         收敛对内部私有属性的直接读取。字段结构按 §3.7 契约固定。"""
@@ -416,7 +468,7 @@ class WSClient:
             "suspended": self.suspended,
             "version": APP_VERSION,
             "active_tasks": db.count_active_tasks(),
-            "accounts": [],  # 账号快照骨架（S5/S6：Scanner 接入后填充）
+            "accounts": accounts_mod.scan_accounts(),  # 账号快照（S4：双目录兼容扫描）
             "clock_offset_seconds": round(self._clock.offset_seconds, 3),
             "scheduling_paused": self._clock.scheduling_paused,
             "token_expire_at": self.expire_at,

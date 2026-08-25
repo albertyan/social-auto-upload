@@ -90,6 +90,50 @@ def set_task_status(task_id: str, status: str) -> None:
         )
 
 
+def get_task(task_id: str) -> tuple[str, str, str] | None:
+    """按 task_id 读取（task_id, payload, status）；不存在返回 None。"""
+    with _LOCK, _connect() as conn:
+        row = conn.execute(
+            "SELECT task_id, payload, status FROM local_tasks WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    return (str(row[0]), str(row[1]), str(row[2]))
+
+
+def list_pending_tasks() -> list[tuple[str, str]]:
+    """重启恢复（§5.3）：返回所有 queued/running 任务的 (task_id, payload)。"""
+    with _LOCK, _connect() as conn:
+        rows = conn.execute(
+            "SELECT task_id, payload FROM local_tasks WHERE status IN ('queued', 'running')"
+            " ORDER BY created_at"
+        ).fetchall()
+    return [(str(r[0]), str(r[1])) for r in rows]
+
+
+def update_task_payload(task_id: str, payload: str) -> None:
+    """更新任务载荷（素材重签后新 URL 回写，防重启后丢失）。"""
+    with _LOCK, _connect() as conn:
+        conn.execute(
+            "UPDATE local_tasks SET payload = ?, updated_at = ? WHERE task_id = ?",
+            (payload, _utcnow(), task_id),
+        )
+
+
+def bump_task_attempts(task_id: str) -> int:
+    """执行尝试计数 +1，返回新值（供排障/后续重试策略）。"""
+    with _LOCK, _connect() as conn:
+        conn.execute(
+            "UPDATE local_tasks SET attempts = attempts + 1, updated_at = ? WHERE task_id = ?",
+            (_utcnow(), task_id),
+        )
+        row = conn.execute(
+            "SELECT attempts FROM local_tasks WHERE task_id = ?", (task_id,)
+        ).fetchone()
+    return int(row[0]) if row else 0
+
+
 # ---------------------------------------------------------------- result_queue
 
 

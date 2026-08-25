@@ -1,8 +1,8 @@
-# sau_wrap —— SAU 客户端包装层（S1/S4 已落，S2：Agent WS 核心，S3：5409 本地 API）
+# sau_wrap —— SAU 客户端包装层（S1 已落，S2：Agent WS 核心，S3：5409 本地 API，S4：任务执行核心）
 
 按《SAU客户端重建方案-单EXE与包装层设计》实施计划推进：
 单一入口子命令分发 + pywin32 服务宿主 + **Agent WS 主循环（S2）** +
-**5409 本地 API（S3）**。
+**5409 本地 API（S3）** + **任务执行核心（S4：dispatcher）**。
 **上游源码零修改**（只新增本目录）。
 
 ## 实现状态
@@ -14,6 +14,7 @@
 | `service remove/start/stop/status` | ✅（start 轮询窗口 60s，stop 等待 30s） |
 | `service upgrade` | ⬜ 占位（S7） |
 | `agent` | ✅ WS 主循环（S2）：注册/心跳/重连退避/凭证类关闭码挂起/任务落库/结果补发；服务异常以失败态退出触发 SCM 重启 |
+| 任务执行核心（S4） | ✅ dispatcher：并发信号量（默认 2 可配）/账号解析/素材下载（403 重签）/上游上传器适配/异常分类/结果回报/重启恢复 |
 | 5409 本地 API（S3） | ✅ `GET /status`、`GET/POST /config`、`POST /reload`、`POST /bind`；令牌鉴权；写操作审计；绑定失败明确报错（§4.4） |
 | `/ui/*`、登录/账号/升级端点 | ⬜ 占位 501（S5/S6/S7） |
 | `machine-code` | ✅ 真实机器码（SHA-256(MachineGuid+卷序列号+CPU ID) 前 32 位，§5.7） |
@@ -47,6 +48,30 @@
   - `POST /bind`：复用 `sau bind` 同一逻辑（config.json + DPAPI 凭证）后热重载；
   - `/ui/*`、`/ui-ticket`、`/login`、`/accounts/*`、`/upgrade*`：占位 501 + 说明（控制台/登录/升级留后续步骤）；
 - **审计**：绑定/配置写入/热重载在 service.log 记一行 `[AUDIT] op=… source=127.0.0.1 result=… detail=…`。
+
+## S4（任务执行核心）范围与语义（§5.3 流水线 / §4.5 素材重签）
+
+- **接收与并发**：`publish_task` → dispatcher；`asyncio.Semaphore` 并发控制（默认 2，`config.json` 的 `max_concurrency` 可配）；幂等落库 `local_tasks`（queued→running→success/failed，INSERT OR REPLACE）；
+- **重启恢复**：`recover_pending()` 扫 queued/running 重新入队（非法 JSON 标 failed）；由首次收到 `registered` 后幂等触发（`recover_pending_once`），保证 403 重签时 `file_renew` 有连接可发；已 success 任务重推直接跳过（防重复发布），failed 重推保留（服务端重试语义）；
+- **账号解析**：扫描 `%ProgramData%\SAU\cookies\{platform}_{account}.json` 生成快照；指定 `account_name` 按名取，否则 first_valid；无可用账号 → failed 并写明原因（不自动重试）；本步 `is_valid` = 文件存在且合法 JSON（真实有效性复核留后续步骤）；
+- **素材下载**：video 用 `file_url` 存 `downloads/{task_id}/video.mp4`，note 用 `media_urls[]`；aiohttp 512KB 分块；**403 → 上行 `file_renew{task_id}` → 等服务端回 `file_renewed`（新 URL）后重新下载**，重签上限 2 次防死循环；新 URL 回写 `local_tasks.payload`；
+- **上游上传器**（import 方式，绝不修改上游）：
+  | platform_key | content_type | 上游入口 |
+  | --- | --- | --- |
+  | douyin | video / note | `DouYinVideo.douyin_upload_video()` / `DouYinNote.douyin_upload_note()` |
+  | kuaishou | video / note | `KSVideo.main()` / `KSNote.main()` |
+  | xiaohongshu | video / note | `XiaoHongShuVideo.main()` / `XiaoHongShuNote.main()` |
+  | bilibili | video | `run_biliup_command([...])`（默认分区 tid=21，to_thread 包裹） |
+  | tencent | video | `TencentVideo.tencent_upload_video()`（唯一支持草稿：manual→is_draft） |
+  | youtube | video | `YouTubeVideo.main()`（可映射但**未验证**） |
+  | baijiahao | video | `BaiJiaHaoVideo.main()` |
+- **异常分类**：cookie/登录态关键词 → failed 不自动重试（现状语义）；网络错误 → failed + 备注（服务端可按规则重投）；
+- **结果回报**：复用 `result_queue` 语义（先落库再发送，断线补发）；完成后清理 `downloads/{task_id}`；manual 非草稿平台备注“平台不支持草稿，已直接发布”；
+- **账号同步**：`account_sync` 上行——注册首包/心跳带 `scan_accounts()` 快照，任务结束后经 after_task_hook 再同步一次；
+- **时钟保护**：`scheduling_paused`（时钟偏差 >5 分钟）或凭证过期时新任务保持 queued 不执行；
+- **可测试性**：`upstream_adapter.register_uploader()` 注入假上传函数、`TaskDispatcher(downloader=…)` 注入假下载器；真实路径保留（惰性 import 上游）。
+- **真实发布依赖**：需平台 cookie。cookie 由上游既有能力获取：`python sau_cli.py <platform> login`（浏览器扫码/登录），包装层不实现登录、只消费其产出。
+  **cookies 目录位置差异处理策略**：上游默认写仓库内 `cookies/`（`conf.BASE_DIR`），包装层主目录为 `%ProgramData%\SAU\cookies\`——`accounts.py` 采取**双目录兼容扫描**：主目录优先，同名 `{platform}_{account}` 以主目录为准，上游目录只读回退（不修改不搬迁）；后续步骤可提供迁移/同步命令将常用账号收敛到主目录。
 
 ## 运行方式（开发环境，仓库根目录）
 
@@ -97,10 +122,12 @@ sau_wrap/
 │   ├── config.py              config.json + credential.bin（DPAPI，§5.8）+ bind
 │   ├── db.py                  SQLite WAL：local_tasks / result_queue（§5.5）
 │   ├── core.py                ClockTracker（时钟偏差滑动平均，§3.8 #1）
-│   ├── ws_client.py           WS 主循环（S2 核心）
-│   └── dispatcher.py / accounts.py   占位（任务调度/账号，后续步骤）
-├── service/                   host.py 服务宿主（asyncio 接线）；ops.py 服务管理；local_api.py 5409 本地 API（S3）
-├── tests/                     mock_ws_server.py + verify_s2.py + verify_s3.py（本地验证，不触碰上游）
+│   ├── ws_client.py           WS 主循环（S2 核心；S4：账号快照/上行辅助）
+│   ├── dispatcher.py          任务执行核心（S4：流水线/重签/异常分类/恢复）
+│   ├── accounts.py            账号快照扫描（双目录兼容，S4）
+│   └── upstream_adapter.py    上游上传器适配层（平台×内容类型映射，S4）
+├── service/                   host.py 服务宿主（asyncio 接线，含 dispatcher 挂载）；ops.py 服务管理；local_api.py 5409 本地 API（S3）
+├── tests/                     mock_ws_server.py + verify_s2/s3/s4.py（本地验证，不触碰上游）
 ├── tray/                      占位（S5）
 ├── console/                   占位（S6）
 ├── upgrade/                   占位（S7）
@@ -112,12 +139,14 @@ sau_wrap/
 
 ```powershell
 python sau_wrap\tests\verify_s2.py   # S2：WS 主循环，14/14 通过（结果写 tests\_verify_report.txt）
-python sau_wrap\tests\verify_s3.py   # S3：5409 本地 API，12/12 通过（结果写 tests\_verify_report_s3.txt）
+python sau_wrap\tests\verify_s3.py   # S3：5409 本地 API，14/14 通过（结果写 tests\_verify_report_s3.txt）
+python sau_wrap\tests\verify_s4.py   # S4：任务执行核心，16/16 通过（结果写 tests\_verify_report_s4.txt）
 ```
 
 - **verify_s2**（五场景）：①注册握手 + 心跳往返 + publish_task 落库 + 优雅停止；②断线重连退避
 （1011 → 实测间隔 2.02s/4.03s）；③4401 挂起零重连（6s 无新连接）+ 热重载唤醒重连；
 ④result_queue 离线积压（含 60 项多批）→ 补发 → 队列清空；⑤服务端主动 1000 关闭 →
 退避重连不退出主循环。
-- **verify_s3**（五场景）：①令牌文件生成；②401/200 鉴权 + /status 契约字段 + /config 读写（未绑定 409）+ /bind 落盘 + 占位 501 + 审计日志；③4401 挂起 → `POST /reload` 唤醒重连；④端口占用 → `LocalApiBindError` + 明确日志。
-- 数据隔离于 `tests\_tmpdata` / `tests\_tmpdata3`（`SAU_DATA_ROOT` 覆盖，不触碰 `%ProgramData%\SAU`）。
+- **verify_s3**（六场景）：①令牌文件生成；②401/200 鉴权 + /status 契约字段 + /config 读写（未绑定 409）+ /bind 落盘 + 占位 501 + 审计日志；③4401 挂起 → `POST /reload` 唤醒重连；④端口占用 → `LocalApiBindError` + 明确日志；⑤退避可被热重载打断；⑥退避期间 /config 写入即时唤醒。
+- **verify_s4**（五场景，全假注入不拉起上游）：①成功链路（落库→running→mock 上传→task_result success→downloads 清理→account_sync；含成功后重推不重复执行）；②403→file_renew→file_renewed 换 URL 重试成功；③cookie 错误分类 → failed 不重试（attempts=1）；④并发信号量（3 任务峰值并发=2）；⑤重启恢复（recover_pending 扫 queued/running 重新入队执行成功）。
+- 数据隔离于 `tests\_tmpdata*`（`SAU_DATA_ROOT` 覆盖，不触碰 `%ProgramData%\SAU`）。
