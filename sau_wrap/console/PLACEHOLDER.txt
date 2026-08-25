@@ -1,0 +1,8 @@
+sau_wrap/console/ —— 控制台前端【占位目录】
+
+包装层自建控制台（设计文档第 6 章，冲突 1 定案：不复用/不修改上游 sau_frontend）。
+
+实施计划 S6 落地：
+- Vue 3 + Vite + hash 路由（createWebHashHistory）
+- 四页：状态总览 / 绑定 / 账号 / 升级（§6.2）
+- 构建产物 dist/ 经 Nuitka --include-data-dir 随包分发（§6.7）

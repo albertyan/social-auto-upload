@@ -1,0 +1,12 @@
+# 包装层依赖清单（设计文档 §8.1，冲突 2 定案：独立清单，不动上游 requirements.txt）
+#
+# 打包/安装时与上游 requirements.txt（UTF-16 编码，读取需显式解码，§9.4）合并安装。
+#
+# 本步（任务 #12 第一步）实际使用：
+pywin32>=306        # Windows 服务宿主（win32serviceutil，§4.1）
+click>=8.1          # CLI 子命令分发框架（§2.4.1 定案方向：Typer/Click，此处取 Click）
+#
+# 后续步骤按需追加（当前不安装，避免提前引入）：
+# websockets        # WS Agent 核心（S2）
+# aiohttp           # 5409 本地 API（S3）
+# pystray           # 瘦托盘（S5）
