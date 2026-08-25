@@ -32,11 +32,13 @@ from sau_wrap.version import APP_VERSION
 
 
 def _run_agent_blocking(logger, request_async_stop) -> None:
-    """以 asyncio 驱动 WS 主循环（阻塞直至停止）。
+    """以 asyncio 驱动服务主体（阻塞直至停止）。
 
     - ``WindowsSelectorEventLoopPolicy``（§5.1）；
-    - ``request_async_stop`` 返回一个回调注册器，供外部（服务停止/信号）置位
-      asyncio stop 事件——签名：``register(callback)``，callback 无参。
+    - 并发启动：5409 本地 API（S3）+ WS 主循环（S2）；
+    - 本地 API 绑定失败：明确报错后服务主体（WS）继续运行（§4.4 禁止静默失败，
+      但不因端口占用拖死 WS 链路）；
+    - ``request_async_stop`` 回调注册器：供外部（服务停止/信号）置位 asyncio stop 事件。
     """
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     loop = asyncio.new_event_loop()
@@ -46,10 +48,33 @@ def _run_agent_blocking(logger, request_async_stop) -> None:
         resume_event = asyncio.Event()
         request_async_stop(lambda: loop.call_soon_threadsafe(stop_event.set))
 
+        from sau_wrap.agent import config as agent_config
         from sau_wrap.agent.ws_client import WSClient
+        from sau_wrap.service.local_api import (
+            DEFAULT_PORT,
+            LocalApiBindError,
+            LocalApiServer,
+        )
 
         client = WSClient(logger, stop_event, resume_event)
-        loop.run_until_complete(client.run())
+
+        async def _main() -> None:
+            cfg = agent_config.load_config()
+            port = cfg.local_api_port if cfg else DEFAULT_PORT
+            api = LocalApiServer(logger, client, port)
+            try:
+                await api.start()
+            except LocalApiBindError:
+                # 已明确报错并记日志（§4.4）；服务主体继续运行，/status 等不可用，
+                # 排障依 service.log 与 doctor。
+                api = None
+            try:
+                await client.run()
+            finally:
+                if api is not None:
+                    await api.stop()
+
+        loop.run_until_complete(_main())
     finally:
         try:
             loop.close()
@@ -67,7 +92,7 @@ class SAUAgentService(win32serviceutil.ServiceFramework):
     #: 服务描述（注册后写入，便于 services.msc 辨识）
     _svc_description_ = (
         "SAU 包装层 Agent 服务：WS 主循环 + 5409 本地 API。"
-        "当前为 S2：Agent WS 核心（注册/心跳/重连退避/任务落库/结果补发）。"
+        "当前为 S3：Agent WS 核心 + 本地控制 API。"
     )
 
     def __init__(self, args):

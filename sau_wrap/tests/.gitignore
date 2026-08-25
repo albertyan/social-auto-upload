@@ -1,4 +1,4 @@
 # 测试产物（临时数据目录与验证报告），不入库
-_tmpdata/
-_verify_report.txt
+_tmpdata*/
+_verify_report*.txt
 _smoke.txt

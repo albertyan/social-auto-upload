@@ -101,6 +101,8 @@ class AgentConfig:
     server_url: str
     agent_id: str
     heartbeat_interval: int = 30
+    #: 本地 API 端口（§4.4：默认 5409，config.json 可覆盖防撞端口）
+    local_api_port: int = 5409
 
 
 def load_config() -> AgentConfig | None:
@@ -118,7 +120,14 @@ def load_config() -> AgentConfig | None:
         interval = int(obj.get("heartbeat_interval") or 30)
     except (TypeError, ValueError):
         interval = 30
-    return AgentConfig(server_url=server_url, agent_id=agent_id, heartbeat_interval=interval)
+    try:
+        port = int(obj.get("local_api_port") or 5409)
+    except (TypeError, ValueError):
+        port = 5409
+    return AgentConfig(
+        server_url=server_url, agent_id=agent_id,
+        heartbeat_interval=interval, local_api_port=port,
+    )
 
 
 def save_config(config: AgentConfig) -> None:
@@ -127,6 +136,7 @@ def save_config(config: AgentConfig) -> None:
         "server_url": config.server_url,
         "agent_id": config.agent_id,
         "heartbeat_interval": config.heartbeat_interval,
+        "local_api_port": config.local_api_port,
     }
     _atomic_write(
         paths.CONFIG_FILE, json.dumps(obj, ensure_ascii=False, indent=2).encode("utf-8")
@@ -176,6 +186,7 @@ def bind(server_url: str, token: str, agent_id: str | None = None) -> AgentConfi
         server_url=server_url,
         agent_id=agent_id,
         heartbeat_interval=existing.heartbeat_interval if existing else 30,
+        local_api_port=existing.local_api_port if existing else 5409,
     )
     save_config(config)
     save_token(token)

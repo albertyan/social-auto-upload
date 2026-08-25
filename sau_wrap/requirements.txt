@@ -7,7 +7,7 @@ pywin32>=306        # Windows 服务宿主（win32serviceutil，§4.1）
 click>=8.1          # CLI 子命令分发框架（§2.4.1 定案方向：Typer/Click，此处取 Click）
 websockets>=13.0    # WS Agent 核心（S2：websockets.asyncio.client，应用层心跳；
                     # 13.0 起 connect 参数名为 additional_headers，12.x 是 extra_headers）
+aiohttp>=3.9        # 5409 本地 API（S3：仅监听 127.0.0.1，§3.5/§4.4）
 #
 # 后续步骤按需追加（当前不安装，避免提前引入）：
-# aiohttp           # 5409 本地 API（S3）
 # pystray           # 瘦托盘（S5）

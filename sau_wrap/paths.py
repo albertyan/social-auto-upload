@@ -63,6 +63,9 @@ CONFIG_FILE: Path = DATA_ROOT / "config.json"
 #: Agent 凭证文件（DPAPI LOCAL_MACHINE 加密，§5.8）
 CREDENTIAL_FILE: Path = DATA_ROOT / "credential.bin"
 
+#: 本地 API 访问令牌（§3.6：服务每次启动重新生成，users 可读，托盘/CLI 持其调 5409）
+LOCAL_TOKEN_FILE: Path = DATA_ROOT / "local_token.bin"
+
 #: 本地 SQLite 数据库文件（WAL，§5.5）
 DB_FILE: Path = DB_DIR / "sau.db"
 

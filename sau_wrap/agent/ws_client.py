@@ -86,6 +86,15 @@ class WSClient:
         self._backoff = BACKOFF_INITIAL
         #: 最近一次 registered 下发的有效期（毫秒或 None）
         self.expire_at: int | None = None
+        # ---- 可观测状态（供 5409 本地 API /status 读取，§3.7 契约）----
+        #: WS 会话是否存活（连接建立→会话结束）
+        self.ws_connected = False
+        #: 是否处于凭证类挂起态（零重连等待唤醒）
+        self.suspended = False
+        #: 最近一次断开原因（关闭码 + 语义，供排障与 /status）
+        self.last_close_reason: str | None = None
+        #: 当前连接引用（热重载时主动关闭触发重连）
+        self._current_ws = None
 
     # ------------------------------------------------------------ 主循环
 
@@ -127,17 +136,19 @@ class WSClient:
                 ) as ws:
                     self._logger.info("WS 连接已建立")
                     normal_exit = await self._session(ws, cfg, machine)
-                    if normal_exit:  # 优雅停止
+                    if normal_exit:  # 优雅停止（仅停止信号触发）
                         break
             except ConnectionClosed as exc:
                 # 统一分类（ConnectionClosedOK 亦为其子类）：关闭握手完成与否决定
                 # OK/非 OK，但凭证类关闭码判定不受影响，必须在退避之前。
                 code = exc.rcvd.code if exc.rcvd is not None else None
+                reason = getattr(exc.rcvd, "reason", "") or ""
                 if code in SUSPEND_CLOSE_CODES:
+                    self.last_close_reason = f"凭证类关闭码 {code}（{reason or '-'}），已挂起"
                     self._logger.warning(
                         "服务端以凭证类关闭码 %s 关闭连接（%s），进入挂起零重连，"
                         "等待凭证更新（配置热重载）唤醒",
-                        code, getattr(exc.rcvd, "reason", "") or "-",
+                        code, reason or "-",
                     )
                     if code == 4410:
                         self._token_expired = True
@@ -149,12 +160,15 @@ class WSClient:
                     break  # 优雅停止（仅停止信号触发才退出主循环）
                 # 其余码（含服务端主动 1000，如发版重启）：退避重连，不退出进程；
                 # 不属凭证类，不挂起。
+                self.last_close_reason = f"关闭码 {code}（{reason or '-'}）"
                 self._logger.warning(
                     "WS 连接被关闭（code=%s），%s 秒后重连", code, self._backoff
                 )
             except OSError as exc:
+                self.last_close_reason = f"连接失败: {exc}"
                 self._logger.warning("WS 连接失败: %s，%s 秒后重连", exc, self._backoff)
             except Exception:
+                self.last_close_reason = "会话异常（详见日志）"
                 self._logger.exception("WS 会话异常，%s 秒后重连", self._backoff)
 
             if await self._sleep_interruptible(self._backoff):
@@ -168,23 +182,29 @@ class WSClient:
     async def _session(self, ws, cfg, machine: str) -> bool:
         """单次连接会话：注册 → 补发队列 → 心跳 + 接收分发。返回 True=优雅停止。"""
         self._registered = False
+        self._current_ws = ws
+        self.ws_connected = True
+        stop_task = None
+        hb_task = None
         try:
-            await ws.send(_msg("register", {
-                "agent_id": cfg.agent_id,
-                "machine_code": machine,
-                "version": APP_VERSION,
-                "platforms": [],   # 平台注册表：后续步骤填充
-                "accounts": [],    # 账号快照：后续步骤由 Scanner 提供
-            }))
-        except ConnectionClosed:
-            # 注册阶段连接即被服务端关闭（如握手后立即 4401/4409）：
-            # 不吞异常，交主循环按关闭码分类处理（挂起 / 退避）。
-            self._logger.warning("register 发送失败：连接已被服务端关闭")
-            raise
-        # 停止监视：stop 置位时主动关闭连接，令 recv 抛出 ConnectionClosedOK(1000)
-        stop_task = asyncio.create_task(self._stop_and_close(ws))
-        hb_task = asyncio.create_task(self._heartbeat_loop(ws, cfg))
-        try:
+            try:
+                await ws.send(_msg("register", {
+                    "agent_id": cfg.agent_id,
+                    "machine_code": machine,
+                    "version": APP_VERSION,
+                    "platforms": [],   # 平台注册表：后续步骤填充
+                    "accounts": [],    # 账号快照：后续步骤由 Scanner 提供
+                }))
+            except ConnectionClosed:
+                # 注册阶段连接即被服务端关闭（如握手后立即 4401/4409）：
+                # 不吞异常，交主循环按关闭码分类处理（挂起 / 退避）。
+                # 注：外层 finally 保证此时 ws_connected/_current_ws 必复位，
+                # 不会出现挂起态快照 ws_connected=True 与 suspended=True 矛盾。
+                self._logger.warning("register 发送失败：连接已被服务端关闭")
+                raise
+            # 停止监视：stop 置位时主动关闭连接，令 recv 抛出 ConnectionClosedOK(1000)
+            stop_task = asyncio.create_task(self._stop_and_close(ws))
+            hb_task = asyncio.create_task(self._heartbeat_loop(ws, cfg))
             while True:
                 raw = await ws.recv()
                 try:
@@ -202,8 +222,14 @@ class WSClient:
             # 不得返回 True（否则主循环退出，服务进程永久停止）。
             raise
         finally:
-            hb_task.cancel()
-            stop_task.cancel()
+            # 包裹整个会话体：任何路径（含 register 阶段抛异常）都必须复位状态，
+            # 否则 trigger_reload 会误操作死连接、/status 快照自相矛盾。
+            self.ws_connected = False
+            self._current_ws = None
+            if hb_task is not None:
+                hb_task.cancel()
+            if stop_task is not None:
+                stop_task.cancel()
 
     async def _stop_and_close(self, ws) -> None:
         """等待 stop 置位后主动关闭连接（优雅停止路径）。"""
@@ -361,32 +387,91 @@ class WSClient:
         if total_sent:
             self._logger.info("result_queue 补发完成，共 %d 项，队列已清空", total_sent)
 
+    # ------------------------------------------------------------ 热重载（S3 本地 API 触发）
+
+    def trigger_reload(self) -> str:
+        """配置热重载入口（现状文档 §5.2）：唤醒挂起态；若当前有连接则主动关闭，
+        令主循环重读 config/凭证后重连。返回描述（供 API 响应/审计）。"""
+        self._resume.set()
+        ws = self._current_ws
+        if ws is not None:
+            self.last_close_reason = "本地热重载（配置/凭证更新）"
+            asyncio.create_task(self._close_for_reload(ws))
+            return "已唤醒：当前连接将关闭并以新配置重连"
+        return "已唤醒：挂起/等待态将立即复查配置"
+
+    async def _close_for_reload(self, ws) -> None:
+        try:
+            await ws.close(1000, "reload")
+        except Exception:  # pragma: no cover
+            pass
+
+    # ------------------------------------------------------------ 可观测快照（§3.7 契约）
+
+    def status_snapshot(self) -> dict:
+        """只读状态快照（供 5409 本地 API ``GET /status``），
+        收敛对内部私有属性的直接读取。字段结构按 §3.7 契约固定。"""
+        return {
+            "ws_connected": self.ws_connected,
+            "suspended": self.suspended,
+            "version": APP_VERSION,
+            "active_tasks": db.count_active_tasks(),
+            "accounts": [],  # 账号快照骨架（S5/S6：Scanner 接入后填充）
+            "clock_offset_seconds": round(self._clock.offset_seconds, 3),
+            "scheduling_paused": self._clock.scheduling_paused,
+            "token_expire_at": self.expire_at,
+            "token_expired": self._token_expired,
+            "last_close_reason": self.last_close_reason,
+        }
+
     # ------------------------------------------------------------ 等待原语
 
     async def _sleep_interruptible(self, seconds: float) -> bool:
-        """退避等待；stop 置位则提前返回。返回 True=应退出。"""
+        """退避等待；stop 置位提前返回（应退出）；resume 置位（配置热重载）
+        同样打断退避立即重连（§5.2：断线退避期间修正配置后不必等满最长 300s）。"""
+        resume_task = asyncio.create_task(self._resume.wait())
+        stop_task = asyncio.create_task(self._stop.wait())
         try:
-            await asyncio.wait_for(self._stop.wait(), timeout=seconds)
+            done, pending = await asyncio.wait(
+                {resume_task, stop_task},
+                timeout=seconds,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        except asyncio.CancelledError:  # pragma: no cover
+            resume_task.cancel()
+            stop_task.cancel()
+            raise
+        for task in pending:
+            task.cancel()
+        if stop_task in done:
             return True
-        except asyncio.TimeoutError:
-            return False
+        if resume_task in done:
+            self._resume.clear()
+            self._logger.info("配置热重载打断退避等待，立即重连")
+        return False
 
     async def _wait_for_resume(self) -> None:
         """挂起零重连：等待 resume（配置热重载）或 stop（§3.5 _wait_for_resume 语义）。"""
+        # 入口先清除可能残留的 resume 标志（防虚唤醒：置位早于进入等待的旧信号）
+        self._resume.clear()
+        self.suspended = True
         self._logger.info("进入挂起状态，等待配置热重载唤醒或停止信号")
-        while not self._stop.is_set():
-            resume_task = asyncio.create_task(self._resume.wait())
-            stop_task = asyncio.create_task(self._stop.wait())
-            done, pending = await asyncio.wait(
-                {resume_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
-            )
-            for task in pending:
-                task.cancel()
-            if resume_task in done:
-                self._resume.clear()
-                self._token_expired = False
-                self._logger.info("被配置热重载唤醒，退出挂起状态，重新连接")
-                return
+        try:
+            while not self._stop.is_set():
+                resume_task = asyncio.create_task(self._resume.wait())
+                stop_task = asyncio.create_task(self._stop.wait())
+                done, pending = await asyncio.wait(
+                    {resume_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in pending:
+                    task.cancel()
+                if resume_task in done:
+                    self._resume.clear()
+                    self._token_expired = False
+                    self._logger.info("被配置热重载唤醒，退出挂起状态，重新连接")
+                    return
+        finally:
+            self.suspended = False
 
     async def _wait_resume_or_poll(self, poll_seconds: float) -> bool:
         """未绑定等待：被唤醒返回 True；超过 poll_seconds 返回 False（复查配置）。"""
