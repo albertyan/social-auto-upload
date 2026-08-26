@@ -11,11 +11,19 @@
    权限不足（5）→ SystemExit(1)、正常注册无异常；
 3. 静态走查：
    - sau.iss：IntToStr 十进制、无 IntToHex、[Run] 托盘、Exec 失败映射 99、
-     无「13~20 静默放行」旧条件；
+     无「13~20 静默放行」旧条件；任务 #3 追加：卸载凭证必删（DeleteCredentialFile）、
+     InitializeUninstall 弹框（MB_YESNO/IDNO，进度窗勾选框已移除）、卸载与升级两处
+     taskkill 前先礼后兵（tray-exit）、内核下载入安装向导（任务 #10 改为后台下载 +
+     进度文件轮询安装页进度条，静默维持隐藏阻塞等待 / 失败弹窗不阻断）、
+     [Languages] 中文化（ChineseSimplified.isl 入库）；
    - post_install.bat：纯 ASCII、exit /b 0、ping 替 timeout、chcp 65001、
-     数字时间戳；
-   - entry.py：限秒等待回车（无 input() 无限阻塞）、控制台流跳过判定；
-4. ``_wait_enter_bounded`` 不无限阻塞（进程挂起根因的守卫）。
+     数字时间戳、已移除 browser install（内核下载移至安装向导）；
+   - entry.py：限秒等待回车（无 input() 无限阻塞）、控制台流跳过判定、
+     --progress-file 选项（任务 #10）；
+   - browser.py：ProgressReporter 原子写（os.replace）与 seq 心跳（任务 #10）；
+4. ``_wait_enter_bounded`` 不无限阻塞（进程挂起根因的守卫）；
+5. ProgressReporter 功能验证（任务 #10）：临时目录实例化 → 字段齐全、
+   seq 严格递增、INI 可解析（configparser 模拟安装器读）、finish 后 done=1。
 
 运行（仓库根目录）：
     .venv\\Scripts\\python.exe sau_wrap\\tests\\verify_s8.py
@@ -42,6 +50,8 @@ RESULTS: list[str] = []
 
 _BAT = os.path.join(_REPO_ROOT, "sau_wrap", "packaging", "post_install.bat")
 _ISS = os.path.join(_REPO_ROOT, "sau_wrap", "packaging", "installer", "sau.iss")
+_ISL = os.path.join(_REPO_ROOT, "sau_wrap", "packaging", "installer",
+                    "Languages", "ChineseSimplified.isl")
 _ENTRY = os.path.join(_REPO_ROOT, "sau_wrap", "entry.py")
 _BROWSER = os.path.join(_REPO_ROOT, "sau_wrap", "browser.py")
 _DOCTOR = os.path.join(_REPO_ROOT, "sau_wrap", "doctor.py")
@@ -225,6 +235,13 @@ def scenario_static_walkthrough() -> None:
           "stage attribution aligned with exit matrix")
 
     check("bat 纯 ASCII 纪律（GBK 乱码根治之一）", True, "decoded as ascii ok")
+    check("bat 已移除 browser install 执行调用（任务 #3：内核下载移至安装向导）",
+          not any("browser install" in l for l in bat.splitlines()
+                  if not l.strip().lower().startswith("rem")),
+          "no browser install invocation in executable lines")
+    check("bat 含内核下载移出说明注释（口径留痕）",
+          "moved to the setup wizard" in bat,
+          "rem comment documents the move to wizard")
     check("bat 末尾显式 exit /b 0（兜底退出码闭环）", "exit /b 0" in bat,
           "explicit success exit")
     check("bat 以 ping 替 timeout（Session 0/重定向安全）",
@@ -239,11 +256,78 @@ def scenario_static_walkthrough() -> None:
     check("bat 每步留痕：install/start 退出码写入日志",
           "service install exit=%RC%" in bat and "service start exit=%RC%" in bat,
           "per-step exit code evidence")
-    check("bat 内核自动下载集成（任务 #26 决策变更：失败不阻断）",
-          "browser install" in bat
-          and "browser install exit=%RC%" in bat
-          and "browser kernel download failed" in bat,
-          "auto-download after service start; failure warn-only")
+
+    # ---- 任务 #3：卸载数据处置 / 优雅退出 / 内核下载入向导 / 中文化 ----
+    check("iss usPostUninstall 删凭证（credential.bin/local_token.bin，DeleteCredentialFile）",
+          "usPostUninstall" in iss
+          and "DeleteCredentialFile" in iss
+          and "credential.bin" in iss and "local_token.bin" in iss,
+          "credential files deleted via DeleteCredentialFile in usPostUninstall")
+    cred_unconditional = iss.split("usPostUninstall:", 1)[1] if "usPostUninstall:" in iss else ""
+    check("iss 凭证无条件删除（不受 DeleteLocalData 开关控制，先于整删）",
+          "DeleteCredentialFile" in cred_unconditional
+          and "DeleteCredentialFile" in cred_unconditional.split("if DeleteLocalData", 1)[0],
+          "credential deletion precedes DeleteLocalData branch")
+    check("iss InitializeUninstall 弹框询问：MB_YESNO 且默认 IDNO（默认保留）",
+          "InitializeUninstall" in iss and "MB_YESNO" in iss and "IDNO" in iss,
+          "yes/no prompt defaulting to keep data")
+    check("iss InitializeUninstallProgressForm 已删除（旧勾选框一闪而过根因移除）",
+          "InitializeUninstallProgressForm" not in iss,
+          "old progress-form checkbox removed")
+    check("iss 全局 DeleteLocalData 开关在位（替代进度窗勾选框）",
+          "DeleteLocalData: Boolean" in iss
+          and "if DeleteLocalData then" in iss,
+          "global switch gates DelTree")
+    check("iss 卸载/升级两处 taskkill 前均先礼后兵（tray-exit 出现 >= 2）",
+          iss.count("tray-exit") >= 2
+          and iss.count("taskkill.exe") >= 2,
+          f"tray-exit count={iss.count('tray-exit')} taskkill count={iss.count('taskkill.exe')}")
+    check("iss tray-exit 显式 --timeout 15（防贴边超时退回 taskkill）",
+          "tray-exit --timeout 15" in iss,
+          "explicit --timeout 15 for tray-exit")
+    # ---- 任务 #10：安装页进度条（后台下载 + 进度文件轮询，替代可见控制台窗口） ----
+    check("iss 内核下载入向导：后台 ewNoWait 拉起 + --progress-file 进度文件轮询",
+          "browser install --progress-file" in iss
+          and "ewNoWait" in iss
+          and "download_progress.ini" in iss
+          and "GetIniString" in iss,
+          "background exec + progress file polling via GetIniString")
+    check("iss 安装页进度条：借用 ProgressGauge + MapStageText 状态文案",
+          "ProgressGauge" in iss
+          and "正在下载浏览器内核" in iss
+          and "MapStageText" in iss,
+          "reuse ProgressGauge with stage caption")
+    check("iss 下载期间禁用 Cancel 并 try/finally 恢复（防孤儿进程/跳过 [Run]）",
+          "CancelButton.Enabled := False" in iss
+          and "CancelButton.Enabled := CancelWasEnabled" in iss,
+          "cancel disabled then restored in finally")
+    check("iss 静默分支维持隐藏阻塞等待（ewWaitUntilTerminated + SW_HIDE）",
+          "SauSilentMode()" in iss
+          and "ewWaitUntilTerminated" in iss and "SW_HIDE" in iss,
+          "silent branch keeps hidden blocking wait")
+    check("iss done 终态 + seq 心跳停滞判定与轮询硬上限在位（任务 #10）",
+          "BrowserStallSeqs" in iss and "BrowserMaxPolls" in iss
+          and "'result', 'done'" in iss and "'progress', 'seq'" in iss,
+          "done/seq stall detection + poll cap present")
+    check("iss 无可见控制台窗口方案残留（SW_SHOWNORMAL 已移除，任务 #8 证伪）",
+          "SW_SHOWNORMAL" not in iss,
+          "visible-console scheme removed")
+    check("iss 内核下载失败弹窗不阻断且含 --from-file 手动补救指引",
+          "浏览器内核下载未完成" in iss and "--from-file" in iss,
+          "warn-only popup with manual recovery hint")
+    iss_exec_lines = [l for l in iss.splitlines() if not l.strip().startswith(";")]
+    iss_exec = "\n".join(iss_exec_lines)
+    check("iss [Languages] 仅简体中文（中文化，任务 #3）",
+          "[Languages]" in iss and "chinesesimplified" in iss
+          and 'Name: "english"' not in iss_exec,
+          "single chinesesimplified language entry")
+    check("Languages\\ChineseSimplified.isl 已入库（Inno 6.5.0+ 官方翻译）",
+          os.path.isfile(_ISL), f"exists={os.path.isfile(_ISL)}")
+    check("iss SauSilentMode 替代 WizardSilentMode（Inno 6.7.3 实测偏差，任务 #3）",
+          "SauSilentMode" in iss and "WizardSilentMode()" not in iss_exec
+          and "GetCmdTail" in iss,
+          "custom silent-mode probe via GetCmdTail")
+
     bare_paren_echo = [
         l for l in bat.splitlines()
         if not l.strip().lower().startswith("rem") and "echo" in l.lower()
@@ -287,6 +371,13 @@ def scenario_static_walkthrough() -> None:
     check("browser 总时限 20 分钟（安装时自动下载上限）",
           "TOTAL_TIMEOUT_SECONDS = 20 * 60.0" in browser,
           "20-minute cap for installer auto-download")
+    check("browser ProgressReporter 原子写（os.replace）与 seq 心跳在位（任务 #10）",
+          "ProgressReporter" in browser and "os.replace" in browser
+          and "seq" in browser,
+          "atomic write + seq heartbeat in ProgressReporter")
+    check("entry --progress-file 选项接入 ProgressReporter（任务 #10）",
+          "--progress-file" in entry and "ProgressReporter" in entry,
+          "--progress-file wired to ProgressReporter")
 
     doctor_src = open(_DOCTOR, encoding="utf-8").read()
     check("doctor 凭证到期时间越界防护（真机 OSError 22 崩溃根治）",
@@ -325,11 +416,81 @@ def scenario_bounded_wait() -> None:
           ok, f"elapsed={elapsed:.2f}s")
 
 
+# ================================================================ 场景 5：ProgressReporter 功能验证（任务 #10）
+
+
+def scenario_progress_reporter() -> None:
+    print("\n==== 场景5：ProgressReporter 进度文件功能验证（任务 #10）====", flush=True)
+    import configparser
+
+    from sau_wrap.browser import ProgressReporter
+
+    tmp = tempfile.mkdtemp(prefix="sau_prog_")
+    try:
+        pf = os.path.join(tmp, "download_progress.ini")
+        rep = ProgressReporter(pf)
+        rep.update(stage="starting", percent=0)
+        rep.update(stage="downloading", component=1, components=2, percent=47,
+                   downloaded_bytes=120000000, total_bytes=301000000,
+                   source="mirror", message="direct download")
+        # 增量合并验证：仅更新 stage/percent，其余字段应保留旧值
+        rep.update(stage="extracting", percent=60)
+        rep.finish(0)
+
+        cp = configparser.ConfigParser()
+        cp.read(pf, encoding="ascii")
+        prog = dict(cp["progress"])
+        res = dict(cp["result"])
+        need = ["stage", "component", "components", "percent", "downloaded_bytes",
+                "total_bytes", "source", "message", "seq"]
+        missing = [k for k in need if k not in prog]
+        check("进度文件字段齐全且增量合并保留旧值（configparser 可解析）",
+              not missing and prog.get("source") == "mirror"
+              and prog.get("component") == "1",
+              f"missing={missing} source={prog.get('source')!r}")
+        check("finish 写 [result] done=1（安装器收尾判定）",
+              res.get("done") == "1", f"done={res.get('done')!r}")
+        check("finish 写 [result] exit_code=0（成败判定）",
+              res.get("exit_code") == "0", f"exit_code={res.get('exit_code')!r}")
+        check("进度文件值域纯 ASCII（Inno 无 BOM 按 GBK 解析约束）",
+              bool(open(pf, "rb").read().decode("ascii") is not None),
+              "decode as ascii ok")
+
+        # seq 严格递增：每次写盘 +1（心跳）
+        rep2 = ProgressReporter(os.path.join(tmp, "seq.ini"))
+        seqs = []
+        for pct in (10, 20, 30, 40):
+            rep2.update(percent=pct)
+            cp2 = configparser.ConfigParser()
+            cp2.read(os.path.join(tmp, "seq.ini"), encoding="ascii")
+            seqs.append(int(cp2["progress"]["seq"]))
+        check("seq 每次写盘严格 +1（安装器停滞判崩溃基准）",
+              len(set(seqs)) == len(seqs)
+              and all(b == a + 1 for a, b in zip(seqs, seqs[1:])),
+              f"seqs={seqs}")
+
+        # 上报失败不影响主链路：父路径为普通文件 → mkdir 必抛 NotADirectoryError
+        # （OSError 子类），必须被吞掉不上抛（进度上报绝不影响下载主链路）
+        blocker = os.path.join(tmp, "blocker_file")
+        open(blocker, "w", encoding="ascii").close()
+        rep3 = ProgressReporter(os.path.join(blocker, "p.ini"))
+        try:
+            rep3.update(stage="downloading")
+            swallow_ok = True
+        except Exception:  # noqa: BLE001
+            swallow_ok = False
+        check("ProgressReporter 写盘异常不上抛（绝不影响下载主链路）",
+              swallow_ok, "OSError swallowed on unwritable path")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main() -> int:
     scenario_bat_matrix()
     scenario_ops_install_idempotent()
     scenario_static_walkthrough()
     scenario_bounded_wait()
+    scenario_progress_reporter()
 
     failed = [r for r in RESULTS if r.startswith("[FAIL]")]
     report = os.path.join(_HERE, "_verify_report_s8.txt")

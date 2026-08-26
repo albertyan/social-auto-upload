@@ -46,6 +46,13 @@ from sau_wrap.version import APP_VERSION
 #: 无需跨会话可见。
 MUTEX_NAME = "SAUTrayMutex"
 
+#: 托盘优雅退出命名事件（任务板 Task #2：卸载/升级不再 taskkill 强杀，
+#: 而是 ``SetEvent`` 通知托盘走 ``icon.stop()``——发 NIM_DELETE，防通知区
+#: 残留幽灵图标）。命名口径与 ``MUTEX_NAME`` 一致（见上方注释）：会话本地
+#: 命名，不加 ``Global\\`` 前缀（标准用户无 SeCreateGlobalPrivilege；托盘
+#: 每用户会话一个，卸载/升级器与托盘同会话，无需跨会话可见）。
+EXIT_EVENT_NAME = "SAUTrayExitEvent"
+
 #: 状态轮询间隔（秒，§5.2：5~10s，取 5；环境变量可覆盖，测试用）
 POLL_INTERVAL = float(os.environ.get("SAU_TRAY_POLL_SECONDS", "5"))
 
@@ -63,6 +70,9 @@ COLOR_OFFLINE = (149, 165, 166)
 NOTIFY_TITLE = "SAU Agent"
 NOTIFY_DOWN = "服务未运行，系统会自动恢复"
 NOTIFY_UP = "服务已恢复在线"
+#: 凭证异常离线气泡（评审问题 3）：服务在运行、根因是凭证时，
+#: 「系统会自动恢复」会误导用户，改用与 tooltip 措辞风格一致的处理指引。
+NOTIFY_TOKEN = "凭证异常，请打开控制台处理"
 
 #: 状态枚举（轮询结果分类）
 ST_ONLINE = "online"          # /status 200 且 ws_connected=True
@@ -120,8 +130,22 @@ def build_ticket_url(port: int, ticket: str) -> str:
     return f"http://127.0.0.1:{port}/ui/t/{ticket}"
 
 
+#: token_status 异常值 → tooltip 连接态文案（与网络断开的「未连接」区分：
+#: 网络正常但凭证有问题，须引导用户重新绑定/打开控制台处理）
+_TOKEN_STATUS_TEXT = {
+    "unbound": "未绑定（请打开控制台绑定）",
+    "expired": "凭证已过期（请重新绑定）",
+    "suspended": "已挂起（凭证，请打开控制台处理）",
+}
+
+
 def build_tooltip(state: str, body: dict | None) -> str:
-    """tooltip：版本 / 连接态 / 活跃任务数。"""
+    """tooltip：版本 / 连接态 / 活跃任务数。
+
+    凭证态收紧（Task #2）：200 响应中 ``token_status`` 非 ok 时，连接态文案
+    体现凭证问题（未绑定/过期/挂起）并给出处理指引，与网络断开（「未连接」）
+    区分；字段缺失按 ok 处理（兼容旧版服务响应）。
+    """
     if state == ST_UNREACHABLE:
         return f"SAU Agent v{APP_VERSION} | 服务不可达"
     if state == ST_AUTH:
@@ -131,6 +155,10 @@ def build_tooltip(state: str, body: dict | None) -> str:
     connected = "在线" if body.get("ws_connected") else "未连接"
     if body.get("suspended"):
         connected = "已挂起"
+    # token_status 非 ok：凭证问题优先于连接态展示（缺失按 ok 处理）
+    token_status = body.get("token_status", "ok")
+    if token_status != "ok":
+        connected = _TOKEN_STATUS_TEXT.get(token_status, f"凭证异常（{token_status}）")
     return (
         f"SAU Agent v{body.get('version', APP_VERSION)} | "
         f"连接: {connected} | 活跃任务: {body.get('active_tasks', 0)}"
@@ -138,10 +166,17 @@ def build_tooltip(state: str, body: dict | None) -> str:
 
 
 def classify_http(status_code: int, body: dict | None) -> str:
-    """HTTP 结果分类（四态：在线 / 离线 / 401 / 不可达由调用方单独给出）。"""
+    """HTTP 结果分类（四态：在线 / 离线 / 401 / 不可达由调用方单独给出）。
+
+    判绿收紧（Task #2）：在线除 ``ws_connected`` 外还要求 ``token_status``
+    为 ok——字段缺失按 "ok" 处理（向后兼容旧版服务响应）；
+    expired/suspended/unbound 等归离线（图标转灰 + 离线提示）。
+    """
     if status_code == 401:
         return ST_AUTH
-    if status_code == 200 and body and body.get("ws_connected") and not body.get("suspended"):
+    if (status_code == 200 and body and body.get("ws_connected")
+            and not body.get("suspended")
+            and body.get("token_status", "ok") == "ok"):
         return ST_ONLINE
     return ST_OFFLINE
 
@@ -160,6 +195,10 @@ def fetch_status(port: int, token: str | None, timeout: float = POLL_TIMEOUT) ->
             try:
                 body = json.loads(resp.read().decode("utf-8"))
             except ValueError:
+                body = None
+            # 修复 3：响应体非 dict（如 JSON 数组/标量）时置 None，
+            # 防 body.get 抛 AttributeError 逃出下方捕获清单
+            if not isinstance(body, dict):
                 body = None
             return classify_http(resp.status, body), body
     except urllib.error.HTTPError as exc:
@@ -194,6 +233,25 @@ class StateTracker:
         return None
 
 
+def pick_notice(state: str, body: dict | None,
+                default_down: str = NOTIFY_DOWN,
+                default_up: str = NOTIFY_UP) -> str:
+    """气泡文案选择（评审问题 3，可测纯逻辑）。
+
+    StateTracker 负责「是否弹」（边沿触发），本函数负责「弹什么」：
+    - ``ST_OFFLINE`` 且 ``token_status`` 非 ok → 凭证文案（此时服务在运行、
+      根因是凭证，用户等不到「自动恢复」，须引导打开控制台处理）；
+    - 其余异常态 → 维持 §5.2 定案离线措辞（``default_down``，一字不动）；
+    - 恢复在线 → 维持定案恢复措辞（``default_up``，一字不动）。
+    """
+    if (state == ST_OFFLINE and body
+            and body.get("token_status", "ok") != "ok"):
+        return NOTIFY_TOKEN
+    if state in _BAD_STATES:
+        return default_down
+    return default_up
+
+
 def make_icon_image(color: tuple[int, int, int], size: int = 64):
     """Pillow 代码生成简单色块图标（圆形），不引入图片资源文件。"""
     from PIL import Image, ImageDraw
@@ -208,6 +266,66 @@ def make_icon_image(color: tuple[int, int, int], size: int = 64):
 def pick_icon_color(state: str) -> tuple[int, int, int]:
     """状态 → 图标颜色（在线绿 / 其余异常态灰）。"""
     return COLOR_ONLINE if state == ST_ONLINE else COLOR_OFFLINE
+
+
+def signal_tray_exit(timeout: float = 8.0,
+                     event_name: str = EXIT_EVENT_NAME,
+                     mutex_name: str = MUTEX_NAME,
+                     poll_interval: float = 0.2) -> int:
+    """请求托盘优雅退出并等待其进程结束（安装器/升级器调用，可测纯逻辑）。
+
+    链路：``SetEvent`` 命名事件 → 托盘轮询线程收到后走 ``icon.stop()``
+    （发 NIM_DELETE，防通知区幽灵图标）→ 托盘进程退出，命名互斥量随之消失。
+    本函数以「互斥量是否仍可打开」作为托盘存活判据轮询确认。
+
+    返回值（进程退出码）：
+    - 0 = 无需兜底：事件不存在（托盘未运行或旧版托盘无此事件）或托盘已退出；
+    - 非 0 = 需调用方 taskkill 兜底：超过 ``timeout`` 托盘仍存在，或发生异常。
+      （异常**不得**静默返回 0 伪成功，否则升级器会误以为托盘已优雅退出。）
+    语义收紧（修复 3）：OpenEvent/OpenMutex 失败严格区分「对象不存在」
+    （``pywintypes.error`` 且 ``winerror == 2``，即 ERROR_FILE_NOT_FOUND）与
+    其余异常（如访问拒绝）——前者按原语义返回 0（事件不存在 = 托盘未运行，
+    互斥量不存在 = 托盘已退出）；后者返回非 0，由调用方 taskkill 兜底。
+    """
+    import time
+    import win32api
+    import win32con
+    import win32event
+
+    import pywintypes
+
+    def _is_object_missing(exc: Exception) -> bool:
+        """命名对象不存在（winerror=2）判定：仅此情形按原语义放行返回 0。"""
+        return isinstance(exc, pywintypes.error) and exc.winerror == 2
+
+    try:
+        handle = win32event.OpenEvent(win32con.EVENT_MODIFY_STATE, False, event_name)
+    except Exception as exc:  # noqa: BLE001
+        if _is_object_missing(exc):
+            return 0  # 事件不存在：托盘未运行/旧版托盘，无需兜底（原语义）
+        return 1  # 其余异常（如访问拒绝）：不得伪成功，调用方 taskkill 兜底
+    if not handle:
+        return 0
+    try:
+        try:
+            win32event.SetEvent(handle)
+        finally:
+            win32api.CloseHandle(handle)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                mutex = win32event.OpenMutex(win32con.SYNCHRONIZE, False, mutex_name)
+            except Exception as exc:  # noqa: BLE001
+                if _is_object_missing(exc):
+                    return 0  # 互斥量已随托盘进程退出而消失 → 视为已退出（原语义）
+                return 1  # 其余异常（如访问拒绝）：不得伪成功，调用方兜底
+            if not mutex:
+                return 0
+            win32api.CloseHandle(mutex)  # 打开成功仅用于探活，立即释放
+            time.sleep(poll_interval)
+        return 1  # 超时托盘仍存在 → 调用方 taskkill 兜底
+    except Exception:  # noqa: BLE001 其余异常（如 SetEvent 被拒）：返回非 0，不伪成功
+        return 1
 
 
 def acquire_mutex(name: str = MUTEX_NAME):
@@ -293,47 +411,105 @@ def run() -> int:
         print("SAU 托盘已在运行（单实例，见 %s）。" % paths.TRAY_LOG_FILE)
         return 0
 
+    # 优雅退出命名事件（Task #2）：卸载/升级器经 ``sau tray-exit`` SetEvent
+    # 通知托盘走 icon.stop()（发 NIM_DELETE，防幽灵图标），替代 taskkill 强杀。
+    # 创建失败仅记日志不阻断（降级为仅支持菜单退出）。
+    exit_event_handle = None
+    try:
+        import win32event
+
+        exit_event_handle = win32event.CreateEvent(None, True, False, EXIT_EVENT_NAME)
+        if not exit_event_handle:
+            logger.warning("创建退出事件 %s 失败，降级为仅支持菜单退出", EXIT_EVENT_NAME)
+    except Exception:  # noqa: BLE001
+        logger.warning("创建退出事件 %s 异常，降级为仅支持菜单退出",
+                       EXIT_EVENT_NAME, exc_info=True)
+
     port = resolve_local_port()
     tracker = StateTracker()
     icon_holder: dict = {}
 
+    # 图标预缓存（Task #2）：两张位图启动时生成一次，轮询期只赋引用，
+    # 消除每次翻转的 Pillow 重建开销。
+    icon_images = {
+        True: make_icon_image(COLOR_ONLINE),
+        False: make_icon_image(COLOR_OFFLINE),
+    }
+
+    def _stop_icon(reason: str) -> None:
+        """统一退出三步（菜单退出与外部事件退出共用）：置停 → 唤醒等待 →
+        ``icon.stop()``（Windows 下即发 NIM_DELETE 移除通知区图标）。"""
+        logger.info("%s", reason)
+        icon_holder["stopped"] = True
+        ev = icon_holder.get("stop_event")
+        if ev is not None:
+            ev.set()
+        ic = icon_holder.get("icon")
+        if ic is not None:
+            try:
+                ic.stop()
+            except Exception:  # noqa: BLE001（重复 stop 等：不影响退出流程）
+                logger.warning("icon.stop() 异常（忽略）", exc_info=True)
+
     def _poll_loop() -> None:
         """状态轮询线程（托盘唯一轻量轮询，§5.2）。"""
         while not icon_holder.get("stopped"):
+            # 探测前移（修复 2）：退出事件非阻塞探测置于循环体**最前**（工作段之前）。
+            # 旧实现把探测放在状态抓取/图标更新（含 fetch_status，HTTP 超时 3s）之后，
+            # 最坏响应延迟 ≈ 5s 等待 + 3s HTTP = 8s，与 tray-exit 默认 8s 超时贴边，
+            # 超时即退回 taskkill（幽灵图标回归）；前移后最坏延迟 ≤1 个 POLL_INTERVAL，
+            # 且 iss 侧已显式传 --timeout 15，余量充足。探测自身的 try/except 降级
+            # 保留：任何异常记日志后降级为纯等待，轮询线程永不因探测异常而死。
+            stop_event = icon_holder.get("stop_event")
+            try:
+                if exit_event_handle is not None:
+                    import win32event
+
+                    if (win32event.WaitForSingleObject(exit_event_handle, 0)
+                            == win32event.WAIT_OBJECT_0):
+                        _stop_icon("外部请求退出（卸载/升级）——走 icon.stop() "
+                                   "发 NIM_DELETE，防通知区幽灵图标")
+                        return
+            except Exception:  # noqa: BLE001
+                logger.exception("退出事件探测异常（降级为纯 stop_event.wait，"
+                                 "轮询线程继续）")
             try:
                 token = load_local_token()  # 每轮重读：服务重启会换令牌
                 state, body = fetch_status(port, token)
                 icon = icon_holder.get("icon")
                 if icon is not None:
-                    # 图标按状态缓存：仅在线/离线翻转时重赋，避免每轮重建位图；
+                    # 图标自愈（Task #2）：删除原 last_online 边沿缓存分支，
+                    # 每轮**无条件**重赋缓存位图——若 pystray 的
+                    # Shell_NotifyIcon 某轮静默失败（图标灰死但状态文字
+                    # 正常），最多一个 POLL_INTERVAL 后即被下一轮重赋覆盖；
+                    # 位图来自 icon_images 预缓存，重赋无重建开销。
                     # tooltip 内容随活跃任务数变化，每轮更新不变。
-                    is_online = state == ST_ONLINE
-                    if icon_holder.get("last_online") != is_online:
-                        icon.icon = make_icon_image(pick_icon_color(state))
-                        icon_holder["last_online"] = is_online
+                    icon.icon = icon_images[state == ST_ONLINE]
                     icon.title = build_tooltip(state, body)
                 notice = tracker.apply(state)
                 if notice and icon is not None:
+                    # 评审问题 3：凭证态离线改用凭证文案（措辞区分见 pick_notice）
+                    notice = pick_notice(state, body)
                     try:
                         icon.notify(notice, NOTIFY_TITLE)
                     except Exception:
                         logger.warning("气泡提示发送失败（不影响轮询）", exc_info=True)
-                logger.debug("状态轮询: state=%s ws=%s",
-                             state, (body or {}).get("ws_connected"))
+                logger.debug("状态轮询: state=%s ws=%s token_status=%s",
+                             state, (body or {}).get("ws_connected"),
+                             (body or {}).get("token_status", "ok"))
             except Exception:
                 logger.exception("状态轮询异常（继续下轮）")
-            # 可被退出打断的等待
-            stopped = icon_holder.get("stop_event")
-            if stopped is not None and stopped.wait(POLL_INTERVAL):
+            # 可被退出打断的等待（评审问题 1 修复）：
+            # 旧实现把 threading.Event 塞进 WaitForMultipleObjects 句柄列表，
+            # pywin32 抛 TypeError 且该段在 try/except 之外，直接杀死轮询线程。
+            # 现保持 stop_event.wait(POLL_INTERVAL) 原语义（可被菜单退出打断）；
+            # 退出事件探测已前移至循环体最前（修复 2），响应延迟最坏 ≤1 个
+            # POLL_INTERVAL（5s），远在 tray-exit --timeout 15 窗口内。
+            if stop_event is not None and stop_event.wait(POLL_INTERVAL):
                 return
 
     def _quit(icon, _item) -> None:
-        logger.info("用户退出托盘（不影响服务运行）")
-        icon_holder["stopped"] = True
-        ev = icon_holder.get("stop_event")
-        if ev is not None:
-            ev.set()
-        icon.stop()
+        _stop_icon("用户退出托盘（不影响服务运行）")
 
     menu = Menu(
         MenuItem("打开控制台", lambda icon, item: open_console(port, logger)),
@@ -343,7 +519,7 @@ def run() -> int:
     )
     icon = pystray.Icon(
         "SAUTray",
-        make_icon_image(COLOR_OFFLINE),
+        icon_images[False],  # 启动初始为离线灰，首轮轮询后按状态重赋
         f"SAU Agent v{APP_VERSION} | 正在连接…",
         menu,
     )
@@ -368,5 +544,12 @@ def run() -> int:
             win32api.CloseHandle(mutex)
         except Exception:  # pragma: no cover
             pass
+        if exit_event_handle is not None:
+            try:
+                import win32api
+
+                win32api.CloseHandle(exit_event_handle)
+            except Exception:  # pragma: no cover
+                pass
         logger.info("托盘已退出")
     return 0

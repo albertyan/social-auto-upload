@@ -39,6 +39,18 @@
 **可注入执行器**（任务定义 ⑥）：``executor`` 参数替换真实登录执行函数
 （默认 :func:`default_real_executor`），``tests/verify_s9.py`` 注入假登录器
 覆盖全状态机，不真实打开平台页面；``browser_check`` 同理可注入。
+
+**浏览器工作线程**（Selector 循环不支持子进程修复）：服务主循环为 §5.1 定案的
+Selector 策略（不支持 ``create_subprocess_*``），而 patchright 启动浏览器驱动必须
+用子进程——真实执行器把上游 ``*_setup`` 调用段整体下沉到
+:mod:`sau_wrap.service.browser_thread` 的专用 Proactor 工作循环执行（主循环侧经桥接
+等待结果）。由此带来两处跨循环/跨线程语义（均已适配）：
+
+- 验证码注入：``wait_for_code`` 的 Future 创建在工作循环上，``inject_code``
+  （主循环侧/控制台 API 线程）经 ``loop.call_soon_threadsafe`` 送达；
+- 会话字段（status/qrcode 等）工作线程写、主循环读，保持原子赋值语义。
+
+测试注入的假执行器仍在主循环直接运行，不经浏览器工作线程。
 """
 
 from __future__ import annotations
@@ -107,6 +119,10 @@ class LoginSessionConflictError(RuntimeError):
         self.existing_session_id = existing_session_id
 
 
+class LoginInvalidModeError(ValueError):
+    """登录模式非法（任务 #4：白名单仅 headless/headed）。"""
+
+
 def _decode_data_url(data_url: str) -> bytes | None:
     """解码 ``data:image/png;base64,...`` → 图片字节；失败返回 None。"""
     try:
@@ -121,10 +137,14 @@ class LoginSession:
     """单个登录会话（内存对象，服务重启即失效——§6.5 可接受）。"""
 
     def __init__(self, session_id: str, platform: str, account_name: str,
-                 timeout: float):
+                 timeout: float, mode: str = "headless"):
         self.session_id = session_id
         self.platform = platform
         self.account_name = account_name
+        #: 登录模式（任务 #4）：``headless``（服务进程内浏览器，现状）/
+        #: ``headed``（计划任务投放到用户桌面会话的子进程，见
+        #: :mod:`sau_wrap.service.headed_launcher` / ``headed_login``）
+        self.mode = mode
         self.created_at = time.time()
         self.expires_at = self.created_at + timeout
         self.status = "waiting"
@@ -132,12 +152,18 @@ class LoginSession:
         #: 二维码（PNG 字节）与最近更新时间（上游刷新后覆盖）
         self.qrcode_bytes: bytes | None = None
         self.qrcode_updated_at = 0.0
-        #: 验证码注入通道（need_input 时创建）
+        #: 验证码注入通道（need_input 时创建；运行于浏览器工作循环，
+        #: inject_code 跨循环送达，见 wait_for_code / inject_code 注释）
         self._code_future: asyncio.Future | None = None
+        self._code_loop: asyncio.AbstractEventLoop | None = None
         #: 执行任务（管理器持有引用用于取消）
         self.task: asyncio.Task | None = None
         #: 成功落盘的 cookie 文件（成功时填充）
         self.cookie_file: Path | None = None
+        #: 有头登录结果回报唤醒事件（任务 #4）：``headed`` 执行器 await 本事件，
+        #: 子进程经 ``POST /login/headed/result`` → :meth:`report_result` 置终态并置位；
+        #: ``cancel()` 亦置位以唤醒执行器（headless 模式下为无害的常备字段）
+        self.result_event: asyncio.Event = asyncio.Event()
 
     # ------------------------------------------------------------ 状态迁移
 
@@ -159,6 +185,21 @@ class LoginSession:
             self.status = "failed"
             self.message = message
 
+    def report_result(self, ok: bool, message: str) -> bool:
+        """有头登录子进程结果回报入口（任务 #4；``/login/headed/result`` 调用）。
+
+        终态幂等：已终态（如被取消/超时抢先）时不覆盖、不置位，返回 False；
+        否则置 success/failed 并置位 ``result_event`` 唤醒执行器，返回 True。
+        """
+        if self.is_terminal():
+            return False
+        if ok:
+            self.mark_success(message=message or "登录成功")
+        else:
+            self.mark_failed(message or "登录失败")
+        self.result_event.set()
+        return True
+
     # ------------------------------------------------------------ 二维码
 
     def accept_qrcode_payload(self, payload: dict) -> None:
@@ -167,6 +208,10 @@ class LoginSession:
 
         payload 含 ``image_data_url``（base64）与 ``image_path``（落盘副本）；
         优先解 data URL，失败回退读文件。刷新时直接覆盖（前端轮询拿新图）。
+
+        **线程语义**：真实执行器下沉浏览器工作线程后本回调在**工作线程**被上游
+        调用，而控制台轮询在主循环侧读 ``qrcode_bytes``——两字段各自保持原子赋值，
+        读方最多看到新旧图的瞬时不一致（下一轮轮询即收敛），无需加锁。
         """
         data: bytes | None = None
         data_url = payload.get("image_data_url") or ""
@@ -187,9 +232,15 @@ class LoginSession:
         """进入 ``need_input`` 并等待验证码注入（执行器内调用）。
 
         超时抛 ``asyncio.TimeoutError``；取消时抛 ``CancelledError``。
+
+        **跨循环语义**：真实执行器运行在浏览器工作循环上，本方法创建的 Future
+        即绑定该循环（``get_running_loop()``）；``inject_code`` 从主循环侧经
+        ``call_soon_threadsafe`` 送达（见该方法）。状态字段先建 Future 后置
+        ``need_input``：保证控制台看到 need_input 时注入通道必定已就绪。
         """
         loop = asyncio.get_running_loop()
         self._code_future = loop.create_future()
+        self._code_loop = loop
         if not self.is_terminal():
             self.status = "need_input"
             self.message = "等待短信验证码输入"
@@ -197,16 +248,36 @@ class LoginSession:
             return await asyncio.wait_for(self._code_future, timeout=timeout)
         finally:
             self._code_future = None
+            self._code_loop = None
             if self.status == "need_input":
                 self.status = "waiting"
                 self.message = ""
 
     def inject_code(self, code: str) -> bool:
-        """注入验证码；无等待中的注入请求返回 False（409 语义）。"""
+        """注入验证码；无等待中的注入请求返回 False（409 语义）。
+
+        **线程安全**：验证码等待 Future 位于浏览器工作循环（或测试场景的主循环），
+        而本方法由控制台 API（主循环/事件线程）调用——不得直接 ``set_result``
+        跨循环 Future，统一经 ``call_soon_threadsafe`` 投递，投递回调内二次检查
+        ``done()`` 兜底「等待中途超时/取消」竞态（此时注入静默丢弃）。
+        「注入先于等待就绪」竞态由 ``_code_future is None → False`` 天然拒绝。
+        """
         fut = self._code_future
         if fut is None or fut.done():
             return False
-        fut.set_result(code)
+        loop = self._code_loop
+
+        def _deliver() -> None:
+            if not fut.done():
+                fut.set_result(code)
+
+        if loop is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(_deliver)
+            except RuntimeError:  # 循环在检查后关闭：视为注入失败（409）
+                return False
+        else:  # 防御：无循环引用（理论不发生）退回直接投递
+            _deliver()
         return True
 
     # ------------------------------------------------------------ 序列化
@@ -216,6 +287,7 @@ class LoginSession:
             "session_id": self.session_id,
             "platform": self.platform,
             "account_name": self.account_name,
+            "mode": self.mode,
             "status": self.status,
             "message": self.message,
             "created_at": int(self.created_at),
@@ -248,14 +320,23 @@ class LoginSessionManager:
 
     # ------------------------------------------------------------ 创建
 
-    async def create(self, platform: str, account_name: str = "default") -> LoginSession:
+    async def create(self, platform: str, account_name: str = "default",
+                     mode: str = "headless") -> LoginSession:
         """创建会话并启动执行任务。
 
+        ``mode`` 白名单（任务 #4）：``headless``（缺省，行为与现状一致）/
+        ``headed``（用户桌面会话子进程；活跃会话前置校验在 local_api 层）。
+
         异常：平台不支持 → :class:`LoginPlatformUnsupportedError`；
+        模式非法 → :class:`LoginInvalidModeError`；
         内核未装 → :class:`LoginBrowserMissingError`；
         每平台单会话冲突 → :class:`LoginSessionConflictError`。
         """
         platform = (platform or "").strip().lower()
+        mode = (mode or "headless").strip().lower()
+        if mode not in ("headless", "headed"):
+            raise LoginInvalidModeError(
+                f"登录模式非法：{mode}（仅支持 headless/headed）")
         account_name = sanitize_fs_name(account_name or "default")
         if account_name is None:
             raise LoginInvalidNameError(
@@ -274,12 +355,12 @@ class LoginSessionManager:
             if sess is not None and not sess.is_terminal() and not sess.is_expired():
                 raise LoginSessionConflictError(existing)
         session = LoginSession(secrets.token_urlsafe(16), platform,
-                               account_name, self._timeout)
+                               account_name, self._timeout, mode=mode)
         self._sessions[session.session_id] = session
         self._by_platform[platform] = session.session_id
         session.task = asyncio.get_running_loop().create_task(self._run(session))
-        self._logger.info("登录会话创建: platform=%s account=%s session=%s",
-                          platform, account_name, session.session_id)
+        self._logger.info("登录会话创建: platform=%s account=%s mode=%s session=%s",
+                          platform, account_name, mode, session.session_id)
         return session
 
     # ------------------------------------------------------------ 查询 / 操作
@@ -300,13 +381,18 @@ class LoginSessionManager:
         return session.inject_code(code)
 
     async def cancel(self, session_id: str) -> LoginSession | None:
-        """取消会话：终止执行任务（上游 finally 负责关浏览器）。"""
+        """取消会话：终止执行任务（上游 finally 负责关浏览器）。
+
+        有头模式（任务 #4）：置终态后置位 ``result_event`` 唤醒执行器；
+        桌面子进程经终态轮询感知后自行退出（窗口关闭由用户/硬超时收敛）。
+        """
         session = self._sessions.get(session_id)
         if session is None:
             return None
         if not session.is_terminal():
             session.status = "cancelled"
             session.message = "用户取消"
+            session.result_event.set()  # 唤醒 headed 执行器（幂等，无害）
             if session.task is not None and not session.task.done():
                 session.task.cancel()
                 try:
@@ -382,12 +468,61 @@ def _default_browser_check() -> bool:
 async def default_real_executor(session: LoginSession) -> None:
     """真实登录执行器：调上游 ``*_setup``（只读引用，铁律不修改上游）。
 
+    - **模式分发**（任务 #4）：``headed`` 会话走 :func:`headed_real_executor`
+      （浏览器在用户桌面会话的子进程里跑，**不经**阶段一的浏览器工作线程）；
+      ``headless``（缺省）维持下述现状链路；
+    - **浏览器工作线程**：上游 ``*_setup`` 启动浏览器驱动依赖
+      ``create_subprocess_exec``，服务主循环（Selector，§5.1 定案）不支持——
+      调用段整体下沉到 :mod:`sau_wrap.service.browser_thread` 的 Proactor 工作循环；
+      超时下沉到线程内（会话剩余时间），``_run`` 外层 ``wait_for`` 保留作兜底；
+      取消链：会话取消 → 主任务取消 → 桥接链式取消工作循环任务 → 上游
+      ``finally`` 关浏览器；
     - cookie 直接落主目录 ``%ProgramData%\\SAU\\cookies\\``（§3.6）；
     - headless=True（服务进程 Session 0 无桌面）；抖音的有头校验回环经
       ``DOUYIN_COOKIE_AUTH_HEADLESS`` 环境变量适配（上游原生支持该开关）；
     - 抖音短信二验经 :mod:`sau_wrap.service.login_adapt` 运行时桥接
       （会话期间替换模块属性，结束还原——上游文件零修改）。
     """
+    if session.mode == "headed":
+        return await headed_real_executor(session)
+    from sau_wrap.service.browser_thread import get_browser_thread  # noqa: PLC0415
+
+    remaining = max(1.0, session.expires_at - time.time())
+    await get_browser_thread().run_browser_coro(
+        lambda: _run_platform_login(session), timeout=remaining)
+
+
+async def headed_real_executor(session: LoginSession) -> None:
+    """有头登录执行器（任务 #4）：拉桌面会话子进程 + 等待结果回报。
+
+    浏览器在子进程（用户桌面会话）内运行，服务侧仅：
+    1. ``asyncio.to_thread`` 下沉 :func:`headed_launcher.launch_headed`
+       （服务主循环 Selector 禁用 ``create_subprocess_*``，进程操作一律
+       ``subprocess`` + 线程，与升级编排拉子进程先例同纪律）；
+    2. 拉起失败（如计划任务拒绝）**不拒绝创建**：会话已创建，此处置 ``failed``
+       并附手动命令引导文案（前端降级展示）；
+    3. 拉起成功 → ``await session.result_event``：子进程结束时经
+       ``POST /login/headed/result`` → ``report_result`` 置终态并置位；
+       外层 ``_run`` 的 ``wait_for`` 会话总超时兜底不变（含子进程回报丢失场景）。
+
+    注意：**不走**阶段一的浏览器工作线程（浏览器不在服务进程里跑）。
+    """
+    from sau_wrap.service import headed_launcher  # noqa: PLC0415
+
+    ok, manual_cmd = await asyncio.to_thread(
+        headed_launcher.launch_headed,
+        session.platform, session.account_name, session.session_id)
+    if not ok:
+        session.mark_failed(
+            "有头登录进程拉起失败（计划任务创建/运行被拒绝；请确认当前存在已登录的"
+            "用户桌面会话）。可在桌面会话的终端内手动执行完成登录："
+            + manual_cmd)
+        return
+    await session.result_event.wait()
+
+
+async def _run_platform_login(session: LoginSession) -> None:
+    """平台登录执行体（运行于浏览器工作线程的 Proactor 循环）。"""
     import os
 
     # 运行时环境适配（合法，上游原生开关）：服务进程无桌面，抖音登录后的

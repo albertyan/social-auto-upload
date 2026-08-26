@@ -30,7 +30,8 @@
   S9 起登录会话族落地（§6.5）：``POST /login/{platform}``、
   ``GET /login/qrcode/{session_id}``、``GET /login/status/{session_id}``、
   ``POST /login/{session_id}/code``、``DELETE /login/{session_id}``（及 ``.../cancel``）、
-  ``GET /accounts/status``、``DELETE /accounts``；``/accounts/recheck`` 仍占位 501；
+  ``GET /accounts/status``、``DELETE /accounts``；``POST /accounts/recheck``
+  一期落地文件级重扫（``mode="file_scan"``，真实浏览器复核留后续）；
 - 写操作审计：绑定/配置写入记一行审计日志（时间、操作、来源恒 127.0.0.1、结果、鉴权方式）。
 """
 
@@ -67,18 +68,25 @@ NONCE_WINDOW = 600.0
 
 #: Cookie 会话写操作必须携带 Nonce 的路径（§6.3：/config、/upgrade/apply 等；
 #: S7 起升级写端点并入；S9 起登录会话写族与账号删除并入（前缀匹配，
-#: 见 _nonce_required）；令牌鉴权豁免，见中间件）
+#: 见 _nonce_required）；/accounts/recheck 一期落地后并入强制集合；
+#: 令牌鉴权豁免，见中间件）
 _NONCE_REQUIRED = frozenset({"/config", "/bind", "/reload",
-                             "/upgrade/apply", "/upgrade/snooze"})
+                             "/upgrade/apply", "/upgrade/snooze",
+                             "/accounts/recheck"})
 
 
 def _nonce_required(method: str, path: str) -> bool:
     """Cookie 会话写操作 Nonce 约束判定（§6.3；S9 扩展登录/账号写族）。
 
     GET 类（含 /login/qrcode 与 /login/status 轮询）不受约束；
-    ``/login/*`` 的 POST/DELETE 与 ``DELETE /accounts`` 属写操作，纳入防护。
+    ``/login/*`` 的 POST/DELETE、``DELETE /accounts`` 与
+    ``POST /accounts/recheck`` 属写操作，纳入防护。
     """
     if method not in ("POST", "DELETE"):
+        return False
+    if path == "/login/headed/result":
+        # 任务 #4：令牌专属端点（有头登录子进程回报），不经 Nonce 约束，
+        # 非令牌调用由端点自身 403 拒绝（语义确定，不受 Cookie/Nonce 分支干扰）。
         return False
     if path in _NONCE_REQUIRED:
         return True
@@ -238,7 +246,9 @@ class LocalApiServer:
 
         - ``/ui/*``（静态资源与票据核销入口）公开（5409 仅绑定 127.0.0.1，§6.3）；
         - 业务端点：``X-SAU-Local-Token`` 或有效会话 Cookie 任一通过即可；
-        - Cookie 会话的写操作追加 Nonce 双重防护（§6.3）。
+        - Cookie 会话的写操作追加 Nonce 双重防护（§6.3）；
+        - Cookie 会话请求成功后刷新会话 Cookie 过期时间（与会话表双滑动续期，
+          避免持续操作满一个窗口后浏览器侧 Cookie 绝对过期被 401 踢出）。
         """
         path = request.path
         if path == "/ui" or path.startswith("/ui/"):
@@ -258,8 +268,26 @@ class LocalApiServer:
                 and _nonce_required(request.method, path)):
             err = self._consume_nonce(request)
             if err is not None:
+                # Nonce 拒绝响应（403/409）同样续种 Cookie，避免服务端会话
+                # 已续期而浏览器侧 Cookie 漂移过期。
+                self._refresh_session_cookie(request, err)
                 return err
-        return await handler(request)
+        resp = await handler(request)
+        self._refresh_session_cookie(request, resp)
+        return resp
+
+    def _refresh_session_cookie(self, request: web.Request,
+                                resp: web.StreamResponse) -> None:
+        """Cookie 双滑动续期：随会话表续期同步刷新 Cookie 绝对过期时间。
+
+        仅当 Cookie 鉴权通过且 ``_session_valid`` 已存入 ``session_sid`` 时生效；
+        成功响应与 Nonce 拒绝响应（403/409）均复用，保证持续操作不被 401
+        踢出；鉴权判定与单实例顶替策略不受影响。
+        """
+        if request.get("auth_via") == "cookie" and request.get("session_sid"):
+            resp.set_cookie(SESSION_COOKIE, request["session_sid"], path="/",
+                            max_age=int(self.session_timeout),
+                            httponly=True, samesite="Strict")
 
     def _unauthorized_response(self, request: web.Request, error: str = "unauthorized",
                                message: str = "缺少或错误的凭证") -> web.Response:
@@ -308,7 +336,11 @@ class LocalApiServer:
         return sid
 
     def _session_valid(self, request: web.Request) -> bool:
-        """校验会话 Cookie：存在、未超 30 分钟无活动（滑动续期）。"""
+        """校验会话 Cookie：存在、未超 30 分钟无活动（滑动续期）。
+
+        校验通过时把 sid 存入 ``request["session_sid"]``，供中间件在响应上
+        刷新 Cookie 过期时间（与会话表双滑动续期）。
+        """
         sid = request.cookies.get(SESSION_COOKIE, "")
         last_active = self._sessions.get(sid)
         if last_active is None:
@@ -320,6 +352,7 @@ class LocalApiServer:
                 self._active_sid = None
             return False
         self._sessions[sid] = now  # 滑动续期
+        request["session_sid"] = sid  # 供中间件刷新 Cookie（双滑动续期）
         return True
 
     # ------------------------------------------------------------ Nonce（§6.3）
@@ -375,30 +408,20 @@ class LocalApiServer:
         app.router.add_post("/upgrade/snooze", self._post_upgrade_snooze)
         # S9：登录会话族（§6.5：创建/二维码/状态/验证码注入/取消）
         # 注意：/login/qrcode 与 /login/status 必须先于 /login/{session_id} 族注册；
-        # /login/{platform}（POST）与 /login/{session_id} 族同方法不冲突靠路径段区分——
-        # aiohttp 动态路由均为单段匹配，此处平台/会话 id 同为单段，故创建端点用独立前缀语义：
-        # POST /login/{platform}（创建）与 POST /login/{session_id}/code（注入）段数不同不冲突。
+        # 任务 #4：/login/headed/result（三段）必须先于 /login/{session_id}/code
+        # 注册（同为 POST 三段，动态路由按注册顺序匹配，否则被“headed”吞为 session_id）；
+        # /login/{platform}（创建）与 /login/{session_id} 族同方法不冲突靠路径段数区分。
+        app.router.add_post("/login/headed/result", self._post_login_headed_result)
         app.router.add_post("/login/{platform}", self._post_login_start)
         app.router.add_get("/login/qrcode/{session_id}", self._get_login_qrcode)
         app.router.add_get("/login/status/{session_id}", self._get_login_status)
         app.router.add_post("/login/{session_id}/code", self._post_login_code)
         app.router.add_post("/login/{session_id}/cancel", self._post_login_cancel)
         app.router.add_delete("/login/{session_id}", self._post_login_cancel)
-        # S9：账号族（§3.5：状态查询 / 删除；真实浏览器复核 /accounts/recheck 仍占位）
+        # S9：账号族（§3.5：状态查询 / 文件级复核 / 删除；真实浏览器复核留后续）
         app.router.add_get("/accounts/status", self._get_accounts_status)
+        app.router.add_post("/accounts/recheck", self._post_accounts_recheck)
         app.router.add_delete("/accounts", self._delete_account)
-        # 占位端点（后续步骤实现）
-        for method, path, note in _PLACEHOLDER_ROUTES:
-            app.router.add_route(method, path, self._make_placeholder(note))
-
-    @staticmethod
-    def _make_placeholder(note: str):
-        async def handler(request: web.Request) -> web.Response:  # noqa: ANN202
-            return web.json_response(
-                {"error": "not_implemented", "message": f"本步占位，尚未实现：{note}"},
-                status=501,
-            )
-        return handler
 
     # ------------------------------------------------------------ S6 控制台端点
 
@@ -505,7 +528,24 @@ class LocalApiServer:
             return web.Response(status=400, text="bad path")
         if not target.is_file():
             return web.Response(status=404, text="not found")
-        ctype = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
+        # Windows 注册表可能把 .js 映射成 text/plain（或缺映射），会被浏览器以
+        # 「模块脚本严格 MIME 检查」拒绝（控制台 JS 无法加载）；
+        # Web 产物扩展名优先用内置表，其余走 mimetypes 兜底 octet-stream。
+        ctype = {
+            ".js": "text/javascript",
+            ".mjs": "text/javascript",
+            ".css": "text/css",
+            ".json": "application/json",
+            ".html": "text/html",
+            ".svg": "image/svg+xml",
+            ".png": "image/png",
+            ".ico": "image/x-icon",
+            ".woff": "font/woff",
+            ".woff2": "font/woff2",
+            ".map": "application/json",
+        }.get(target.suffix.lower())
+        if ctype is None:
+            ctype = mimetypes.guess_type(str(target))[0] or "application/octet-stream"
         data = target.read_bytes()
         if target.name == "index.html":
             headers = {"Cache-Control": "no-cache"}
@@ -625,21 +665,46 @@ class LocalApiServer:
     async def _post_login_start(self, request: web.Request) -> web.Response:
         """``POST /login/{platform}``：创建登录会话（每平台单会话，§6.5）。
 
-        请求体可选 ``{"account_name": "..."}``（缺省 default）。
-        错误：平台不支持 → 400；内核未装 → 503（引导 browser install）；
+        请求体可选 ``{"account_name": "...", "mode": "headless"|"headed"}``
+        （均缺省时行为与现状完全一致）。任务 #4：``headed`` 创建前置校验当前存在
+        活跃用户桌面会话（否则 503 ``no_interactive_session`` 引导）；拉起失败
+        不拒绝创建（会话照常创建，执行器置 failed 时 message 附手动命令引导）。
+        错误：平台/模式非法 → 400；内核未装/无交互会话 → 503；
         已有活跃会话 → 409（携带既有 session_id）。
         """
         from sau_wrap.service import login_sessions as ls  # noqa: PLC0415
 
         platform = request.match_info.get("platform", "")
         account_name = "default"
+        mode = "headless"
         try:
             body = await request.json()
             account_name = str(body.get("account_name") or "default")
+            mode = str(body.get("mode") or "headless")
         except (ValueError, json.JSONDecodeError, AttributeError):
             pass
+        if mode.strip().lower() == "headed":
+            # 前置校验：无活跃桌面会话则有头浏览器无处安放（会话创建后必失败，
+            # 不如前置 503 引导）；quser 同步调用经 to_thread 下沉（不阻塞循环）
+            from sau_wrap.service import headed_launcher  # noqa: PLC0415
+
+            user = await asyncio.to_thread(headed_launcher.find_interactive_user)
+            if not user:
+                self._audit("login_start", "fail",
+                            f"platform={platform} mode=headed no_interactive_session",
+                            request)
+                return web.json_response(
+                    {"error": "no_interactive_session",
+                     "message": "当前没有已登录的用户桌面会话，有头登录无法展示浏览器窗口。"
+                                "请先登录 Windows 用户会话（解锁屏幕/重新登录）后重试，"
+                                "或改用 headless 模式扫码登录。"},
+                    status=503)
         try:
-            session = await self._login_manager.create(platform, account_name)
+            session = await self._login_manager.create(platform, account_name,
+                                                       mode=mode)
+        except ls.LoginInvalidModeError as exc:
+            return web.json_response(
+                {"error": "invalid_mode", "message": str(exc)}, status=400)
         except ls.LoginInvalidNameError as exc:
             # 终审修复④：account_name 路径穿越防护（白名单净化）
             return web.json_response(
@@ -653,13 +718,19 @@ class LocalApiServer:
                  "guide": "sau.exe browser install"},
                 status=503)
         except ls.LoginSessionConflictError as exc:
-            return web.json_response(
-                {"error": "session_conflict",
-                 "message": "该平台已有进行中的登录会话",
-                 "session_id": exc.existing_session_id},
-                status=409)
+            body = {
+                "error": "session_conflict",
+                "message": "该平台已有进行中的登录会话",
+                "session_id": exc.existing_session_id,
+            }
+            # 评审修复 #10：附既有会话的 mode（前端据此正确渲染复用会话，
+            # 区分有头/无头展示差异）。
+            existing = self._login_manager.get(exc.existing_session_id)
+            if existing is not None:
+                body["mode"] = existing.mode
+            return web.json_response(body, status=409)
         self._audit("login_start", "success",
-                    f"platform={platform} account={account_name} "
+                    f"platform={platform} account={account_name} mode={mode} "
                     f"session={session.session_id}", request)
         return web.json_response(session.to_status_dict())
 
@@ -685,6 +756,45 @@ class LocalApiServer:
         if session is None:
             return web.json_response({"error": "session_not_found"}, status=404)
         return web.json_response(session.to_status_dict())
+
+    async def _post_login_headed_result(self, request: web.Request) -> web.Response:
+        """``POST /login/headed/result``：有头登录子进程结果回报（任务 #4）。
+
+        仅 ``X-SAU-Local-Token`` 鉴权（子进程持令牌；控制台浏览器不应直达本端点）；
+        请求体 ``{"session_id": "...", "ok": true|false, "message": "..."}``；
+        校验会话存在且 ``mode=="headed"`` 且未终态 → ``report_result`` 置终态。
+        """
+        if request.get("auth_via") != "token":
+            return web.json_response(
+                {"error": "token_required",
+                 "message": "结果回报仅限 X-SAU-Local-Token 调用方（有头登录子进程）"},
+                status=403)
+        try:
+            body = await request.json()
+        except (ValueError, json.JSONDecodeError):
+            return web.json_response({"error": "invalid_json"}, status=400)
+        session_id = str(body.get("session_id") or "")
+        ok = bool(body.get("ok"))
+        message = str(body.get("message") or "")
+        session = self._login_manager.get(session_id)
+        if session is None:
+            return web.json_response({"error": "session_not_found"}, status=404)
+        if session.mode != "headed":
+            return web.json_response(
+                {"error": "not_headed_session",
+                 "message": f"会话模式为 {session.mode}，不接受有头结果回报"},
+                status=409)
+        if not session.report_result(ok, message):
+            return web.json_response(
+                {"error": "session_terminal",
+                 "message": f"会话已终态（{session.status}），回报被幂等忽略",
+                 "status": session.status},
+                status=409)
+        self._audit("login_headed_result",
+                    "success" if ok else "fail",
+                    f"session={session.session_id} platform={session.platform} "
+                    f"message={message[:120]}", request)
+        return web.json_response({"ok": True})
 
     async def _post_login_code(self, request: web.Request) -> web.Response:
         """``POST /login/{session_id}/code``：短信验证码注入（§6.5 need_input）。"""
@@ -725,14 +835,31 @@ class LocalApiServer:
     async def _get_accounts_status(self, request: web.Request) -> web.Response:
         """``GET /accounts/status``：账号列表（双目录兼容扫描，§3.6）。
 
-        基础判定：文件存在且合法 JSON 即 is_valid；真实浏览器复核标注后续
-        （``/accounts/recheck`` 占位）。
+        基础判定：文件存在且合法 JSON 即 is_valid；真实浏览器复核标注后续。
         """
         from sau_wrap.agent import accounts as accounts_mod  # noqa: PLC0415
 
         return web.json_response({"accounts": accounts_mod.scan_accounts(),
                                   "note": "is_valid 为基础判定（文件存在且合法 JSON）；"
-                                          "真实浏览器复核待 /accounts/recheck 实现"})
+                                          "真实浏览器复核待后续实现"})
+
+    async def _post_accounts_recheck(self, request: web.Request) -> web.Response:
+        """``POST /accounts/recheck``：账号状态复核（一期：文件级重扫，§3.5）。
+
+        复用 ``GET /accounts/status`` 同源的 ``scan_accounts`` 文件扫描逻辑，
+        返回各账号 ``platform_key / account_name / is_valid / source`` 与本次
+        检查时间戳 ``checked_at``（epoch 秒）；``mode="file_scan"`` 明确标注
+        本次为文件级检查（非真实浏览器复核），便于前端展示口径。
+        """
+        from sau_wrap.agent import accounts as accounts_mod  # noqa: PLC0415
+
+        accounts = accounts_mod.scan_accounts()
+        self._audit("accounts_recheck", "success", f"count={len(accounts)}", request)
+        return web.json_response({
+            "mode": "file_scan",
+            "checked_at": int(time.time()),
+            "accounts": accounts,
+        })
 
     async def _delete_account(self, request: web.Request) -> web.Response:
         """``DELETE /accounts``：删除主目录账号 cookie 文件（写操作：Nonce + 审计）。
@@ -815,17 +942,30 @@ class LocalApiServer:
         return web.json_response(body)
 
     async def _get_config(self, request: web.Request) -> web.Response:
-        """``GET /config``：读绑定配置（不含凭证）。"""
+        """``GET /config``：读绑定配置；已绑定时附凭证回显。
+
+        追加 ``token_present``（布尔）；凭证存在时附 ``token`` 明文
+        （``agent_config.load_token()`` DPAPI 解密）。读取异常（如解密失败）
+        按无凭证处理，不影响接口可用性。
+        """
         cfg = agent_config.load_config()
         if cfg is None:
             return web.json_response({"bound": False})
-        return web.json_response({
+        try:
+            token = agent_config.load_token()
+        except Exception:  # noqa: BLE001
+            token = None  # 兜底：解密失败等异常按无凭证处理，不得 500
+        body = {
             "bound": True,
             "server_url": cfg.server_url,
             "agent_id": cfg.agent_id,
             "heartbeat_interval": cfg.heartbeat_interval,
             "local_api_port": cfg.local_api_port,
-        })
+            "token_present": token is not None,
+        }
+        if token is not None:
+            body["token"] = token
+        return web.json_response(body)
 
     async def _post_config(self, request: web.Request) -> web.Response:
         """``POST /config``：写 server_url（及可选运行参数）→ 触发热重载。"""
@@ -909,10 +1049,3 @@ class LocalApiServer:
             operation, result, detail, via,
         )
 
-
-#: 占位端点（本步返回 501 + 说明，后续步骤实现；
-#: /ui/* 与票据链路已由 S6 实现、升级族已由 S7 实现、登录会话族与账号
-#: 查询/删除已由 S9 实现，从此清单移除；仅留真实浏览器复核）
-_PLACEHOLDER_ROUTES = (
-    ("POST", "/accounts/recheck", "账号状态真实浏览器复核（后续步骤）"),
-)

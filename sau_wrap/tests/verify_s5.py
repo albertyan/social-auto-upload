@@ -12,7 +12,14 @@
    错误注入：非 183 创建失败必须报错而不得返回 None）；
 4. 日志轮转配置（tray.log = 5MB × 3，§14.1）；
 5. 打开控制台/日志目录的 URL/路径构造 + tooltip 构造；
-6. 图标生成（Pillow 色块：在线绿/离线灰，无图片资源文件）。
+6. 图标生成（Pillow 色块：在线绿/离线灰，无图片资源文件）；
+7. Task #4 追加：判绿纳入 token_status（expired/suspended/unbound 归离线，
+   缺失按 ok）、tooltip 凭证态文案、signal_tray_exit 优雅退出信号（随机化
+   命名隔离，不碰真实托盘）。
+8. Task #6 追加（评审修复）：_poll_loop 等待段不再把 threading.Event 传入
+   WaitForMultipleObjects（源码静态断言 + 抽出等待逻辑跑真实线程验证不抛
+   TypeError 且可被退出事件打断）；pick_notice 气泡文案区分（凭证态离线 →
+   凭证文案；普通离线 → 既定措辞；恢复 → 恢复措辞）。
 
 托盘真实启动（交互会话）手动验证步骤见 sau_wrap/README.md「S5 手动验证」。
 
@@ -66,6 +73,10 @@ class _StatusHandler(http.server.BaseHTTPRequestHandler):
     - ``tok_online``  → 200 ws_connected=True
     - ``tok_offline`` → 200 ws_connected=False
     - ``tok_susp``    → 200 ws_connected=True suspended=True
+    - ``tok_tsexp``   → 200 ws_connected=True token_status=expired（Task #4）
+    - ``tok_tssusp``  → 200 ws_connected=True token_status=suspended（Task #4）
+    - ``tok_tsunb``   → 200 ws_connected=True token_status=unbound（Task #4）
+    - ``tok_tsok``    → 200 ws_connected=True token_status=ok（Task #4）
     - 其他            → 401
     """
 
@@ -82,6 +93,26 @@ class _StatusHandler(http.server.BaseHTTPRequestHandler):
         elif token == "tok_susp":
             body = {"ws_connected": True, "suspended": True,
                     "version": "2.0.0a0", "active_tasks": 0}
+            self._reply(200, body)
+        elif token == "tok_tsexp":
+            body = {"ws_connected": True, "suspended": False,
+                    "token_status": "expired",
+                    "version": "2.0.0a0", "active_tasks": 1}
+            self._reply(200, body)
+        elif token == "tok_tssusp":
+            body = {"ws_connected": True, "suspended": False,
+                    "token_status": "suspended",
+                    "version": "2.0.0a0", "active_tasks": 1}
+            self._reply(200, body)
+        elif token == "tok_tsunb":
+            body = {"ws_connected": True, "suspended": False,
+                    "token_status": "unbound",
+                    "version": "2.0.0a0", "active_tasks": 0}
+            self._reply(200, body)
+        elif token == "tok_tsok":
+            body = {"ws_connected": True, "suspended": False,
+                    "token_status": "ok",
+                    "version": "2.0.0a0", "active_tasks": 2}
             self._reply(200, body)
         else:
             self._reply(401, {"error": "unauthorized"})
@@ -121,6 +152,21 @@ def scenario_poll_states(port: int, dead_port: int) -> None:
     st, _ = tray_app.fetch_status(port, "tok_susp")
     check("挂起亦判离线（200 + suspended=True）", st == tray_app.ST_OFFLINE,
           f"state={st}")
+
+    # Task #4：判绿收紧——凭证态（/status 的 token_status）纳入在线判定；
+    # expired/suspended/unbound 归离线，缺失按 ok（兼容旧版服务响应）
+    st, _ = tray_app.fetch_status(port, "tok_tsexp")
+    check("token_status=expired → 判离线（凭证过期不得判绿）",
+          st == tray_app.ST_OFFLINE, f"state={st}")
+    st, _ = tray_app.fetch_status(port, "tok_tssusp")
+    check("token_status=suspended → 判离线（凭证挂起不得判绿）",
+          st == tray_app.ST_OFFLINE, f"state={st}")
+    st, _ = tray_app.fetch_status(port, "tok_tsunb")
+    check("token_status=unbound → 判离线（未绑定不得判绿）",
+          st == tray_app.ST_OFFLINE, f"state={st}")
+    st, _ = tray_app.fetch_status(port, "tok_tsok")
+    check("token_status=ok → 判在线（显式 ok 不影响判绿）",
+          st == tray_app.ST_ONLINE, f"state={st}")
 
     st, _ = tray_app.fetch_status(port, "wrong_token")
     check("401 令牌错误 → auth_error", st == tray_app.ST_AUTH, f"state={st}")
@@ -283,8 +329,26 @@ def scenario_urls_and_tooltip() -> None:
     tip_unreach = tray_app.build_tooltip(tray_app.ST_UNREACHABLE, None)
     check("tooltip 在线：版本+连接态+活跃任务",
           "2.0.0a0" in tip_on and "在线" in tip_on and "3" in tip_on, f"tip={tip_on!r}")
-    check("tooltip 挂起态", "挂起" in tip_susp, f"tip={tip_susp!r}")
+    check("tooltip 挂起态（suspended 字段口径）", "挂起" in tip_susp, f"tip={tip_susp!r}")
     check("tooltip 不可达", "不可达" in tip_unreach, f"tip={tip_unreach!r}")
+
+    # Task #4：token_status 非 ok 时连接态文案体现凭证问题并给处理指引；
+    # 字段缺失按 ok 处理（已在上方既有在线用例覆盖，兼容旧 mock）
+    tip_unb = tray_app.build_tooltip(tray_app.ST_OFFLINE,
+                                     {"version": "2.0.0a0", "ws_connected": True,
+                                      "token_status": "unbound", "active_tasks": 0})
+    tip_exp = tray_app.build_tooltip(tray_app.ST_OFFLINE,
+                                     {"version": "2.0.0a0", "ws_connected": True,
+                                      "token_status": "expired", "active_tasks": 0})
+    tip_tss = tray_app.build_tooltip(tray_app.ST_OFFLINE,
+                                     {"version": "2.0.0a0", "ws_connected": True,
+                                      "token_status": "suspended", "active_tasks": 0})
+    check("tooltip 未绑定：含「未绑定（请打开控制台绑定）」",
+          "未绑定（请打开控制台绑定）" in tip_unb, f"tip={tip_unb!r}")
+    check("tooltip 凭证过期：含「凭证已过期（请重新绑定）」",
+          "凭证已过期（请重新绑定）" in tip_exp, f"tip={tip_exp!r}")
+    check("tooltip 凭证挂起：含「已挂起（凭证，请打开控制台处理）」",
+          "已挂起（凭证，请打开控制台处理）" in tip_tss, f"tip={tip_tss!r}")
 
     # local_token.bin 读取（不存在 → None；写入 → 读回）
     check("令牌文件缺失 → None", tray_app.load_local_token() is None,
@@ -316,6 +380,220 @@ def scenario_icons() -> None:
           and tray_app.pick_icon_color(tray_app.ST_AUTH) == tray_app.COLOR_OFFLINE
           and tray_app.pick_icon_color(tray_app.ST_UNREACHABLE) == tray_app.COLOR_OFFLINE,
           "online→绿；offline/auth/unreachable→灰")
+
+    # Task #4：图标双图预缓存 + 每轮无条件重赋（自愈）。
+    # run() 为交互式入口无法模块级启动，用源码级静态断言防回归：
+    import inspect
+
+    src = inspect.getsource(tray_app.run)
+    check("run() 预缓存双图 {True: 绿, False: 灰}（轮询期只赋引用不重建）",
+          "icon_images = {" in src
+          and "make_icon_image(COLOR_ONLINE)" in src
+          and "make_icon_image(COLOR_OFFLINE)" in src,
+          "icon_images pre-cache present in run()")
+    check("run() 每轮无条件重赋缓存位图（图标自愈；last_online 边沿分支已删除）",
+          "icon.icon = icon_images[state == ST_ONLINE]" in src
+          and "last_online =" not in src and "!= last_online" not in src,
+          "unconditional reassignment per poll; no edge-cache branch")
+
+
+# ================================================================ 场景 7（Task #4）
+
+
+def scenario_signal_tray_exit() -> None:
+    print("\n==== 场景7：signal_tray_exit 优雅退出信号（卸载/升级先礼后兵） ====", flush=True)
+    import uuid
+
+    import win32api
+    import win32event
+
+    tag = uuid.uuid4().hex[:8]
+    ev_missing = f"SAUVerifyNoEvent{tag}"
+    mtx_missing = f"SAUVerifyNoMutex{tag}"
+
+    # 事件不存在（托盘未运行/旧版托盘）：快速返回 0，无需兜底；
+    # 随机化名称做测试隔离，确保不碰真实托盘（SAUTrayExitEvent/SAUTrayMutex）
+    t0 = time.monotonic()
+    rc = tray_app.signal_tray_exit(timeout=1.0, event_name=ev_missing,
+                                   mutex_name=mtx_missing)
+    dt = time.monotonic() - t0
+    check("事件不存在 → 快速返回 0（无需 taskkill 兜底）", rc == 0, f"rc={rc}")
+    check("事件不存在时快速返回（远小于 timeout）", dt < 0.5, f"elapsed={dt:.3f}s")
+
+    # 事件存在但互斥量不存在（视同托盘已退出）：SetEvent 后探活即得 0；
+    # 即使首探落在 timeout 边界后，循环也会立即终止，耗时受小 timeout 控制
+    ev_h = win32event.CreateEvent(None, True, False, f"SAUVerifyEvent{tag}")
+    try:
+        t0 = time.monotonic()
+        rc = tray_app.signal_tray_exit(timeout=0.3,
+                                       event_name=f"SAUVerifyEvent{tag}",
+                                       mutex_name=mtx_missing,
+                                       poll_interval=0.05)
+        dt = time.monotonic() - t0
+        check("事件存在、互斥量不存在 → 返回 0（视同托盘已退出）",
+              rc == 0, f"rc={rc}")
+        check("互斥量探活快速收敛（不空转满 timeout）", dt < 0.5,
+              f"elapsed={dt:.3f}s")
+    finally:
+        win32api.CloseHandle(ev_h)
+
+    # 超时路径：事件与互斥量都在且「托盘」永不退出（无人消费事件）→ 1；
+    # 用小 timeout 控制用例耗时（超时后调用方 taskkill 兜底）
+    ev_h2 = win32event.CreateEvent(None, True, False, f"SAUVerifyEvent2{tag}")
+    mtx_h = tray_app.acquire_mutex(f"SAUVerifyMutex{tag}")
+    try:
+        t0 = time.monotonic()
+        rc = tray_app.signal_tray_exit(timeout=0.4,
+                                       event_name=f"SAUVerifyEvent2{tag}",
+                                       mutex_name=f"SAUVerifyMutex{tag}",
+                                       poll_interval=0.1)
+        dt = time.monotonic() - t0
+        check("托盘仍在（互斥量存活）且超时 → 返回 1（调用方 taskkill 兜底）",
+              rc == 1, f"rc={rc}")
+        check("超时用例耗时受 timeout 控制（0.3~2s）", 0.3 <= dt < 2.0,
+              f"elapsed={dt:.3f}s")
+    finally:
+        win32api.CloseHandle(ev_h2)
+        if mtx_h is not None:
+            win32api.CloseHandle(mtx_h)
+
+
+# ================================================================ 场景 8（Task #6 评审修复①③）
+
+
+def scenario_pick_notice() -> None:
+    print("\n==== 场景8：气泡文案区分（评审问题 3：凭证态离线不误导「自动恢复」）====", flush=True)
+    # 凭证态离线（服务在运行、根因是凭证）→ 凭证文案而非「系统会自动恢复」
+    for ts in ("expired", "unbound", "suspended"):
+        got = tray_app.pick_notice(tray_app.ST_OFFLINE, {"token_status": ts})
+        check(f"凭证态离线（token_status={ts}）→ 凭证文案",
+              got == tray_app.NOTIFY_TOKEN == "凭证异常，请打开控制台处理",
+              f"notice={got!r}")
+
+    # 普通离线（未连接/挂起/缺 token_status）→ §5.2 定案措辞一字不动
+    got = tray_app.pick_notice(tray_app.ST_OFFLINE, {"ws_connected": False})
+    check("普通离线（连接断开）→ 既定措辞不变",
+          got == tray_app.NOTIFY_DOWN == "服务未运行，系统会自动恢复",
+          f"notice={got!r}")
+    got = tray_app.pick_notice(tray_app.ST_UNREACHABLE, None)
+    check("服务不可达 → 既定离线措辞不变（无 body 不误判凭证）",
+          got == tray_app.NOTIFY_DOWN, f"notice={got!r}")
+    got = tray_app.pick_notice(tray_app.ST_AUTH, None)
+    check("401 令牌不匹配 → 既定离线措辞不变（非 ST_OFFLINE 不走凭证分支）",
+          got == tray_app.NOTIFY_DOWN, f"notice={got!r}")
+
+    # 恢复在线 → 定案恢复措辞一字不动；token_status 显式 ok 不误走凭证分支
+    got = tray_app.pick_notice(tray_app.ST_ONLINE, {"token_status": "ok"})
+    check("恢复在线 → 「服务已恢复在线」措辞不变",
+          got == tray_app.NOTIFY_UP == "服务已恢复在线", f"notice={got!r}")
+
+
+# ================================================================ 场景 9（Task #6 评审修复①）
+
+
+def scenario_poll_wait_section() -> None:
+    print("\n==== 场景9：轮询等待段不再崩溃（评审问题 1）====", flush=True)
+    import dis
+    import inspect
+    import textwrap
+    import uuid
+
+    import win32api
+    import win32event
+
+    src = inspect.getsource(tray_app.run)
+    poll_src = src[src.index("def _poll_loop"):src.index("def _quit")]
+
+    # 源码/字节码静态断言（风格与既有源码断言一致）：
+    # 先抽出 _poll_loop 在桩环境编译为真实函数对象，再扫其字节码——
+    # 只认实际执行的指令，注释中的历史说明不干扰断言。
+    stub_ns = {
+        "icon_holder": {}, "exit_event_handle": None,
+        "POLL_INTERVAL": 0.1, "port": 5409,
+        "load_local_token": lambda: None,
+        "fetch_status": lambda port, token: (tray_app.ST_UNREACHABLE, None),
+        "tracker": tray_app.StateTracker(),
+        "_stop_icon": lambda reason: None,
+        "logger": __import__("logging").getLogger("sau.verify5.wait.static"),
+    }
+    exec(compile(textwrap.dedent(poll_src), "<poll_loop>", "exec"), stub_ns)  # noqa: S102
+    code_ops = [instr.argval for instr in dis.get_instructions(stub_ns["_poll_loop"])]
+    has_wfm = any("WaitForMultipleObjects" in str(op) for op in code_ops)
+    has_wfs = any("WaitForSingleObject" in str(op) for op in code_ops)
+    check("_poll_loop 字节码不存在 WaitForMultipleObjects（threading.Event 入句柄列表必抛 TypeError）",
+          not has_wfm, "dis-scanned poll-loop bytecode")
+    check("等待段包含退出事件非阻塞探测 WaitForSingleObject(exit_event_handle, 0)",
+          has_wfs and "WaitForSingleObject(exit_event_handle, 0)" in poll_src,
+          "non-blocking probe present")
+    check("等待段降级路径保留 stop_event.wait(POLL_INTERVAL)（可被菜单退出打断）",
+          "stop_event.wait(POLL_INTERVAL)" in poll_src, "fallback wait present")
+    # 探测段被 try/except 包裹：try 在探测前、except 在探测后（降级纯等待）
+    i_try = poll_src.rindex("try:", 0, poll_src.index("WaitForSingleObject"))
+    i_probe = poll_src.index("WaitForSingleObject(exit_event_handle, 0)")
+    i_except = poll_src.index("except Exception", i_probe)
+    check("等待段整体纳入 try/except（异常降级，轮询线程永不因等待而死）",
+          i_try < i_probe < i_except, f"try@{i_try} probe@{i_probe} except@{i_except}")
+    # 修复 2（探测前移）：退出事件探测必须出现在工作段（load_local_token /
+    # fetch_status）之前——旧位置在工作段之后时最坏延迟 ≈5s+3s(HTTP)=8s，
+    # 与 tray-exit 默认 8s 超时贴边；前移后最坏延迟 ≤1 个 POLL_INTERVAL。
+    i_work = poll_src.index("load_local_token()")
+    check("修复 2：退出事件探测前移至工作段之前（最坏延迟 ≤1 个 POLL_INTERVAL）",
+          i_probe < i_work, f"probe@{i_probe} work@{i_work}")
+
+    # 线程级实运：把 _poll_loop 源码抽出在桩环境跑真实线程（不启动真实托盘）：
+    # ① 未置退出事件时轮询存活不抛异常；② SetEvent 后在窗口内优雅退出。
+    code = textwrap.dedent(poll_src)
+    tag = uuid.uuid4().hex[:8]
+    ev_name = f"SAUVerifyPollEvent{tag}"
+    ev_h = win32event.CreateEvent(None, True, False, ev_name)
+    import logging as _logging
+
+    stop_event = threading.Event()
+    stop_reasons: list[str] = []
+    ns = {
+        "icon_holder": {"stop_event": stop_event},  # 无 icon：跳过图标分支
+        "exit_event_handle": ev_h,
+        "POLL_INTERVAL": 0.1,
+        "port": 5409,  # _poll_loop 轮询体引用的外层局部量（桩值即可）
+        "load_local_token": lambda: None,
+        "fetch_status": lambda port, token: (tray_app.ST_UNREACHABLE, None),
+        "tracker": tray_app.StateTracker(),
+        "_stop_icon": lambda reason: (stop_reasons.append(reason),
+                                      icon_holder_set()),
+        "logger": _logging.getLogger("sau.verify5.wait"),
+    }
+
+    def icon_holder_set() -> None:
+        ns["icon_holder"]["stopped"] = True
+        stop_event.set()
+
+    try:
+        exec(compile(code, "<poll_loop>", "exec"), ns)  # noqa: S102（测试内桩执行）
+        poll_fn = ns["_poll_loop"]
+        errors: list[BaseException] = []
+
+        def _run() -> None:
+            try:
+                poll_fn()
+            except BaseException as exc:  # noqa: BLE001 捕获线程内任何异常（含 TypeError）
+                errors.append(exc)
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        time.sleep(0.3)  # 约 3 轮等待段：旧实现首轮即抛 TypeError 杀线程
+        alive_before_signal = t.is_alive() and not errors
+        win32event.SetEvent(ev_h)  # 模拟卸载/升级器 tray-exit 发信号
+        t.join(timeout=2.0)
+        exited = not t.is_alive() and not errors
+        check("未置退出事件时轮询线程存活（等待段不抛异常，旧实现首轮即死）",
+              alive_before_signal, f"alive={t.is_alive()} errors={errors!r}")
+        check("SetEvent 后轮询线程在窗口内优雅退出（无 TypeError）",
+              exited and not errors, f"exited={exited} errors={errors!r}")
+        check("退出路径走 _stop_icon（与菜单退出相同：置停 → 唤醒 → icon.stop）",
+              len(stop_reasons) == 1 and "外部请求退出" in stop_reasons[0],
+              f"reasons={stop_reasons!r}")
+    finally:
+        win32api.CloseHandle(ev_h)
 
 
 # ================================================================ 主入口
@@ -500,6 +778,9 @@ def main() -> int:
         scenario_encoding_guard()
         scenario_urls_and_tooltip()
         scenario_icons()
+        scenario_signal_tray_exit()
+        scenario_pick_notice()
+        scenario_poll_wait_section()
     finally:
         server.shutdown()
 

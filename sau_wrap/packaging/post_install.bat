@@ -11,6 +11,10 @@ rem    0  success (status-evidence / autostart failure tolerated: warn only)
 rem    11 service install failed  (stage 3: never swallowed)
 rem    12 service start failed    (stage 4: retried twice)
 rem cmd.exe itself fails to launch -> Inno side maps to 99 (unknown).
+rem NOTE: stage 5 (browser kernel download) no longer runs here and is NOT
+rem part of the exit-code matrix below; it moved to the setup wizard for a
+rem visible progress window (see sau.iss CurStepChanged, ssPostInstall).
+rem Matrix semantics (0/11/12) unchanged.
 rem
 rem Task #26 fixes:
 rem - every external step captured via %%ERRORLEVEL%% + echoed to the log
@@ -86,20 +90,8 @@ rem ---- verify status once more (evidence step: failure tolerated) ----
 call "%SAU%" service status
 if errorlevel 1 echo [post-install][warn] service status reported anomaly [evidence only, not blocking]
 
-rem ---- task #26 decision change: browser kernel auto-download at install
-rem      time (design doc section 7.3 revised). Failure NEVER blocks the
-rem      install (section 17 stage 5); already-installed is skipped inside
-rem      sau.exe (upgrade does not re-download the ~295MB two-component
-rem      pair); total cap 20 minutes enforced inside sau.exe; progress
-rem      lands in this log and in
-rem      %ProgramData%\SAU\logs\browser_install.log. ----
-echo [post-install] browser kernel download starting [skip if installed]...
-call "%SAU%" browser install
-set "RC=%ERRORLEVEL%"
-echo [post-install] browser install exit=%RC%
-if not "%RC%"=="0" (
-    echo [post-install][warn] browser kernel download failed [stage 5: not blocking, see browser_install.log]
-)
+rem ---- browser kernel download moved to the setup wizard, run in a
+rem      visible window (see sau.iss CurStepChanged). File stays pure ASCII. ----
 
 rem ---- section 7.3 step 3: autostart for the CURRENT user (section 5.4);
 rem      failure tolerated per stage 6 (log only, tray can start manually) ----

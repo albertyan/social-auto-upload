@@ -12,6 +12,7 @@ const form = ref({ server_url: '', token: '', agent_id: '' })
 const msg = ref('')
 const msgOk = ref(true)
 const busy = ref(false)
+const showToken = ref(false)
 
 async function loadAll() {
   try {
@@ -22,7 +23,11 @@ async function loadAll() {
   }
   try {
     config.value = await apiGet('/config')
-    if (config.value.bound) form.value.server_url = config.value.server_url || ''
+    if (config.value.bound) {
+      form.value.server_url = config.value.server_url || ''
+      form.value.agent_id = config.value.agent_id || ''
+    }
+    showToken.value = false
   } catch (e) {
     if (!(e instanceof UnauthorizedError)) showErr(e.message)
   }
@@ -83,6 +88,18 @@ function copyCode() {
     .catch(() => showErr('复制失败，请手动选择复制'))
 }
 
+function copyAgentId() {
+  navigator.clipboard?.writeText(config.value.agent_id || '')
+    .then(() => showMsg('Agent ID 已复制'))
+    .catch(() => showErr('复制失败，请手动选择复制'))
+}
+
+function copyToken() {
+  navigator.clipboard?.writeText(config.value.token || '')
+    .then(() => showMsg('Token 已复制'))
+    .catch(() => showErr('复制失败，请手动选择复制'))
+}
+
 onMounted(loadAll)
 </script>
 
@@ -131,5 +148,33 @@ onMounted(loadAll)
       </button>
     </template>
     <p v-if="msg" class="msg" :class="msgOk ? 'ok' : 'err'">{{ msg }}</p>
+  </div>
+
+  <div v-if="config && config.bound" class="card">
+    <h2>当前绑定凭证</h2>
+    <div class="field">
+      <label>Agent ID</label>
+      <p style="font-family:Consolas,monospace;word-break:break-all">
+        {{ config.agent_id || '—' }}
+        <button v-if="config.agent_id" class="secondary" style="margin-left:8px" @click="copyAgentId">
+          复制
+        </button>
+      </p>
+    </div>
+    <div class="field">
+      <label>Token</label>
+      <template v-if="config.token_present">
+        <p style="font-family:Consolas,monospace;word-break:break-all">
+          {{ showToken ? config.token : '••••••••' }}
+          <button class="secondary" style="margin-left:8px" @click="showToken = !showToken">
+            {{ showToken ? '隐藏' : '显示' }}
+          </button>
+          <button class="secondary" style="margin-left:8px" @click="copyToken">
+            复制
+          </button>
+        </p>
+      </template>
+      <p v-else class="msg err" style="margin-top:0">本机凭证不可用，请重新绑定</p>
+    </div>
   </div>
 </template>

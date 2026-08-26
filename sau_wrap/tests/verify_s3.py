@@ -7,9 +7,9 @@
 3. ``GET/POST /config``：读/写 server_url，写入触发审计与热重载；
 4. ``POST /bind`` 复用 ``sau bind`` 逻辑（config.json + credential.bin 落盘）；
 5. 4401 挂起 → ``POST /reload`` 唤醒重连（复用 mock WS 服务端，含挂起态 ws_connected=False 断言）；
-6. 占位端点（/accounts/recheck）→ 501 + 说明（/ui/* 自 S6 起已由静态托管实现；
-   /upgrade 自 S7 起已由升级状态机实现，返回快照 200；/login/* 与 /accounts/*
-   自 S9 起已实现，不在占位清单）；
+6. ``POST /accounts/recheck`` 一期落地：文件级重扫（200 + mode=file_scan）；
+   /ui/* 自 S6 起已由静态托管实现；/upgrade 自 S7 起已由升级状态机实现，
+   返回快照 200；/login/* 与 /accounts/* 自 S9 起已实现，占位端点已全部落地）；
 7. 端口被占用 → 明确报错（``LocalApiBindError`` + 日志），禁止静默失败（§4.4）；
 8. 退避期间（8s 档）``POST /config`` 热重载打断退避立即重连（<2s）。
 
@@ -95,7 +95,7 @@ async def wait_until(pred, timeout: float, interval: float = 0.1) -> bool:
 
 
 async def scenario_api_basics() -> None:
-    print("\n==== 场景1/2/3/6：鉴权 + /status + /config + 占位501 ====", flush=True)
+    print("\n==== 场景1/2/3/6：鉴权 + /status + /config + recheck 文件级重扫 ====", flush=True)
     fresh_env()
     logger, logbuf = make_logger()
     stop_event, resume_event = asyncio.Event(), asyncio.Event()
@@ -157,14 +157,24 @@ async def scenario_api_basics() -> None:
               and cfg2.heartbeat_interval == 25,
               f"resp={rw_body} 落盘server_url={cfg2.server_url if cfg2 else '-'}")
 
-        # 占位 501（/ui/* 自 S6 起已实现：静态托管 200 或产物缺失提示 503；
-        # /upgrade 自 S7 起已实现：快照 200；/login/* 与 /accounts/* 自 S9 起已实现）
+        # /accounts/recheck 一期落地（文件级重扫，mode=file_scan）；
+        # /ui/* 自 S6 起已实现：静态托管 200 或产物缺失提示 503；
+        # /upgrade 自 S7 起已实现：快照 200
         pu = await sess.get(f"{base}/ui/", headers=headers)
         pl = await sess.post(f"{base}/accounts/recheck", headers=headers)
+        plb = await pl.json()
         pg = await sess.get(f"{base}/upgrade", headers=headers)
-        check("占位端点 /accounts/recheck → 501；/ui/ 已静态托管；/upgrade 已实现（200）",
-              pu.status in (200, 503) and pl.status == 501 and pg.status == 200,
-              f"status={(pu.status, pl.status, pg.status)} body={(await pl.json())}")
+        accs = plb.get("accounts")
+        check("/accounts/recheck 文件级重扫落地（200 + file_scan + 契约字段）；"
+              "/ui/ 已静态托管；/upgrade 已实现（200）",
+              pu.status in (200, 503) and pl.status == 200
+              and plb.get("mode") == "file_scan"
+              and isinstance(plb.get("checked_at"), int)
+              and isinstance(accs, list)
+              and all(set(a) >= {"platform_key", "account_name",
+                                 "is_valid", "source"} for a in accs)
+              and pg.status == 200,
+              f"status={(pu.status, pl.status, pg.status)} body={plb}")
 
     audit_lines = [ln for ln in logbuf.getvalue().splitlines() if "[AUDIT]" in ln]
     check("写操作审计日志（bind/config，来源 127.0.0.1）",

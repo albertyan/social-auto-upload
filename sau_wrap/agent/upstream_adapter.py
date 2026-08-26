@@ -66,12 +66,41 @@ async def execute_upload(
 ) -> str:
     """统一上传入口。返回 publish_url（上游暂不回链，恒 ""；后续步骤可扩展）。
 
-    - 优先使用注入实现（可测试性）；否则走内置真实映射（惰性 import 上游）；
-    - 上游为同步阻塞实现（subprocess/biliup）时用 ``asyncio.to_thread`` 包裹。
+    - 优先使用注入实现（可测试性，仍在调用方循环直接 await）；否则走内置真实
+      映射（惰性 import 上游）；
+    - 上游为同步阻塞实现（subprocess/biliup）时用 ``asyncio.to_thread`` 包裹；
+    - **浏览器内置上传器**（patchright/playwright 异步实现）经
+      :mod:`sau_wrap.service.browser_thread` 的专用 Proactor 工作循环执行：
+      服务主循环为 Selector（§5.1 定案）不支持 ``create_subprocess_*``，
+      而浏览器驱动启动依赖它；只替换调度壳，不改上传协程本体（bilibili
+      走 to_thread 同步子进程，不经工作线程）。
     """
     fn = _REGISTRY.get((platform_key, content_type))
-    if fn is None:
-        fn = _builtin_uploader(platform_key, content_type)
+    if fn is not None:
+        # 注入实现（测试假函数）：不经浏览器工作线程，保持原行为
+        result = fn(
+            payload=payload,
+            account_file=account_file,
+            video_file=video_file,
+            image_files=image_files or [],
+        )
+        if inspect.isawaitable(result):
+            result = await result
+        return str(result or "")
+
+    fn = _builtin_uploader(platform_key, content_type)
+    if (platform_key, content_type) in _BROWSER_BUILTIN_KEYS:
+        from sau_wrap.service.browser_thread import get_browser_thread  # noqa: PLC0415
+
+        result = await get_browser_thread().run_browser_coro(
+            lambda: fn(
+                payload=payload,
+                account_file=account_file,
+                video_file=video_file,
+                image_files=image_files or [],
+            ))
+        return str(result or "")
+
     result = fn(
         payload=payload,
         account_file=account_file,
@@ -114,6 +143,10 @@ _BUILTIN_KEYS = frozenset({
     ("youtube", "video"),
     ("baijiahao", "video"),
 })
+
+#: 需浏览器子进程的内置上传器（异步浏览器实现：经 browser_thread 的
+#: Proactor 工作循环执行；bilibili 为同步 subprocess + to_thread，不在此列）
+_BROWSER_BUILTIN_KEYS = _BUILTIN_KEYS - {("bilibili", "video")}
 
 
 def _builtin_uploader(platform_key: str, content_type: str):

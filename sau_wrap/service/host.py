@@ -97,13 +97,44 @@ def _run_agent_blocking(logger, request_async_stop) -> None:
             if api is not None:
                 api.attach_orchestrator(orch)
             orch.startup_selfcheck()
+            # 任务 #4 残留收敛 + 浏览器工作线程预热（评审修复 #6/#8）：
+            # 均经 asyncio.create_task 并发执行，不阻塞 WS/5409 启动关键路径。
+            # - cleanup_stale：同步 subprocess 调用经 to_thread 下沉，异常兜底保留；
+            #   移出关键路径，避免异常环境延迟 WS 启动。
+            # - warmup：首次 _ensure_started 的同步 Event.wait(10s) 移到此处经 to_thread
+            #   预热，避免首个浏览器请求在主循环协程内同步等待卡住 5409/WS。
+            async def _startup_housekeeping() -> None:
+                try:
+                    from sau_wrap.service import headed_launcher
+
+                    await asyncio.to_thread(headed_launcher.cleanup_stale)
+                except Exception:  # noqa: BLE001 - 残留清理失败不影响主流程
+                    logger.warning("有头登录残留清理失败（不阻塞启动）", exc_info=True)
+                try:
+                    from sau_wrap.service.browser_thread import get_browser_thread
+
+                    await asyncio.to_thread(get_browser_thread().warmup)
+                except Exception:  # noqa: BLE001 - 预热失败仅告警，首次使用时重建
+                    logger.warning("浏览器工作线程预热失败（首次使用时将重建）",
+                                   exc_info=True)
+
+            # 持引用防任务被 GC（事件循环仅持弱引用；启动序列内全程存活）
+            housekeeping_task = asyncio.create_task(_startup_housekeeping())  # noqa: F841
             try:
                 # 重启恢复延迟到首次 registered 后触发（ws_client 内调
                 # dispatcher.recover_pending_once）：保证 403 重签时 file_renew 可发。
                 await client.run()
             finally:
                 if api is not None:
-                    await api.stop()
+                    await api.stop()  # 内部先 close_all 取消活跃登录会话（链式取消
+                    # 浏览器工作循环上的登录协程）
+                # 浏览器工作线程 drain 停机（登录/发布浏览器协程均在其 Proactor
+                # 工作循环上；先取消残余在途任务再关循环，带超时防停机悬挂，幂等）
+                from sau_wrap.service.browser_thread import get_browser_thread
+                try:
+                    await asyncio.to_thread(get_browser_thread().stop, 10.0)
+                except Exception:  # noqa: BLE001 - 停机收尾失败不阻断退出流程
+                    logger.warning("浏览器工作线程停机异常", exc_info=True)
 
         loop.run_until_complete(_main())
     finally:

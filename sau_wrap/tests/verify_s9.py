@@ -14,7 +14,7 @@
    DELETE 取消 / Cookie 会话 Nonce 防护 / 成功后 account_sync 触发；
 3. 账号族：``GET /accounts/status``（主目录扫描 + 基础判定）/
    ``DELETE /accounts``（删除 + 审计；缺参 400；不存在 404）/
-   ``/accounts/recheck`` 仍 501 占位。
+   ``POST /accounts/recheck`` 一期落地文件级重扫（200 + mode=file_scan）。
 
 运行：``.venv\\Scripts\\python.exe sau_wrap\\tests\\verify_s9.py``
 数据隔离：``SAU_DATA_ROOT`` → 本目录 ``_tmpdata9``。退出码 0=全部通过。
@@ -478,7 +478,8 @@ async def scenario_accounts() -> None:
                   r1.status == 200
                   and accs.get(("douyin", "httpacc"), {}).get("is_valid") is True
                   and accs.get(("kuaishou", "broken"), {}).get("is_valid") is False
-                  and "recheck" in b1.get("note", ""),
+                  and "基础判定" in b1.get("note", "")
+                  and "真实浏览器复核" in b1.get("note", ""),
                   f"status={r1.status} accounts={b1['accounts']}")
 
             # —— DELETE /accounts：删除主目录文件 + 审计
@@ -517,10 +518,17 @@ async def scenario_accounts() -> None:
                   and (await rt3.json())["error"] == "invalid_account_name",
                   f"status={rt3.status} body={await rt3.json()}")
 
-            # —— /accounts/recheck 仍占位 501
+            # —— /accounts/recheck 一期落地：文件级重扫（mode="file_scan"）
             r5 = await sess.post(f"{base}/accounts/recheck", headers=headers)
-            check("/accounts/recheck 保持 501 占位（真实浏览器复核后续）",
-                  r5.status == 501, f"status={r5.status} body={await r5.json()}")
+            b5 = await r5.json()
+            accs5 = b5.get("accounts")
+            check("/accounts/recheck 文件级重扫落地（200 + file_scan + 契约字段）",
+                  r5.status == 200 and b5.get("mode") == "file_scan"
+                  and isinstance(b5.get("checked_at"), int)
+                  and isinstance(accs5, list)
+                  and all(set(a) >= {"platform_key", "account_name",
+                                     "is_valid", "source"} for a in accs5),
+                  f"status={r5.status} body={b5}")
     finally:
         for f in (good, bad):
             with contextlib.suppress(OSError):

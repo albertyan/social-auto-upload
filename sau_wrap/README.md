@@ -23,7 +23,7 @@
 | Web 控制台（S6） | ✅ 静态托管 `/ui/*` + 票据换 Cookie 鉴权 + Nonce 写防护 + 四页面（状态/绑定/账号/升级） |
 | 升级编排（S7） | ✅ `upgrade_notice` 校验（防投毒）+ 后台下载（边下边算 SHA-256/重试/单飞）+ 八态状态机持久化 + `/upgrade` 快照 + `/upgrade/apply`（可注入执行器编排 + 自动回滚）+ `/upgrade/snooze` + 启动自检三分支（§15.2）；真实停服/安装真机验证留待 S8 打包后 |
 | 登录会话族（S9） | ✅ `POST /login/{platform}` 创建（二维码回调/单会话/5 分钟超时）+ 二维码/状态轮询 + 验证码注入 + 取消；抖音短信二验运行时桥接；成功后落盘→account_sync |
-| 账号端点族（S9） | ✅ `GET /accounts/status`（主目录扫描+基础判定）、`DELETE /accounts`（删除+审计）；`/accounts/recheck` 保留 501 占位（真实浏览器复核后续） |
+| 账号端点族（S9） | ✅ `GET /accounts/status`（主目录扫描+基础判定）、`DELETE /accounts`（删除+审计）、`POST /accounts/recheck`（一期文件级重扫，mode=file_scan；真实浏览器复核后续） |
 | 瘦托盘（S5） | ✅ `sau tray`：三菜单（打开控制台/打开日志目录/退出，无启停）+ `/status` 轮询（5s）+ 图标状态/气泡提示 + Mutex 单实例；「打开控制台」已接票据链路（S6） |
 | `machine-code` | ✅ 真实机器码（SHA-256(MachineGuid+卷序列号+CPU ID) 前 32 位，§5.7） |
 | `bind` | ✅ 写 `config.json` + `credential.bin`（DPAPI LOCAL_MACHINE） |
@@ -53,12 +53,12 @@
 - **鉴权**：`X-SAU-Local-Token` 头；令牌**每次服务启动重新生成**写 `%ProgramData%\SAU\local_token.bin`（users 可读）；无/错令牌一律 401（`secrets.compare_digest` 防时序攻击）；
 - **端点**：
   - `GET /status`：ws_connected / suspended / agent_id / version / active_tasks / accounts（骨架）/ clock_offset_seconds / scheduling_paused / token_expire_at / token_status（expired|suspended|unbound|ok）/ last_close_reason（字段结构按 §3.7 契约固定，托盘轮询项）；
-  - `GET /config` / `POST /config`：读/写 server_url（可选 heartbeat_interval、local_api_port，端口变更重启生效）；未绑定时写入返回 409 引导先 bind；写入后触发热重载；
+  - `GET /config` / `POST /config`：读/写 server_url（可选 heartbeat_interval、local_api_port，端口变更重启生效）；未绑定时写入返回 409 引导先 bind；写入后触发热重载；GET 已绑定时追加凭证回显：`token_present` 布尔，为 true 时附 `token` 明文（仅监听 127.0.0.1 + 令牌/会话鉴权前提下的回显设计）；
   - `POST /reload`：热重载——唤醒挂起态 / 断开当前连接以新配置重连（凭证类挂起后的人工恢复入口）；
   - `POST /bind`：复用 `sau bind` 同一逻辑（config.json + DPAPI 凭证）后热重载；
   - S6 起新增：`GET /ui/*`（静态托管）、`POST /ui-ticket`、`GET /ui/t/<ticket>`、`GET /nonce`、`GET /machine-code`（见下节）；
   - S7 起新增：`GET /upgrade`（只读快照）、`POST /upgrade/apply`（确认编排，写操作走 Nonce 链路）、`POST /upgrade/snooze`（见 S7 节）；
-  - S9 起新增：`/login/*` 登录会话族与 `/accounts/*` 账号族（见 S9 节；`/accounts/recheck` 仍 501 占位）；
+  - S9 起新增：`/login/*` 登录会话族与 `/accounts/*` 账号族（见 S9 节；`/accounts/recheck` 一期落地文件级重扫，mode=file_scan）；
 - **审计**：绑定/配置写入/热重载在 service.log 记一行 `[AUDIT] op=… source=127.0.0.1 result=… detail=… via=token|cookie`（S6 起附鉴权方式）。
 
 ## S4（任务执行核心）范围与语义（§5.3 流水线 / §4.5 素材重签）
@@ -184,7 +184,7 @@
   - `POST /login/{session_id}/cancel` 与 `DELETE /login/{session_id}`：取消会话；
   - `GET /accounts/status`：主目录扫描 + 基础判定（JSON 可解析）+ 复核说明；
   - `DELETE /accounts`：删主目录 cookie（仅存兼容目录 → 409 `fallback_readonly`；不存在 404）+ 审计 `op=account_delete`；
-  - `POST /accounts/recheck`：仍 501 占位（真实浏览器复核留后续）；
+  - `POST /accounts/recheck`：一期落地文件级重扫（200 + `mode="file_scan"` + `checked_at` + accounts 列表，与 /accounts/status 同源扫描；真实浏览器复核留后续）；
 - **成功后链路**：登录成功 → cookie 落盘 → `on_success` 回调 → `send_account_sync` 上行（`LocalApiServer` 无条件接线，含测试注入的管理器）；
 - **控制台**：账号页（`AccountsView.vue`）实现登录表单（4 支持平台下拉 + 不支持平台置说明）/活跃会话面板（2s 轮询状态+二维码 blob 图/状态徽章/验证码输入/取消）/账号表格（主目录可删/兼容目录只读）；409 冲突自动复用既有 session_id 续轮询；
 - **验证边界**：verify_s9 全假执行器覆盖管理器单元/HTTP 链路/账号族 27 项（含停机路径：`LocalApiServer.stop()` 先 `close_all` 取消活跃会话，消除孤儿浏览器窗口）；`default_real_executor` 的平台分发与抖音短信桥接的真实页面注入留待真机回归（需浏览器内核 + 平台网络）。

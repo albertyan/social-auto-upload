@@ -9,6 +9,7 @@ CLI 框架选型：文档 §2.4.1 建议「Typer 或 Click」，本实现采用 
     sau agent                服务进程本体（SCM ImagePath 指向本命令）
     sau service <verb>       install|remove|start|stop|status|upgrade
     sau tray                 瘦托盘（S5：三菜单 + Mutex + /status 轮询）
+    sau tray-exit            【隐藏】请求托盘优雅退出（安装器/升级器专用）
     sau browser install      浏览器内核安装（本步占位）
     sau doctor               诊断（本步占位）
     sau machine-code|bind    机器码 / 绑定（S2 已实现）
@@ -152,6 +153,48 @@ def tray() -> None:
     sys.exit(run())
 
 
+@cli.command("tray-exit", hidden=True)
+@click.option("--timeout", type=float, default=8.0, help="等待托盘退出的上限秒数")
+def tray_exit(timeout: float) -> None:
+    """【隐藏】请求托盘优雅退出（仅供安装器/升级器调用）。
+
+    走命名事件（SAUTrayExitEvent）通知托盘走 ``icon.stop()``——即发
+    NIM_DELETE 移除通知区图标，防 taskkill 强杀导致的幽灵图标残留；
+    事件不存在（托盘未运行或旧版托盘）视为无实例，返回 0；
+    超时托盘仍存在则返回非 0，供调用方 taskkill 兜底。
+    """
+    from sau_wrap.tray.app import signal_tray_exit
+
+    sys.exit(signal_tray_exit(timeout=timeout))
+
+
+# ---------------------------------------------------------------- login-headed
+
+
+@cli.command("login-headed", hidden=True)
+@click.option("--platform", required=True,
+              help="平台（douyin/kuaishou/xiaohongshu/tencent）")
+@click.option("--account", default="default", help="账号名（缺省 default）")
+@click.option("--session-id", "session_id", default=None,
+              help="服务端登录会话 id（回报终态用；手动降级执行可省）")
+@click.option("--channel", default=None, help="【占位】渠道（本期不透传上游）")
+@click.option("--user-data-dir", "user_data_dir", default=None,
+              help="【占位】浏览器用户数据目录（本期不透传上游）")
+def login_headed(platform: str, account: str, session_id: str | None,
+                 channel: str | None, user_data_dir: str | None) -> None:
+    """【隐藏】有头登录子进程本体（任务 #4，仅供计划任务投放/手动降级调用）。
+
+    服务（Session 0 无桌面）经计划任务（InteractiveToken）把本命令投放到用户
+    桌面会话执行：``headless=False`` 真实窗口扫码；结束（成败均）现读令牌经
+    ``POST /login/headed/result`` 回报终态（3 次重试后仅记日志）。
+    退出码：0=登录成功；1=失败/异常。
+    """
+    from sau_wrap.service.headed_login import run_headed_login
+
+    sys.exit(run_headed_login(platform, account, session_id,
+                              channel=channel, user_data_dir=user_data_dir))
+
+
 # ---------------------------------------------------------------- browser
 
 
@@ -163,17 +206,24 @@ def browser() -> None:
 @browser.command("install")
 @click.option("--from-file", "from_file", type=str, default=None,
               help="离线安装：本地内核 zip 路径（§8.7 第三层兜底）")
-def browser_install(from_file: str | None) -> None:
+@click.option("--progress-file", "progress_file", type=str, default=None,
+              help="进度文件路径（安装器传入，任务 #10；未传时手动终端零变化）")
+def browser_install(from_file: str | None, progress_file: str | None) -> None:
     """下载 / 安装浏览器内核（§8.7：镜像源 + 60s 卡死换源 + 离线兜底）。
 
     任务 #26（真机「无任何反应」修复）：进度日志双通道——交互终端可见 +
     同步落盘 ``%ProgramData%\\SAU\\logs\\browser_install.log``（无输出时
     可查）；启动即打印目标目录/已装判定，结束时明确成败与后续指引。
+
+    任务 #10（安装页进度条）：``--progress-file`` 传入时以 ProgressReporter
+    向安装器上报进度——开头写 ``stage=starting``，finally 写 ``done=1`` +
+    ``exit_code``（正常/失败/异常路径都要写）。
     """
     import logging
 
     from sau_wrap import browser
 
+    reporter = browser.ProgressReporter(progress_file) if progress_file else None
     logger = logging.getLogger("sau.browser")
     logger.setLevel(logging.INFO)
     fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
@@ -191,6 +241,10 @@ def browser_install(from_file: str | None) -> None:
         logger.addHandler(h_file)
     except OSError:
         log_file = None
+    # 任务 #10：安装器进度条初始态（未传 --progress-file 时 reporter 为 None，零变化）
+    if reporter is not None:
+        reporter.update(stage="starting", percent=0)
+    ok = False
     try:
         click.echo(f"浏览器内核安装开始：目标目录 {browser.chromium_dir()}")
         if log_file is not None:
@@ -198,10 +252,15 @@ def browser_install(from_file: str | None) -> None:
         if from_file:
             ok = browser.install_from_file(from_file, logger)
         else:
-            ok = browser.install_online(logger)
+            ok = browser.install_online(logger, reporter)
         click.echo("浏览器内核安装成功" if ok
                    else "浏览器内核安装失败（不阻断其它功能；弱网可稍后重试，"
                         "或用离线包：sau.exe browser install --from-file <zip>）")
+    except BaseException:
+        # 异常路径也要写 done（安装器以 done 判定收尾，不得无限等心跳停滞）
+        if reporter is not None:
+            reporter.finish(1)
+        raise
     finally:
         for h in (h_out,) + ((h_file,) if log_file is not None else ()):
             try:
@@ -209,6 +268,9 @@ def browser_install(from_file: str | None) -> None:
                 logger.removeHandler(h)
             except Exception:  # noqa: BLE001
                 pass
+    # 任务 #10：正常/失败路径均在 sys.exit(1) 前写 done=1 + exit_code
+    if reporter is not None:
+        reporter.finish(0 if ok else 1)
     if not ok:
         sys.exit(1)
     click.echo(f"浏览器内核就绪：{browser.chromium_executable()}")
