@@ -1,4 +1,10 @@
-# 测试产物（临时数据目录与验证报告），不入库
+# 测试产物（临时数据目录与验证报告），不入库（任务 #26：原根 .gitignore
+# 的 */tests/** 误伤了源码文件，已撤销，改由本文件定向忽略）
 _tmpdata*/
+_tmpdbg/
+_tmps8/
 _verify_report*.txt
+_regress_*.out
+_doc_*.txt
 _smoke.txt
+__pycache__/

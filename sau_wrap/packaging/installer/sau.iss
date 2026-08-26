@@ -49,6 +49,15 @@ Source: "{#BuildDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs c
 ; post-install 编排脚本（§17 失败不静默）
 Source: "..\post_install.bat"; DestDir: "{app}"; Flags: ignoreversion
 
+[Run]
+; 任务 #26（托盘缺失修复）：sau.iss 原本无 [Run] 段，装完从不拉起托盘；
+; post-install 异常中断时 HKCU 自启项也未写入 → 重启后托盘同样缺席。
+; postinstall = 完成页勾选项（默认勾选）；nowait 不阻塞向导收尾；
+; 静默安装跳过（托盘依赖交互会话）；托盘自身单实例 Mutex 兜底重复启动。
+Filename: "{app}\sau.exe"; Parameters: "tray"; \
+  Description: "启动 SAU 托盘（后台常驻，任务 #26）"; \
+  Flags: postinstall nowait skipifsilent skipifdoesntexist
+
 [Code]
 var
   DeleteDataCheck: TNewCheckBox;
@@ -151,10 +160,17 @@ begin
 end;
 
 // ---------------- 首装步骤 2~5：数据目录/权限/服务/自启（post_install.bat）---
+//
+// 任务 #26（结果码处理重构）：
+// - bat 退出码矩阵闭环：0 成功 / 11 注册失败（阶段 3）/ 12 启动失败（阶段 4）/
+//   其余一律「未知」并显示十进制原始码（旧版 13~20 区间连弹窗都不触发，
+//   且 IntToStr 已是十进制——用户侧 "$17" 十六进制误导口径彻底消除）；
+// - Exec 失败（cmd 未能启动）映射为 99 报未知，不再伪装 -1；
+// - 任何非 0 都弹窗（旧条件漏掉 13~20，未知码静默放行）。
 
 procedure CurStepChanged(CurStep: TSetupStep);
 var
-  ResultCode, ExitCode: Integer;
+  ExitCode: Integer;
   Msg: String;
 begin
   if CurStep <> ssPostInstall then
@@ -163,21 +179,21 @@ begin
   if not Exec('cmd.exe', '/c ""' + ExpandConstant('{app}\post_install.bat')
               + '" > "' + ExpandConstant('{app}\post_install.log') + '" 2>&1"',
               '', SW_HIDE, ewWaitUntilTerminated, ExitCode) then
-    ExitCode := -1;
-  ResultCode := 0;
+    ExitCode := 99;  // cmd.exe 未能启动：报未知码，不得静默放行（任务 #26）
   case ExitCode of
-    0:  ;  // 成功（自启失败按 §17 阶段 6 记日志不阻断，bat 已内化处理）
-    11: Msg := '服务注册失败（§17 阶段 3）：请查看 ' + ExpandConstant('{app}\post_install.log') + '，' + #13#10
+    0:  Exit;  // 成功（自启/状态佐证失败按 §17 阶段 6 记日志不阻断，bat 已内化）
+    11: Msg := '服务注册失败（阶段 3，退出码 11）：请查看 ' + ExpandConstant('{app}\post_install.log') + '，' + #13#10
                + '或手动执行 "sau.exe service install"，再运行 "sau.exe doctor" 排障。';
-    12: Msg := '服务启动失败（§17 阶段 4，已重试 2 次）：请运行 "sau.exe doctor" 排障，' + #13#10
+    12: Msg := '服务启动失败（阶段 4，退出码 12，已重试 2 次）：请运行 "sau.exe doctor" 排障，' + #13#10
                + '详情见 ' + ExpandConstant('{app}\post_install.log') + ' 与 '
                + ExpandConstant('{commonappdata}\SAU\logs\service.log') + '。';
-    else Msg := 'post-install 异常（exit=' + IntToStr(ExitCode)
-               + '）：详见 ' + ExpandConstant('{app}\post_install.log') + '。';
-    // 注：不用多行 Format([...])——数组常量 '[' 位于行首会被 ISPP 误判为段标签
+    else Msg := 'post-install 异常（未知退出码 ' + IntToStr(ExitCode) + '，十进制）：' + #13#10
+               + '详见 ' + ExpandConstant('{app}\post_install.log') + '；' + #13#10
+               + '可手动执行 "sau.exe service install" 与 "sau.exe doctor" 排障。';
+    // 注：不用多行 Format([...])——数组常量 '[' 位于行首会被 ISPP 误判为段标签；
+    // IntToStr 输出十进制，阶段归属与退出码矩阵严格一一对应（任务 #26）
   end;
-  if (ExitCode = 11) or (ExitCode = 12) or (ExitCode < 0) or (ExitCode > 20) then
-    SuppressibleMsgBox(Msg, mbError, MB_OK, IDOK);
+  SuppressibleMsgBox(Msg, mbError, MB_OK, IDOK);
 end;
 
 // ---------------- 卸载（§13 六步 + §13.2 数据保留勾选）----------------

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 import click
 
@@ -163,18 +164,51 @@ def browser() -> None:
 @click.option("--from-file", "from_file", type=str, default=None,
               help="离线安装：本地内核 zip 路径（§8.7 第三层兜底）")
 def browser_install(from_file: str | None) -> None:
-    """下载 / 安装浏览器内核（§8.7：镜像源 + 60s 卡死换源 + 离线兜底）。"""
+    """下载 / 安装浏览器内核（§8.7：镜像源 + 60s 卡死换源 + 离线兜底）。
+
+    任务 #26（真机「无任何反应」修复）：进度日志双通道——交互终端可见 +
+    同步落盘 ``%ProgramData%\\SAU\\logs\\browser_install.log``（无输出时
+    可查）；启动即打印目标目录/已装判定，结束时明确成败与后续指引。
+    """
     import logging
 
     from sau_wrap import browser
 
     logger = logging.getLogger("sau.browser")
-    logging.basicConfig(level=logging.INFO,
-                        format="%(asctime)s [%(levelname)s] %(message)s")
-    if from_file:
-        ok = browser.install_from_file(from_file, logger)
-    else:
-        ok = browser.install_online(logger)
+    logger.setLevel(logging.INFO)
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    # 通道 1：交互终端（stdout；非控制台重定向场景同样被捕获）
+    h_out = logging.StreamHandler(sys.stdout)
+    h_out.setFormatter(fmt)
+    logger.addHandler(h_out)
+    # 通道 2：日志文件（无可见输出时的排障依据；失败不阻断命令本身）
+    log_file = None
+    try:
+        log_file = paths.LOGS_DIR / "browser_install.log"
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        h_file = logging.FileHandler(log_file, encoding="utf-8")
+        h_file.setFormatter(fmt)
+        logger.addHandler(h_file)
+    except OSError:
+        log_file = None
+    try:
+        click.echo(f"浏览器内核安装开始：目标目录 {browser.chromium_dir()}")
+        if log_file is not None:
+            click.echo(f"进度日志同步写入：{log_file}")
+        if from_file:
+            ok = browser.install_from_file(from_file, logger)
+        else:
+            ok = browser.install_online(logger)
+        click.echo("浏览器内核安装成功" if ok
+                   else "浏览器内核安装失败（不阻断其它功能；弱网可稍后重试，"
+                        "或用离线包：sau.exe browser install --from-file <zip>）")
+    finally:
+        for h in (h_out,) + ((h_file,) if log_file is not None else ()):
+            try:
+                h.flush()
+                logger.removeHandler(h)
+            except Exception:  # noqa: BLE001
+                pass
     if not ok:
         sys.exit(1)
     click.echo(f"浏览器内核就绪：{browser.chromium_executable()}")
@@ -257,24 +291,103 @@ _register_platform_commands()
 # ---------------------------------------------------------------- main
 
 
-def harden_stdio_encoding() -> None:
-    """入口级编码加固（终审追加：真机 ``UnicodeEncodeError: 'gbk' codec`` 根治）。
+def _stream_is_console(stream) -> bool:
+    """True = 流直连真实控制台/ConPTY（WriteConsoleW 语义）。
 
-    GBK（CP936）终端下输出**任何**非 CP936 字符（``²`` ``✓`` ``°`` emoji，
-    及上游透传的不可控输出）都会抛 ``UnicodeEncodeError`` 致整条命令崩溃；
-    入口统一把 stdout/stderr 强制 ``utf-8 + errors='replace'``（终端按自身解码
-    呈现，最差乱码但不崩溃）。服务进程（Session 0 无控制台）与托盘哑流场景：
-    逐流 try/except 兜底，无 reconfigure / 流不可写等情形绝不引发新崩溃。
+    判定用 ``isatty()``（GetConsoleMode 成功与否）而非 GetConsoleWindow：
+    ConPTY 终端（Windows Terminal / PS 7）无窗口句柄但仍是控制台语义。
+    """
+    try:
+        isatty = getattr(stream, "isatty", None)
+        if isatty is None:
+            return False
+        return bool(isatty())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+class _ResilientTextWriter:
+    """写入失败降级丢弃的输出包装（任务 #26：任何终端环境绝不因输出崩溃）。
+
+    仅包非控制台流（重定向/管道/哑流）。write/flush 吞掉一切异常按成功计，
+    其余属性（encoding/isatty/fileno/errors/reconfigure…）透传内层流。
+
+    bytes 写入纪律（任务 #26 真机零输出根因修复）：click 的
+    ``_is_binary_writer`` 用 ``write(b"")`` 探测流类型；若对 bytes 写入吞掉
+    TypeError，本类会被误判为二进制流，click 再在其上包文本编码层、
+    把消息编码为 bytes 写回，底层 TextIOWrapper 报 TypeError 又被吞，
+    输出静默全丢（--version/--help/doctor 零输出）。故 bytes 必须真实写入：
+    优先底层 ``buffer``（二进制通道），否则按内层编码解码后写入。
+    """
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def write(self, s):
+        try:
+            if isinstance(s, (bytes, bytearray)):
+                buf = getattr(self._inner, "buffer", None)
+                if buf is not None:
+                    n = buf.write(s)
+                    buf.flush()
+                    return n
+                enc = getattr(self._inner, "encoding", None) or "utf-8"
+                err = getattr(self._inner, "errors", None) or "replace"
+                return self._inner.write(bytes(s).decode(enc, errors=err))
+            return self._inner.write(s)
+        except Exception:  # noqa: BLE001 句柄失效/编码异常：降级丢弃不崩溃
+            try:
+                return len(s)
+            except Exception:  # noqa: BLE001
+                return 0
+
+    def flush(self):
+        try:
+            self._inner.flush()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def writable(self):
+        return True
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def harden_stdio_encoding() -> None:
+    """入口级编码加固（终审追加重构，任务 #26 真机崩溃根治）。
+
+    按流类型分路，两条历史崩溃链均被切断：
+    1. GBK（CP936）管道终端输出非 CP936 字符（``²`` ``✓`` ``°`` emoji 及上游
+       透传不可控输出）抛 ``UnicodeEncodeError`` → 非控制台流统一
+       ``reconfigure(encoding="utf-8", errors="replace")``；
+    2. **对控制台流做 reconfigure 会把 WriteConsoleW 路径降级为 WriteFile，
+       控制台句柄拒绝并报 ``OSError: [Errno 22] Invalid argument``**
+       （2026-08-26 真机：doctor/--version 交互零输出）→ 控制台/ConPTY 流
+       （isatty() True）**一律跳过**：WriteConsoleW 原生支持全部 Unicode；
+    3. 非控制台流再包 :class:`_ResilientTextWriter`：句柄失效等写入异常
+       降级丢弃，命令逻辑不因输出通道崩溃。
+
+    逐流 try/except：无控制台（Session 0）/哑流/不支持场景绝不引发新崩溃。
     """
     for stream in (sys.stdout, sys.stderr):
         try:
             if stream is None:
                 continue
+            if _stream_is_console(stream):
+                continue  # WriteConsoleW 语义，禁 reconfigure（EINVAL 崩溃源）
             reconfigure = getattr(stream, "reconfigure", None)
             if reconfigure is not None:
                 reconfigure(encoding="utf-8", errors="replace")
         except Exception:  # noqa: BLE001（无控制台/重定向/不支持：不得新崩）
             continue
+    try:
+        if sys.stdout is not None and not _stream_is_console(sys.stdout):
+            sys.stdout = _ResilientTextWriter(sys.stdout)
+        if sys.stderr is not None and not _stream_is_console(sys.stderr):
+            sys.stderr = _ResilientTextWriter(sys.stderr)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -302,30 +415,91 @@ def main(argv: list[str] | None = None) -> None:
         raise
 
 
+def _crash_log_path():
+    """崩溃报告落盘路径（%ProgramData%\\SAU\\logs\\last_crash.txt）。
+
+    语义（任务 #26 复查定案）：每次崩溃**覆盖写、恒保留最近一份**——
+    不会无限残留旧崩溃；历史详情以 service.log 为准。
+    """
+    try:
+        from sau_wrap import paths  # noqa: PLC041
+
+        p = paths.LOGS_DIR / "last_crash.txt"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        return p
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _wait_enter_bounded(seconds: int = 60) -> None:
+    """限秒等待回车（任务 #26：替代 input() 无限阻塞——控制台不可见时
+    input() 会让进程永久挂起，真机 HasExited=False 的直接根因）。"""
+    try:
+        import msvcrt
+
+        deadline = time.time() + seconds
+        while time.time() < deadline:
+            if msvcrt.kbhit() and msvcrt.getwch() == "\r":
+                return
+            time.sleep(0.2)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _fatal_with_console_fallback() -> None:
-    """无控制台时（disable 模式）AllocConsole 兜底，把异常打到新控制台。
+    """无可见控制台时的致命异常兜底（任务 #26 重写：可见+留痕+绝不阻塞）。
 
     判定注意：GUI 子系统下 Python 3.6+ 的 stdout/stderr 是非 None 哑流，
-    不能以 ``is None`` 判断；改用 ``GetConsoleWindow()`` 判是否已附控制台。
+    不能以 ``is None`` 判断；用 ``GetConsoleWindow()`` 判是否已附**窗口**控制台。
+    处置（旧版 ``input()`` 无限阻塞是进程挂起根因，已移除）：
+    1. 崩溃全文覆盖写 ``%ProgramData%\\SAU\\logs\\last_crash.txt``（恒 1 份）；
+    2. **MessageBoxTimeoutW 15 秒自动关闭**弹窗显示摘要与日志路径（任务 #26：
+       旧版 MessageBoxW 无超时，管道/隐藏窗口等无人值守环境会无限阻塞——
+       冻结产物 doctor 管道环境 120s 超时实测锤实）；
+    3. 仅当 MessageBoxTimeoutW 不可用（极旧系统）才回退 AllocConsole +
+       限秒等待回车（:func:`_wait_enter_bounded`，60s 上限）。
     """
+    import traceback
+
+    tb_text = traceback.format_exc()
+    try:
+        p = _crash_log_path()
+        if p is not None:
+            p.write_text(f"{time.strftime('%Y-%m-%d %H:%M:%S')} argv={sys.argv}\n{tb_text}",
+                         encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
     try:
         import ctypes
         if ctypes.windll.kernel32.GetConsoleWindow():
-            return  # 终端调用：输出已在调用方终端可见，无需兜底；
+            return  # 窗口控制台：traceback 已随异常写到调用方终端；
             # 编码已由 main() 的 harden_stdio_encoding() 加固，非 CP936 字符不崩
     except Exception:
         pass  # 判定失败则保守走兜底分支（AllocConsole 重复调用无副作用）
+    brief = tb_text.strip().splitlines()
+    brief = brief[-1] if brief else "未知异常"
+    msg = (f"sau.exe 发生致命异常：\n{brief}\n\n"
+           f"完整堆栈：%ProgramData%\\SAU\\logs\\last_crash.txt")
+    try:
+        import ctypes
+        # MessageBoxTimeoutW：15 秒无人响应自动关闭（绝不无限阻塞，任务 #26）
+        ctypes.windll.user32.MessageBoxTimeoutW(
+            0, msg, "SAU 致命异常", 0x10 | 0x00010000, 0, 15000)
+        return
+    except Exception:  # noqa: BLE001 极旧系统无此 API：回退限秒分支
+        pass
     try:
         import ctypes
         if ctypes.windll.kernel32.AllocConsole():
             sys.stdout = open("CONOUT$", "w", encoding="utf-8", errors="replace")
             sys.stderr = open("CONOUT$", "w", encoding="utf-8", errors="replace")
             sys.stdin = open("CONIN$", "r", encoding="utf-8", errors="replace")
-            import traceback
             print("sau.exe 发生致命异常：", file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
-            input("按回车键退出...")
-    except Exception:
+            print("（60 秒内按回车退出，或等待自动退出；详情见 last_crash.txt）",
+                  file=sys.stderr)
+            _wait_enter_bounded(60)
+    except Exception:  # noqa: BLE001
         pass
 
 

@@ -9,7 +9,7 @@ import vue from '@vitejs/plugin-vue'
 
 const API_PREFIXES = [
   '/status', '/config', '/bind', '/reload', '/nonce',
-  '/machine-code', '/ui-ticket',
+  '/machine-code', '/ui-ticket', '/browser',
   '/accounts', '/login', '/upgrade',
 ]
 

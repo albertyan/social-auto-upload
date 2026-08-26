@@ -28,8 +28,8 @@
 | `machine-code` | ✅ 真实机器码（SHA-256(MachineGuid+卷序列号+CPU ID) 前 32 位，§5.7） |
 | `bind` | ✅ 写 `config.json` + `credential.bin`（DPAPI LOCAL_MACHINE） |
 | `tray` | ✅ 瘦托盘（S5，见上） |
-| `browser install` | ✅ 内核安装（S8：npmmirror 镜像 + 官方源轮换 3 轮/60s 卡死检测 + `--from-file` 离线；落 `%ProgramData%\SAU\browsers\`） |
-| `doctor` | ✅ 八项体检（S8：服务/端口/配置凭证/WS/内核/数据目录可写/磁盘/日志末 20 行；有 FAIL 退出码 1） |
+| `browser install` | ✅ 内核安装（S8：npmmirror CFT 直链自管下载（完整内核+headless shell 两组件，zip 合计约 295MB：~173MB + ~114MB，任务 #26 实测镜像 ~8MB/s）+ 官方源 patchright 回退，共 3 轮/套接字 30s 卡死保护 + `--from-file` 离线；落 `%ProgramData%\SAU\browsers\`） |
+| `doctor` | ✅ 十一项体检（0 + ①~⑩：运行形态/服务/端口/WS/传输加密/配置凭证/机器码/内核/数据目录可写/磁盘/日志末 20 行；有 FAIL 退出码 1） |
 | 版本号 | ✅ `version.py` 的 `APP_VERSION`（可被环境变量 `SAU_VERSION` 覆盖），`--version` 显示 |
 | 日志 | ✅ `%ProgramData%\SAU\logs\service.log`（10MB × 5 轮转） |
 
@@ -162,11 +162,11 @@
 - **包含**：上游运行时 `uploader/utils/myUtils`（只读引用）+ `sau_wrap` 全量 + `patchright/playwright/aiohttp/websockets/pystray/PIL/win32` 等（biliup 不进包，见体积优化条）；`conf.example.py` + 控制台 `dist → ui/`（dist 缺失自动先构建）；patchright driver 经 `--include-package-data` 单份进产物；
 - **体积优化（§8.6）**：`--nofollow-import-to` 排除清单 25 项（测试框架/tkinter/flask 系/流媒体遗留/trio/xhs/旧前端旧托盘 + 首构建 400MB 实测后追加裁剪：stream_gears 随 biliup 32.5MB，逐条注释依据见 `nuitka_build.py`）；**cv2/numpy 禁排除**（终审修复②：上游四大平台上传器模块顶层 `import cv2`，属隐性依赖必须随包，纪律固化于 `packaging/BUILD_ENV.md`）；`--disable-plugin=playwright`（防浏览器二进制进产物 +100MB，内核走 `browser install`）；biliup 不进包（上游经 subprocess 调独立二进制，首次使用按需下载）；`--python-flag=no_asserts`；**不用 UPX**（杀软误报风险定案）；目标体积 ≤100MB（不含内核，口径为 Inno 安装包）；
 - **构建纪律（§7.5）**：`--jobs=4`、`CCACHE_DISABLE=1` + `--disable-cache=all`、`--remove-output` 清残留；编译器缺失由 Nuitka 自动下载（`--assume-yes-for-downloads`），版本落档 `packaging/BUILD_ENV.md`；
-- **browser install（§8.7 三层方案）**：默认 npmmirror 镜像（`PLAYWRIGHT_DOWNLOAD_HOST`）+ 官方源，60 秒无输出判卡死自动换源（最多 3 轮）；`--from-file <zip>` 离线安装（兼容两种 zip 布局）；内核统一落 `%ProgramData%\SAU\browsers\`（`entry.py` 顶部 `PLAYWRIGHT_BROWSERS_PATH` setdefault，SYSTEM 服务/托盘/CLI 全路径一致，避免默认 `%USERPROFILE%` 缓存跨会话不一致）；当前 chromium revision 1208；
-- **安装器（sau.iss）**：固定 AppId（新布局自身，支撑覆盖升级 §8.4）；`PrivilegesRequired=admin`；LZMA2 ultra + SolidCompression（§8.6 手段⑤）；首装六步（[Files] 整目录释放 → post_install.bat：数据目录+users-full ACL → VERSION → 服务注册（失败 exit 11 不静默）→ 启动重试 3 次（失败 exit 12）→ HKCU 自启（失败仅记日志，§17 阶段 6））；内核不在安装器内下载（首启按需 §7.3）；覆盖升级 `PrepareToInstall` 停服 + 句柄释放等待 30s；卸载六步（杀托盘/停服/remove+sc delete/删自启项/删程序文件/数据默认保留+勾选全删，§13）；产物命名 `sau-{version}.exe`（与升级链一致）；
+- **browser install（§8.7 三层方案）**：首选 npmmirror Chrome for Testing 直链自管下载（任务 #26 实测：`PLAYWRIGHT_DOWNLOAD_HOST` 的 playwright 镜像路径对新版内核 404，故改直链；两组件 = 完整内核 + headless shell，登录 headless 必需）；官方源经 patchright 驱动回退（`readline()` 无预读读行，防进度缓冲致误判卡死）；共 3 轮（直链→官方→直链），套接字读超时 30s 卡死保护；`--from-file <zip>` 离线安装（兼容两种 zip 布局）；内核统一落 `%ProgramData%\SAU\browsers\`（`entry.py` 顶部 `PLAYWRIGHT_BROWSERS_PATH` setdefault，SYSTEM 服务/托盘/CLI 全路径一致，避免默认 `%USERPROFILE%` 缓存跨会话不一致）；当前 chromium revision 1208（CFT 145.0.7632.6）；
+- **安装器（sau.iss）**：固定 AppId（新布局自身，支撑覆盖升级 §8.4）；`PrivilegesRequired=admin`；LZMA2 ultra + SolidCompression（§8.6 手段⑤）；首装六步（[Files] 整目录释放 → post_install.bat：数据目录+users-full ACL → VERSION → 服务注册（失败 exit 11 不静默）→ 启动重试 3 次（失败 exit 12）→ 浏览器内核自动下载（任务 #26 决策变更：已装跳过/弱网 20 分钟上限/失败仅记日志不阻断，§7.3/§17 阶段 5）→ HKCU 自启（失败仅记日志，§17 阶段 6））；覆盖升级 `PrepareToInstall` 停服 + 句柄释放等待 30s；卸载六步（杀托盘/停服/remove+sc delete/删自启项/删程序文件/数据默认保留+勾选全删，§13）；产物命名 `sau-{version}.exe`（与升级链一致）；
 - **哈希发布闭环（§8.5）**：`hash_release.py` 自动计算安装包 64 位小写 SHA-256，输出发布单 `release-manifest.json`（版本/文件名/哈希/下载地址占位）——运营只搬运不手填，管理端 `PUT /sau/upgrade-config` 按发布单填三字段即广播；
 - **冻结形态判定**：统一走 `sau_wrap.paths.is_frozen()`（`"__compiled__" in globals()`：Nuitka 把 `__compiled__` 伪模块注入每个编译模块的模块级全局名，**不进 `sys.modules`**；兼容 `sys.frozen` 兜底）。**不可直接用 `sys.frozen` 或 `"__compiled__" in sys.modules`**：Nuitka standalone 产物不设 `sys.frozen`、伪模块也不在 `sys.modules`（实测 Nuitka 4.1.3），真机缺陷（2026-08-26）即因误判走源码分支构造 `python.exe + __main__.py` 的 ImagePath 导致服务注册失败；另 Nuitka standalone 的 `sys.executable` 指向产物内随附 `python.exe`（非 sau.exe），故冻结形态 ImagePath 一律取 `sys.argv[0]`（即 sau.exe 自身）构造 `"<sau.exe>" agent --startup auto`（SCM 直接拉起自身，无需 pythonservice.exe 代理）；`pythonservice.exe` 仍以 `--include-data-files` 随包同级兜底（pywin32 回退查找路径）；`sau doctor` 首项输出运行形态/ImagePath 诊断；
-- **doctor 九项（§14）**：运行形态（冻结判定 + ImagePath）/服务状态/5409 端口/配置凭证/WS 连通/浏览器内核/数据目录可写/磁盘剩余（<2GB FAIL）/三日志末 20 行；有 FAIL 退出码 1。
+- **doctor 十一项（0 + ①~⑩，§14）**：运行形态（冻结判定 + ImagePath）/服务状态/5409 端口/WS 连通/WS 传输加密/配置凭证（越界时间戳安全降级）/机器码（诊断）/浏览器内核/数据目录可写/磁盘剩余（<2GB FAIL）/三日志末 20 行；单项外部调用 5s 守护；有 FAIL 退出码 1。
 - **验证边界**：本步完成 Nuitka 产物验证（--help/--version/doctor/ui/index.html）与安装包编译实测（ISCC 6.7.3，产物 51.4MB ≤ §8.6 目标 100MB）；2026-08-26 真机缺陷修复（冻结判定改 `__compiled__` + pythonservice.exe 随包）后已重建产物并烟测；真实服务注册/启停/卸载/覆盖升级在干净虚拟环境（或提权）的验证留待下一步。
 
 ## S9（登录扫码会话链路）范围与语义（重建方案 §6.5/§3.5）
@@ -282,7 +282,7 @@ sau_wrap/
 ├── tray/                      瘦托盘（S5：app.py 主体，pystray + Pillow 代码生成图标；S6：票据链路）
 ├── console/                   Web 控制台源码（S6：Vue3 + Vite；dist/node_modules 不入库，见 console/.gitignore）
 ├── upgrade/                   半自动升级编排（S7：updater.py 通知校验/下载/八态状态机；orchestrator.py 可注入执行器六步编排/回滚/启动自检）
-├── browser.py / doctor.py     浏览器内核安装（§8.7）与八项体检（§14）
+├── browser.py / doctor.py     浏览器内核安装（§8.7）与十一项体检（§14）
 ├── packaging/                 打包与分发（S8）：nuitka_build.py 构建脚本 / build_console.py 控制台构建 / installer/sau.iss Inno Setup 脚本 / post_install.bat 安装后编排 / hash_release.py 哈希发布闭环 / BUILD_ENV.md 版本矩阵
 └── requirements.txt           包装层独立依赖清单（§8.1）
 ```

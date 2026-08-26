@@ -123,7 +123,12 @@ def _sc(args: list[str]) -> bool:
     """调用 sc.exe 作为加固项的回退路径（§4.2 原文即 `sc config ...`）。"""
     import subprocess
 
-    result = subprocess.run(["sc.exe"] + args, capture_output=True, text=True)
+    try:
+        result = subprocess.run(["sc.exe"] + args, capture_output=True, text=True,
+                                timeout=10)  # 任务 #26：外部调用短超时，禁无限等待
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        click.echo(f"[警告] sc.exe {' '.join(args)} 执行异常/超时: {exc}", err=True)
+        return False
     if result.returncode != 0:
         click.echo(
             f"[警告] sc.exe {' '.join(args)} 失败: "
@@ -184,11 +189,17 @@ def _apply_reliability_policy() -> list[str]:
 
 
 def cmd_install() -> None:
-    """注册服务并立即应用延迟自启 + 失败重启策略（§4.2）。"""
+    """注册服务并立即应用延迟自启 + 失败重启策略（§4.2）。
+
+    幂等语义（任务 #26 根因修复）：服务已存在（ERROR_SERVICE_EXISTS 1073）
+    视为成功——覆盖重装场景（新安装包直接覆盖安装）不得因此报错，
+    继续刷新可靠性策略（延迟自启/失败重启）后正常返回。
+    """
     exe, args = service_image_parts()
     class_string = "sau_wrap.service.host.SAUAgentService"
     click.echo(f"注册服务 {SERVICE_NAME} ...")
     click.echo(f"ImagePath: \"{exe}\" {args}")
+    created = True
     try:
         win32serviceutil.InstallService(
             class_string,
@@ -207,15 +218,15 @@ def cmd_install() -> None:
                 err=True,
             )
             sys.exit(1)
-        if exc.winerror == 1073:  # ERROR_SERVICE_EXISTS：重复 install 给友好提示
+        if exc.winerror == 1073:  # ERROR_SERVICE_EXISTS：幂等视为成功（任务 #26）
+            created = False
             click.echo(
-                f"[提示] 服务 {SERVICE_NAME} 已存在，无需重复安装。"
-                "如需重装，请先执行: sau service remove",
-                err=True,
+                f"[提示] 服务 {SERVICE_NAME} 已存在（覆盖重装场景）："
+                "幂等视为成功，继续刷新可靠性策略。"
             )
-            sys.exit(1)
-        raise
-    click.echo("服务注册成功。")
+        else:
+            raise
+    click.echo("服务注册成功。" if created else "服务已存在，跳过重复注册。")
     problems = _apply_reliability_policy()
     if problems:
         click.echo(

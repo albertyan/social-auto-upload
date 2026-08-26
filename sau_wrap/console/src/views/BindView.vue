@@ -1,4 +1,6 @@
-<!-- 绑定页：机器码展示 + GET/POST /config + POST /bind + POST /reload（§6.2） -->
+<!-- 绑定页：机器码展示 + GET/POST /config + POST /bind + POST /reload（§6.2）
+     任务 #26：已绑定态仍可编辑 Server URL / Agent Token 并重新提交（重配
+     token 入口，走既有 POST /bind，Nonce+审计已具备） -->
 <script setup>
 import { ref, onMounted } from 'vue'
 import { apiGet, apiWrite, UnauthorizedError } from '../api.js'
@@ -38,7 +40,8 @@ async function doBind() {
       token: form.value.token,
       agent_id: form.value.agent_id || undefined,
     })
-    showMsg(`绑定成功：agent_id=${r.agent_id}；${r.reload || ''}`)
+    showMsg(`绑定成功：agent_id=${r.agent_id}；${r.reload || '热重载已触发'}`)
+    form.value.token = ''
     await loadAll()
   } catch (e) {
     if (!(e instanceof UnauthorizedError)) showErr(`绑定失败：${e.message}`)
@@ -107,17 +110,22 @@ onMounted(loadAll)
       <label>Server URL（ws:// 或 wss://）</label>
       <input v-model="form.server_url" placeholder="wss://example.com/ws" />
     </div>
-    <div v-if="config && !config.bound" class="field">
-      <label>Token（opcgeo 后台签发）</label>
+    <!-- 任务 #26：Token / Agent ID 在已绑定态同样可编辑（重置 token 后无需命令行兜底） -->
+    <div class="field">
+      <label>Token（opcgeo 后台签发；已绑定时可填新 token 重新提交）</label>
       <input v-model="form.token" type="password" placeholder="绑定令牌" />
     </div>
-    <div v-if="config && !config.bound" class="field">
+    <div class="field">
       <label>Agent ID（可选，后台已分配时填写）</label>
       <input v-model="form.agent_id" placeholder="可留空" />
     </div>
-    <button v-if="config && !config.bound" :disabled="busy" @click="doBind">绑定</button>
-    <template v-else>
-      <button :disabled="busy" @click="doSaveConfig">保存并热重载</button>
+    <button :disabled="busy || !form.token" @click="doBind">
+      {{ config && config.bound ? '重新配置并绑定' : '绑定' }}
+    </button>
+    <template v-if="config && config.bound">
+      <button class="secondary" style="margin-left:8px" :disabled="busy" @click="doSaveConfig">
+        仅改地址并热重载
+      </button>
       <button class="secondary" style="margin-left:8px" :disabled="busy" @click="doReload">
         手动热重载
       </button>

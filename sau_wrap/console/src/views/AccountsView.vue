@@ -19,6 +19,21 @@ const accounts = ref([])
 const accountsNote = ref('')
 const err = ref('')
 
+// ---- 任务 #26：浏览器内核安装态（缺失时展示指引卡）
+const browserStatus = ref(null)   // {installed, dir, log, guide, error?}
+const browserChecking = ref(false)
+
+async function refreshBrowserStatus() {
+  browserChecking.value = true
+  try {
+    browserStatus.value = await apiGet('/browser/status')
+  } catch (e) {
+    if (!(e instanceof UnauthorizedError)) browserStatus.value = { installed: false, error: e.message }
+  } finally {
+    browserChecking.value = false
+  }
+}
+
 // ---- 登录表单
 const platform = ref('douyin')
 const accountName = ref('default')
@@ -156,11 +171,28 @@ async function removeAccount(acc) {
   }
 }
 
-onMounted(refreshAccounts)
+onMounted(() => { refreshAccounts(); refreshBrowserStatus() })
 onUnmounted(() => { stopPolling(); releaseQrcode() })
 </script>
 
 <template>
+  <!-- 任务 #26：内核缺失指引卡（命令 + 日志位置 + 完成后刷新重试） -->
+  <div v-if="browserStatus && !browserStatus.installed" class="card" style="border-left:4px solid #e6a23c">
+    <h2>浏览器内核未安装（登录依赖）</h2>
+    <p>登录需要内置浏览器内核，当前未检测到。请在管理员命令行执行：</p>
+    <p><code>{{ browserStatus.guide || 'sau.exe browser install' }}</code>
+      <span v-if="browserStatus.error" class="msg err" style="margin-left:8px">{{ browserStatus.error }}</span>
+    </p>
+    <p style="color:#7f8c9b;font-size:12px">
+      安装时会自动下载（弱网上限 20 分钟）；进度日志：<code>{{ browserStatus.log || '%ProgramData%\SAU\logs\browser_install.log' }}</code>；
+      目标目录：<code>{{ browserStatus.dir || '%ProgramData%\SAU\browsers' }}</code>。
+      离线环境可用 <code>sau.exe browser install --from-file &lt;zip&gt;</code>。
+    </p>
+    <button :disabled="browserChecking" @click="refreshBrowserStatus">
+      {{ browserChecking ? '检测中…' : '已安装完成？刷新检测' }}
+    </button>
+  </div>
+
   <div class="card">
     <h2>平台账号</h2>
     <p v-if="err" class="msg err">{{ err }}</p>

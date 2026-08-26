@@ -361,6 +361,8 @@ class LocalApiServer:
         app.router.add_post("/bind", self._post_bind)
         # S6 新增：机器码只读端点 / nonce 签发 / 票据签发与核销 / 静态托管
         app.router.add_get("/machine-code", self._get_machine_code)
+        # 任务 #26：内核安装态只读端点（账号页缺失指引卡 / 排障）
+        app.router.add_get("/browser/status", self._get_browser_status)
         app.router.add_get("/nonce", self._get_nonce)
         app.router.add_post("/ui-ticket", self._post_ui_ticket)
         # 注意：/ui 与 /ui/t/{ticket} 必须先于 /ui/{tail:.*} 注册（动态路由按注册顺序匹配）
@@ -452,6 +454,31 @@ class LocalApiServer:
             return web.json_response(
                 {"error": "machine_code_unavailable", "message": str(exc)}, status=503)
         return web.json_response({"machine_code": code})
+
+    async def _get_browser_status(self, request: web.Request) -> web.Response:
+        """``GET /browser/status``：浏览器内核安装态只读（任务 #26）。
+
+        供控制台账号页在内核缺失时展示指引卡（命令 + 日志位置 + 刷新重试）；
+        判定异常时保守报未安装并携带原因，不抛 5xx（只读体验端点）。
+        """
+        from sau_wrap import browser  # noqa: PLC041
+
+        try:
+            payload = {
+                "installed": browser.is_installed(),
+                "revision": browser.chromium_revision(),
+                "dir": str(browser.chromium_dir()),
+                "log": str(paths.LOGS_DIR / "browser_install.log"),
+                "guide": "sau.exe browser install",
+            }
+        except Exception as exc:  # noqa: BLE001
+            payload = {
+                "installed": False,
+                "error": str(exc),
+                "log": str(paths.LOGS_DIR / "browser_install.log"),
+                "guide": "sau.exe browser install",
+            }
+        return web.json_response(payload)
 
     async def _get_ui_static(self, request: web.Request) -> web.Response:
         """``GET /ui/*``：静态托管（§6.4）。

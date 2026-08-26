@@ -64,14 +64,18 @@ _CPUID_POWERSHELL = (
 
 
 def _cpu_id() -> str:
-    """CPU ProcessorId：PowerShell Get-CimInstance 优先，wmic 末位回退（终审修复12）。"""
+    """CPU ProcessorId：PowerShell Get-CimInstance 优先，wmic 末位回退（终审修复12）。
+
+    超时纪律（任务 #26）：单项 5 秒上限——企业终端安全软件可能拦截/极慢化
+    CIM/WMI 子进程，无超时会导致绑定/注册链路整体挂起。
+    """
     for cmd in (
         ["powershell", "-NoProfile", "-Command", _CPUID_POWERSHELL],
         ["wmic", "cpu", "get", "ProcessorId", "/value"],
     ):
         try:
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=15,
+                cmd, capture_output=True, text=True, timeout=5,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except (OSError, subprocess.TimeoutExpired):
@@ -113,3 +117,27 @@ async def get_machine_code_async() -> str:
 def is_valid_machine_code(code: str) -> bool:
     """校验机器码格式（32 位十六进制，服务端 ^[0-9a-fA-F]{32}$ 归一前的形态）。"""
     return bool(_HEX32_RE.match((code or "").strip().lower()))
+
+
+#: 降级缓存（任务 #26）
+_DEGRADED_CACHE: tuple[str, bool] | None = None
+
+
+def get_machine_code_or_degraded() -> tuple[str, bool]:
+    """机器码降级版（任务 #26：诊断展示链路专用）。
+
+    返回 ``(code, degraded)``：完整三因子优先；CPU_ID 被安全软件拦截/超时等
+    失败时降级为 ``SHA-256(MachineGuid | 卷序列号)``（两因子仍为机器不变量）。
+    **注意**：降级码与完整码不同——仅限诊断/展示；绑定链路必须用严格版，
+    否则与服务端计算的完整机器码不一致。
+    """
+    global _DEGRADED_CACHE
+    if _DEGRADED_CACHE is not None:
+        return _DEGRADED_CACHE
+    try:
+        _DEGRADED_CACHE = (get_machine_code(), False)
+        return _DEGRADED_CACHE
+    except RuntimeError:
+        raw = "|".join([_machine_guid(), _volume_serial()])
+        _DEGRADED_CACHE = (hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32], True)
+        return _DEGRADED_CACHE

@@ -143,6 +143,24 @@ def _check_ws(status: dict | None) -> tuple[str, str]:
     return "WARN", f"WS 未连接：上次断开原因={reason}{suspended}"
 
 
+def _fmt_expire(exp) -> str:
+    """到期时间安全格式化（任务 #26：time.localtime 对越界时间戳招致
+    ``OSError: [Errno 22]`` 崩溃，真机 doctor 凭证检查项崩溃根因）。
+
+    兼容三种脏值：① 服务端返回**毫秒**（>1e12 → 除 1000）；② 越界值 →
+    降级显示原始数；③ 非数值 → ``-``。
+    """
+    if not isinstance(exp, (int, float)):
+        return "-"
+    val = float(exp)
+    if val > 1e12:  # 毫秒时间戳归一到秒（2001-09 后秒级必 <1e12）
+        val /= 1000.0
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(val))
+    except (OSError, ValueError, OverflowError):
+        return f"{exp}（时间戳越界，原值展示）"
+
+
 def _check_credential(status: dict | None) -> tuple[str, str]:
     if not paths.CONFIG_FILE.is_file():
         return "WARN", "未绑定（config.json 不存在，先执行 sau bind）"
@@ -150,12 +168,13 @@ def _check_credential(status: dict | None) -> tuple[str, str]:
         return "FAIL", "config.json 存在但 credential.bin 缺失（重新 bind）"
     if status is None:
         return "WARN", "凭证文件存在；到期时间无法确认（本地 API 不可达）"
-    ts = status.get("token_status", "?")
-    exp = status.get("token_expire_at")
-    exp_txt = time.strftime("%Y-%m-%d %H:%M:%S",
-                            time.localtime(exp)) if isinstance(exp, (int, float)) else "-"
-    level = "OK" if ts == "ok" else "WARN"
-    return level, f"token_status={ts}；到期={exp_txt}"
+    try:
+        ts = status.get("token_status", "?")
+        exp_txt = _fmt_expire(status.get("token_expire_at"))
+        level = "OK" if ts == "ok" else "WARN"
+        return level, f"token_status={ts}；到期={exp_txt}"
+    except Exception as exc:  # noqa: BLE001 诊断不因单项崩溃（任务 #26）
+        return "WARN", f"凭证状态解析异常（不影响其余项）：{exc}"
 
 
 def _check_browser() -> tuple[str, str]:
@@ -227,8 +246,27 @@ def _check_logs() -> tuple[str, str]:
     return "OK", "\n".join(lines)
 
 
+def _check_machine_code() -> tuple[str, str]:
+    """机器码展示（诊断专用降级版，任务 #26）。
+
+    CPU_ID 采集（PowerShell CIM/wmic）可能被企业终端安全软件拦截或极慢化，
+    超时单项 5 秒上限（machine._cpu_id）；仍失败时降级为 MachineGuid+卷序列号。
+    降级码与绑定链路完整码不同，detail 中明确标注；失败只影响本项不阻断其余。
+    """
+    from sau_wrap.agent import machine  # noqa: PLC0415
+
+    try:
+        code, degraded = machine.get_machine_code_or_degraded()
+    except Exception as exc:  # noqa: BLE001
+        return "WARN", f"机器码不可用（诊断展示，不影响服务）：{exc}"
+    if degraded:
+        return "WARN", (f"{code}（降级：MachineGuid+卷序列号，CPU_ID 采集失败/被拦截；"
+                        "与绑定链路完整码不同）")
+    return "OK", code
+
+
 def run() -> int:
-    """执行八项检查并打印；存在 FAIL → 退出码 1。"""
+    """执行十一项检查（0 + ①~⑩）并打印；存在 FAIL → 退出码 1。"""
     from sau_wrap.agent import config as agent_config  # noqa: PLC0415
 
     port = 5409
@@ -244,24 +282,45 @@ def run() -> int:
     def add(title: str, level: str, detail: str) -> None:
         results.append((level, title, detail))
 
-    add("0. 运行形态", *_check_frozen())
-    add("① 服务状态", *_check_service())
+    # 任务 #26：单项外部调用超时防护——企业终端安全软件可能拦截/极慢化
+    # 子进程（CIM/WMI/sc.exe）；超时只影响该项（WARN），不影响其余检查与退出。
+    # 注意：不可用 with 上下文——Python 3.9+ __exit__ 的 shutdown(wait=True)
+    # 会在超时后继续阻塞等子线程结束，使超时保护失效；不用 with，
+    # 执行器引用随函数释放，线程自行收尾（不阻塞主流程）。
+    import concurrent.futures  # noqa: PLC0415
+
+    t_start = time.time()
+
+    def guarded(title: str, fn) -> None:
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            level, detail = pool.submit(fn).result(timeout=5)
+        except concurrent.futures.TimeoutError:
+            level, detail = "WARN", "检查超时（>5s，已跳过；疑似安全软件拦截外部调用）"
+        except Exception as exc:  # noqa: BLE001
+            level, detail = "WARN", f"检查异常（不影响其余项）：{exc}"
+        add(title, level, detail)
+
+    guarded("0. 运行形态", _check_frozen)
+    guarded("① 服务状态", _check_service)
     port_out, status = _check_port_and_status(port)
     for lvl, detail in port_out:
         add(f"② 端口 {port}", lvl, detail)
     add("③ WS 连接", *_check_ws(status))
-    add("③2 WS 传输加密", *_check_ws_transport())
-    add("④ Agent 凭证", *_check_credential(status))
-    add("⑤ 浏览器内核", *_check_browser())
-    add("⑥ 数据目录可写", *_check_writable())
-    add("⑦ 磁盘空间", *_check_disk())
-    add("⑧ 日志摘要", *_check_logs())
+    add("④ WS 传输加密", *_check_ws_transport())
+    add("⑤ Agent 凭证", *_check_credential(status))
+    guarded("⑥ 机器码（诊断）", _check_machine_code)
+    guarded("⑦ 浏览器内核", _check_browser)
+    guarded("⑧ 数据目录可写", _check_writable)
+    guarded("⑨ 磁盘空间", _check_disk)
+    add("⑩ 日志摘要", *_check_logs())
 
     icon = {"OK": "[OK]  ", "WARN": "[WARN]", "FAIL": "[FAIL]"}
     has_fail = False
     for level, title, detail in results:
         has_fail = has_fail or level == "FAIL"
         click.echo(f"{icon[level]} {title}：{detail}")
+    click.echo(f"总耗时 {time.time() - t_start:.1f}s（单项外部调用 5s 超时保护，任务 #26）")
     return 1 if has_fail else 0
 
 

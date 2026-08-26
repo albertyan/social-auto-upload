@@ -386,6 +386,107 @@ def scenario_encoding_guard() -> None:
     check("哑流/None 流（服务 Session 0 与重定向场景）：加固不抛异常",
           dummy_ok, "dummy+None stream")
 
+    # 任务 #26：控制台流（isatty=True）必须跳过 reconfigure——
+    # reconfigure 会把 WriteConsoleW 路径降级为 WriteFile，控制台句柄报 EINVAL（2026-08-26 真机崩溃）
+    class _FakeConsole:
+        reconfigure_called = False
+
+        def isatty(self):
+            return True
+
+        def reconfigure(self, **kw):
+            _FakeConsole.reconfigure_called = True
+            raise OSError(22, "Invalid argument")  # 若被调用即复现真机崩溃形态
+
+        def write(self, s):
+            return len(s)
+
+        def flush(self):
+            pass
+
+    fc = _FakeConsole()
+    old_out2, old_err2 = sys.stdout, sys.stderr
+    sys.stdout = fc  # type: ignore[assignment]
+    sys.stderr = fc  # type: ignore[assignment]
+    try:
+        entry_mod.harden_stdio_encoding()
+        console_ok = not _FakeConsole.reconfigure_called
+        # 控制台流不得被 _ResilientTextWriter 包裹（保持 WriteConsoleW 语义）
+        not_wrapped = sys.stdout is fc
+    except Exception:  # noqa: BLE001
+        console_ok = False
+        not_wrapped = False
+    finally:
+        sys.stdout, sys.stderr = old_out2, old_err2
+    check("控制台流跳过 reconfigure（WriteConsoleW 保护，EINVAL 根治）",
+          console_ok, "reconfigure not called on isatty stream")
+    check("控制台流不被降级包装（保持原生控制台语义）", not_wrapped,
+          "sys.stdout is original console stream")
+
+    # 任务 #26：非控制台流写入失败降级丢弃（句柄失效不得崩溃）
+    class _BrokenPipe:
+        def isatty(self):
+            return False
+
+        def reconfigure(self, **kw):
+            pass
+
+        def write(self, s):
+            raise OSError(22, "Invalid argument")
+
+        def flush(self):
+            raise OSError(22, "Invalid argument")
+
+    old_out3, old_err3 = sys.stdout, sys.stderr
+    sys.stdout = _BrokenPipe()  # type: ignore[assignment]
+    sys.stderr = _BrokenPipe()  # type: ignore[assignment]
+    try:
+        entry_mod.harden_stdio_encoding()
+        broken_ok = True
+        try:
+            print("任何内容 ①② \u00b2 \u2713 \U0001f600")
+            sys.stdout.flush()
+        except Exception:  # noqa: BLE001
+            broken_ok = False
+    except Exception:  # noqa: BLE001
+        broken_ok = False
+    finally:
+        sys.stdout, sys.stderr = old_out3, old_err3
+    check("失效句柄写入降级丢弃（绝不因输出崩溃）", broken_ok,
+          "broken pipe write/flush swallowed")
+
+    # 任务 #26：click 二进制探测与完整输出链路（--version/--help 零输出根因防回归）：
+    # click 的 _is_binary_writer 用 write(b"") 探测流类型；若 bytes 写入被吞异常，
+    # 包装器会被误判为二进制流再被包编码层，输出静默全丢。
+    sink = _io.BytesIO()
+    tw = _io.TextIOWrapper(sink, encoding="utf-8")
+    w = entry_mod._ResilientTextWriter(tw)
+    probe_ok = True
+    try:
+        w.write(b"")            # click _is_binary_writer 探测形态：不得抛异常
+        w.write(b"raw-bytes-ok")
+        w.flush()
+    except Exception:  # noqa: BLE001
+        probe_ok = False
+    bytes_ok = probe_ok and b"raw-bytes-ok" in sink.getvalue()
+
+    old_out4, old_err4 = sys.stdout, sys.stderr
+    sys.stdout = w              # type: ignore[assignment]
+    sys.stderr = w              # type: ignore[assignment]
+    click_ok = False
+    try:
+        import click as _click
+        _click.echo("探针可见输出 ①")
+        click_ok = "探针可见输出 ①".encode("utf-8") in sink.getvalue()
+    except Exception:  # noqa: BLE001
+        click_ok = False
+    finally:
+        sys.stdout, sys.stderr = old_out4, old_err4
+    check("弹性包装器接受 bytes 写入（click 二进制探测不误判）",
+          bytes_ok, f"probe_ok={probe_ok} bytes_in_sink={bytes_ok}")
+    check("click.echo 经弹性包装器全链路可见（零输出防回归）",
+          click_ok, "click.echo payload present in underlying buffer")
+
 
 def main() -> int:
     dead_port = _find_dead_port()
