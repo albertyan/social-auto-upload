@@ -23,7 +23,7 @@ import json
 import logging
 import shutil
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import aiohttp
 
@@ -75,10 +75,29 @@ def is_network_error(exc: BaseException) -> bool:
 
 
 async def default_downloader(url: str, dest: Path) -> None:
-    """aiohttp 下载（512KB 分块，§5.3）；403 抛 ``FileRenewNeeded``。"""
+    """aiohttp 下载（512KB 分块，§5.3）；403 抛 ``FileRenewNeeded``。
+
+    终审修复14：素材下载强制 ``https``；重定向受控——每一跳目标必须仍为 ``https``，
+    否则中止（防降级到明文或任意跳转源）。
+    """
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        raise RuntimeError(f"素材 URL 非 https，拒绝下载: scheme={parsed.scheme!r}")
     paths.ensure_dir(dest.parent)
     async with aiohttp.ClientSession() as session:
-        async with session.get(url) as resp:
+        async with session.get(url, allow_redirects=False) as resp:
+            hops = 0
+            while resp.status in (301, 302, 303, 307, 308):
+                hops += 1
+                if hops > 5:
+                    raise RuntimeError("素材下载重定向次数超限（>5）")
+                location = resp.headers.get("Location") or ""
+                target = urlparse(urljoin(str(resp.real_url), location))
+                if target.scheme != "https":
+                    raise RuntimeError(
+                        f"素材下载重定向目标非 https，拒绝: {target.scheme!r}")
+                resp.release()
+                return await default_downloader(target.geturl(), dest)
             if resp.status == 403:
                 raise FileRenewNeeded(f"403 签名过期: {url}")
             resp.raise_for_status()
@@ -160,20 +179,34 @@ class TaskDispatcher:
                           task_id, payload.get("platform_key"), payload.get("content_type"))
 
     def recover_pending(self) -> int:
-        """重启恢复（§5.3）：扫 queued/running 重新入队。返回恢复条数。"""
+        """重启恢复（§5.3）：扫 queued/running 重新入队。返回恢复条数。
+
+        终审修复13：恢复 ``running`` 任务记显式告警——其上次可能已进入平台发布动作，
+        重新执行存在**重复发布风险**，依赖服务端幂等兼容。
+        """
         rows = db.list_pending_tasks()
         count = 0
+        running_count = 0
         for task_id, payload_json in rows:
+            row = db.get_task(task_id)
+            prior_status = row[2] if row is not None else "?"
             try:
                 payload = json.loads(payload_json)
             except ValueError:
                 self._logger.error("恢复失败：任务载荷非法 JSON: task_id=%s", task_id)
                 db.set_task_status(task_id, "failed")
                 continue
+            if prior_status == "running":
+                running_count += 1
+                self._logger.warning(
+                    "重启恢复 running 任务（存在重复发布风险，依赖服务端幂等）: "
+                    "task_id=%s", task_id,
+                )
             self.submit(payload)
             count += 1
         if count:
-            self._logger.info("重启恢复：重新入队 %d 个未完成任务", count)
+            self._logger.info("重启恢复：重新入队 %d 个未完成任务（其中 running %d 个）",
+                              count, running_count)
         return count
 
     def recover_pending_once(self) -> int:
@@ -292,6 +325,14 @@ class TaskDispatcher:
                 return
 
             # 3) 调用上游上传器（适配层）
+            # 终审修复13：上传启动前再检停机标志——素材下载可能耗时较长，
+            # 避免停机期发起新的真实平台发布动作；任务保持 running，留待重启恢复。
+            if self._stop.is_set():
+                self._logger.warning(
+                    "服务正在停机，放弃发起上传（任务保持 running 待重启恢复）: "
+                    "task_id=%s", task_id,
+                )
+                return
             try:
                 publish_url = await upstream_adapter.execute_upload(
                     platform_key,

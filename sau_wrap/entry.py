@@ -12,7 +12,8 @@ CLI 框架选型：文档 §2.4.1 建议「Typer 或 Click」，本实现采用 
     sau browser install      浏览器内核安装（本步占位）
     sau doctor               诊断（本步占位）
     sau machine-code|bind    机器码 / 绑定（S2 已实现）
-    sau <平台> ...           透传上游 sau_cli.py（后续步骤实现）
+    sau <平台> ...           同构透传上游 sau_cli.py（终审修复⑥：§3.2/决策表行 8，
+                             douyin/kuaishou/xiaohongshu/bilibili/tencent/youtube）
 
 本步（任务 #13 第二步 / S2）实现状态：
 - agent           ✅ WS 主循环（注册/心跳/重连退避/挂起/任务落库/结果补发）
@@ -122,6 +123,23 @@ def service_upgrade() -> None:
     ops.cmd_upgrade()
 
 
+@service.command("upgrade-run", hidden=True)
+@click.option("--installer", required=True, help="安装包路径（服务侧移交）")
+@click.option("--target-version", "target_version", required=True,
+              help="目标版本（校验基准）")
+def service_upgrade_run(installer: str, target_version: str) -> None:
+    """【隐藏】升级 runner 副本执行入口（终审修复⑧，§7.4 步骤 8-10）。
+
+    仅供服务进程升级移交时拉起 ``updates/runner/`` 副本调用，不由用户直接使用：
+    停服/备份/静默安装/启服/校验/回滚全流程在本进程执行。
+    """
+    from sau_wrap.upgrade import runner
+
+    result = runner.run_upgrade(installer, target_version)
+    # success = 升级完成；rolled_back/failed = 系统已收敛但升级未成，退出码非 0。
+    sys.exit(0 if result.get("phase") == "success" else 1)
+
+
 # ---------------------------------------------------------------- tray
 
 
@@ -208,7 +226,55 @@ def bind(server_url: str, token: str, agent_id: str | None) -> None:
     click.echo("下一步: sau service start（或 sau agent run-fg 前台验证）")
 
 
+# ---------------------------------------------------------------- 平台 CLI 透传（§3.2 / 决策表行 8，终审修复⑥）
+#
+# 与上游 sau_cli.py argparse 分组同构：``sau <platform> <action> ...`` 全参数
+# 透传（含 --help，由上游 argparse 自行处理）；转发实现见 sau_wrap.cli_bridge。
+
+
+def _register_platform_commands() -> None:
+    from sau_wrap.cli_bridge import UPSTREAM_PLATFORMS, forward
+
+    for platform in UPSTREAM_PLATFORMS:
+
+        def _cmd(args: tuple[str, ...], _platform: str = platform) -> None:
+            sys.exit(forward([_platform, *args]))
+
+        _cmd.__doc__ = (
+            f"平台 CLI 透传（上游 sau_cli.py，§3.2）："
+            f"sau {platform} login|cookie-auth|check|upload-video|upload-note …")
+        cli.command(
+            platform,
+            context_settings={"ignore_unknown_options": True,
+                              "allow_extra_args": True,
+                              "help_option_names": []},  # --help 交上游 argparse
+        )(click.argument("args", nargs=-1, type=click.UNPROCESSED)(_cmd))
+
+
+_register_platform_commands()
+
+
 # ---------------------------------------------------------------- main
+
+
+def harden_stdio_encoding() -> None:
+    """入口级编码加固（终审追加：真机 ``UnicodeEncodeError: 'gbk' codec`` 根治）。
+
+    GBK（CP936）终端下输出**任何**非 CP936 字符（``²`` ``✓`` ``°`` emoji，
+    及上游透传的不可控输出）都会抛 ``UnicodeEncodeError`` 致整条命令崩溃；
+    入口统一把 stdout/stderr 强制 ``utf-8 + errors='replace'``（终端按自身解码
+    呈现，最差乱码但不崩溃）。服务进程（Session 0 无控制台）与托盘哑流场景：
+    逐流 try/except 兜底，无 reconfigure / 流不可写等情形绝不引发新崩溃。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is None:
+                continue
+            reconfigure = getattr(stream, "reconfigure", None)
+            if reconfigure is not None:
+                reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001（无控制台/重定向/不支持：不得新崩）
+            continue
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -223,6 +289,7 @@ def main(argv: list[str] | None = None) -> None:
     """
     if argv is None:
         argv = sys.argv[1:]
+    harden_stdio_encoding()  # 子命令分发前统一加固（含上游透传路径）
     try:
         if "--startup" in argv:
             from sau_wrap.service import host
@@ -244,7 +311,8 @@ def _fatal_with_console_fallback() -> None:
     try:
         import ctypes
         if ctypes.windll.kernel32.GetConsoleWindow():
-            return  # 终端调用：输出已在调用方终端可见，无需兜底
+            return  # 终端调用：输出已在调用方终端可见，无需兜底；
+            # 编码已由 main() 的 harden_stdio_encoding() 加固，非 CP936 字符不崩
     except Exception:
         pass  # 判定失败则保守走兜底分支（AllocConsole 重复调用无副作用）
     try:

@@ -490,7 +490,7 @@ async def scenario_accounts() -> None:
                           for ln in logbuf.getvalue().splitlines()),
                   f"status={r2.status} exists={good.is_file()}")
 
-            # —— 缺参 400 / 不存在 404
+            # —— 缺参 400 / 不存在 404 / 路径穿越 400（终审修复③）
             r3 = await sess.request("DELETE", f"{base}/accounts", headers=headers,
                                     json={"platform": "douyin"})
             r4 = await sess.request("DELETE", f"{base}/accounts", headers=headers,
@@ -498,6 +498,24 @@ async def scenario_accounts() -> None:
             check("DELETE /accounts 守卫：缺参 400 / 不存在 404",
                   r3.status == 400 and r4.status == 404,
                   f"status={(r3.status, r4.status)}")
+            rt1 = await sess.request(
+                "DELETE", f"{base}/accounts", headers=headers,
+                json={"platform": "a/../../config", "account": "x"})
+            rt2 = await sess.request(
+                "DELETE", f"{base}/accounts", headers=headers,
+                json={"platform": "douyin", "account": "..\\evil"})
+            check("DELETE /accounts 路径穿越 → 400（终审修复③：白名单净化）",
+                  rt1.status == 400 and (await rt1.json())["error"] == "invalid_name"
+                  and rt2.status == 400,
+                  f"status={(rt1.status, rt2.status)} body1={await rt1.json()}")
+
+            # —— 登录 account_name 穿越 → 400（终审修复④）
+            rt3 = await sess.post(f"{base}/login/douyin", headers=headers,
+                                  json={"account_name": "a/../../config"})
+            check("POST /login account_name 路径穿越 → 400（终审修复④）",
+                  rt3.status == 400
+                  and (await rt3.json())["error"] == "invalid_account_name",
+                  f"status={rt3.status} body={await rt3.json()}")
 
             # —— /accounts/recheck 仍占位 501
             r5 = await sess.post(f"{base}/accounts/recheck", headers=headers)
@@ -510,6 +528,129 @@ async def scenario_accounts() -> None:
         await api.stop()
 
 
+# ================================================================ 平台 CLI 透传（终审修复⑥）
+
+
+def scenario_cli_passthrough() -> None:
+    print("\n==== 平台 CLI 透传基本验证（终审修复⑥） ====", flush=True)
+    import subprocess
+    env = dict(os.environ)
+    # 子进程经入口级编码加固后一律输出 utf-8（终审追加），解码须显式指定，
+    # 不得依赖 GBK 控制台默认（否则 reader 线程 UnicodeDecodeError → stdout=None）
+    dec = {"encoding": "utf-8", "errors": "replace"}
+    # 透传 --help 到上游：argparse 打印平台动作清单并退出码 0（不拉浏览器）
+    r = subprocess.run(
+        [sys.executable, "-m", "sau_wrap", "douyin", "--help"],
+        capture_output=True, text=True, timeout=120, env=env,
+        cwd=os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)))), **dec)
+    head = r.stdout.splitlines()[0] if r.stdout.splitlines() else ""
+    check("sau douyin --help 透传上游成功（退出码 0 + 动作清单）",
+          r.returncode == 0 and "upload-video" in r.stdout
+          and "upload-note" in r.stdout,
+          f"exit={r.returncode} stdout_head={head!r}")
+    # 六平台子命令均已注册（entry 顶层 --help 列表可见）
+    r2 = subprocess.run(
+        [sys.executable, "-m", "sau_wrap", "--help"],
+        capture_output=True, text=True, timeout=60, env=env,
+        cwd=os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)))), **dec)
+    check("六平台子命令已注册于 sau 入口",
+          r2.returncode == 0
+          and all(p in r2.stdout for p in (
+              "douyin", "kuaishou", "xiaohongshu",
+              "bilibili", "tencent", "youtube")),
+          f"exit={r2.returncode}")
+
+
+# ================================================================ 签名守卫（终审修复⑩）
+
+
+async def scenario_signature_guard() -> None:
+    print("\n==== 短信二验适配签名守卫（终审修复⑩） ====", flush=True)
+    import types
+    from sau_wrap.service import login_adapt
+
+    def _compatible_module():
+        m = types.ModuleType("fake_dm_ok")
+
+        async def wait(page, account_file, qrcode_info, qrcode_callback=None,
+                       poll_interval=3, max_checks=100):
+            return {}
+
+        async def completed(page):
+            return True
+
+        def build(ok, status, message, account_file, qrcode_info, url=""):
+            return {}
+
+        async def save(page, account_file, qrcode_path, qrcode_callback=None):
+            return {}
+
+        m._wait_for_douyin_login = wait
+        m._is_douyin_login_completed = completed
+        m._build_login_result = build
+        m._save_douyin_qrcode = save
+        return m
+
+    # —— a) 兼容模块 → 无问题清单，桥接替换生效且退出还原
+    dm_ok = _compatible_module()
+    sys.modules["uploader.douyin_uploader"] = types.ModuleType("uploader.douyin_uploader")
+    sys.modules["uploader.douyin_uploader"].main = dm_ok  # type: ignore[attr-defined]
+    sys.modules["uploader.douyin_uploader.main"] = dm_ok
+    orig = dm_ok._wait_for_douyin_login
+    replaced_seen = False
+    async with login_adapt.douyin_sms_bridge(object()):
+        replaced_seen = dm_ok._wait_for_douyin_login is not orig
+    check("签名兼容 → 守卫通过，桥接替换生效且退出还原",
+          login_adapt.upstream_compat_issues(dm_ok) == []
+          and replaced_seen and dm_ok._wait_for_douyin_login is orig,
+          f"issues={login_adapt.upstream_compat_issues(dm_ok)} replaced={replaced_seen}")
+
+    # —— b) 缺符号 / 签名不兼容 → 放弃桥接 + WARN（不带错运行）
+    buf = io.StringIO()
+    guard_logger = logging.getLogger("sau.login_adapt")
+    handler = logging.StreamHandler(buf)
+    handler.setLevel(logging.WARNING)
+    guard_logger.addHandler(handler)
+    try:
+        dm_miss = _compatible_module()
+        del dm_miss._save_douyin_qrcode
+        sys.modules["uploader.douyin_uploader.main"] = dm_miss
+        sys.modules["uploader.douyin_uploader"].main = dm_miss  # type: ignore[attr-defined]
+        orig_miss = dm_miss._wait_for_douyin_login
+        async with login_adapt.douyin_sms_bridge(object()):
+            pass
+        check("缺符号 → 守卫拦截：不替换 + WARN 人工升级包装层",
+              dm_miss._wait_for_douyin_login is orig_miss
+              and "短信二验适配失效，请人工升级包装层" in buf.getvalue()
+              and any("_save_douyin_qrcode" in i
+                      for i in login_adapt.upstream_compat_issues(dm_miss)),
+              f"replaced={dm_miss._wait_for_douyin_login is not orig_miss} "
+              f"warn_logged={'短信二验适配失效' in buf.getvalue()}")
+
+        dm_bad = _compatible_module()
+
+        def build_bad(ok, status):  # 仅 2 参，无法绑定 5 位置参调用形态
+            return {}
+
+        dm_bad._build_login_result = build_bad
+        sys.modules["uploader.douyin_uploader.main"] = dm_bad
+        sys.modules["uploader.douyin_uploader"].main = dm_bad  # type: ignore[attr-defined]
+        orig_bad = dm_bad._wait_for_douyin_login
+        async with login_adapt.douyin_sms_bridge(object()):
+            pass
+        check("签名不兼容 → 守卫拦截：不替换且清单指出 _build_login_result",
+              dm_bad._wait_for_douyin_login is orig_bad
+              and any("_build_login_result" in i
+                      for i in login_adapt.upstream_compat_issues(dm_bad)),
+              f"issues={login_adapt.upstream_compat_issues(dm_bad)}")
+    finally:
+        guard_logger.removeHandler(handler)
+        for k in ("uploader.douyin_uploader", "uploader.douyin_uploader.main"):
+            sys.modules.pop(k, None)
+
+
 # ================================================================ main
 
 
@@ -517,6 +658,8 @@ async def main() -> None:
     await scenario_manager()
     await scenario_http()
     await scenario_accounts()
+    scenario_cli_passthrough()
+    await scenario_signature_guard()
 
     total = len(RESULTS)
     failed = sum(1 for r in RESULTS if r.startswith("[FAIL]"))

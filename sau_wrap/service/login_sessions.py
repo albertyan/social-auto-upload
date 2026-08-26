@@ -46,6 +46,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import re
 import secrets
 import time
 from pathlib import Path
@@ -54,6 +55,20 @@ from sau_wrap import paths
 
 #: 支持服务端扫码登录的平台（上游 ``*_setup`` 带 qrcode_callback 的四家）
 SUPPORTED_PLATFORMS = ("douyin", "kuaishou", "xiaohongshu", "tencent")
+
+#: 文件系统安全名白名单（终审修复④：防路径穿越）：仅允许字母数字与 ``_.-``
+_SAFE_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+
+
+def sanitize_fs_name(value: str) -> str | None:
+    """净化用于拼文件路径的名称；不合法返回 None。
+
+    终审修复④：platform / account / account_name 参与 cookie 文件路径拼接，
+    必须拒绝 ``/``、``\\``、``..`` 等非白名单内容（如 ``a/../../config``）；
+    调用方另应做 ``resolve().is_relative_to()`` 双保险（见 local_api）。
+    """
+    value = (value or "").strip()
+    return value if _SAFE_NAME_RE.fullmatch(value) else None
 
 #: 不支持平台的原因说明（400 响应附带，引导用户）
 UNSUPPORTED_REASONS = {
@@ -74,6 +89,10 @@ _TERMINAL_RETAIN = 600.0
 
 class LoginPlatformUnsupportedError(ValueError):
     """平台不支持服务端扫码登录（附原因说明）。"""
+
+
+class LoginInvalidNameError(ValueError):
+    """account_name 非法（终审修复④：非白名单字符，拒绝参与路径拼接）。"""
 
 
 class LoginBrowserMissingError(RuntimeError):
@@ -237,7 +256,10 @@ class LoginSessionManager:
         每平台单会话冲突 → :class:`LoginSessionConflictError`。
         """
         platform = (platform or "").strip().lower()
-        account_name = (account_name or "default").strip() or "default"
+        account_name = sanitize_fs_name(account_name or "default")
+        if account_name is None:
+            raise LoginInvalidNameError(
+                "account_name 含非法字符（仅允许字母/数字/_/./-，长度 1-64）")
         if platform not in SUPPORTED_PLATFORMS:
             reason = UNSUPPORTED_REASONS.get(
                 platform, f"未知平台：{platform}（支持：{', '.join(SUPPORTED_PLATFORMS)}）")
@@ -296,10 +318,16 @@ class LoginSessionManager:
         return session
 
     async def close_all(self) -> None:
-        """服务退出前清理全部活跃会话。"""
-        for session in list(self._sessions.values()):
-            if not session.is_terminal():
-                await self.cancel(session.session_id)
+        """服务退出前清理全部活跃会话（终审修复14：总超时 10 秒防停机悬挂）。"""
+        async def _close() -> None:
+            for session in list(self._sessions.values()):
+                if not session.is_terminal():
+                    await self.cancel(session.session_id)
+
+        try:
+            await asyncio.wait_for(_close(), timeout=10.0)
+        except asyncio.TimeoutError:
+            self._logger.warning("close_all 超时（10 秒），部分会话未完成清理")
 
     # ------------------------------------------------------------ 执行
 

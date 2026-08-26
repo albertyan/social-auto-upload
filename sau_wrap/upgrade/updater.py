@@ -39,6 +39,7 @@ import os
 import re
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -53,8 +54,11 @@ PHASES = (
     "applying", "success", "failed", "rolled_back",
 )
 
-#: 状态持久化文件（现状文档 §7.3：SAU_HOME/etc/upgrade_state.json，原子写）
-STATE_FILE: Path = paths.DATA_ROOT / "etc" / "upgrade_state.json"
+#: 状态持久化文件（§3.6 目录树口径，终审修复⑨对齐：SAU_HOME/updates/etc/，原子写）
+STATE_FILE: Path = paths.UPDATES_DIR / "etc" / "upgrade_state.json"
+
+#: 旧版状态文件位置（初版实现落 SAU_HOME/etc/；终审修复⑨对齐 §3.6 后启动迁移）
+_LEGACY_STATE_FILE: Path = paths.DATA_ROOT / "etc" / "upgrade_state.json"
 
 #: 下载重试与节流参数（现状文档 §7.3：3 次尝试指数退避 2s 起；任务定义总超时 1800s）
 DOWNLOAD_MAX_ATTEMPTS = 3
@@ -80,11 +84,24 @@ def parse_semver(v: str):
     return core, m.group(4)
 
 
+def _pre_key(pre: str) -> tuple:
+    """预发布后缀比较键（终审修复⑭：逐段按数字解析，2.0.0a10 > 2.0.0a9）。
+
+    逐段拆为 (非数字前缀, 数字尾) 元组序列比较；纯数字段按数值比，
+    非数字段按字典序（2.0.0b1 > 2.0.0a0 仍成立）。
+    """
+    key: list = []
+    for seg in str(pre).split("."):
+        m = re.match(r"^([^0-9]*)([0-9]*)$", seg)
+        key.append((m.group(1), int(m.group(2)) if m.group(2) else -1))
+    return tuple(key)
+
+
 def version_gt(a: str, b: str) -> bool | None:
     """``a > b`` 语义化严格比较；任一非法返回 None。
 
     规则：先比核心三段；核心相同则正式版大于任何预发布版，
-    预发布之间按后缀字典序（2.0.0b1 > 2.0.0a0）。
+    预发布之间按后缀逐段比较（数字段按数值：2.0.0a10 > 2.0.0a9）。
     """
     pa, pb = parse_semver(a), parse_semver(b)
     if pa is None or pb is None:
@@ -98,7 +115,7 @@ def version_gt(a: str, b: str) -> bool | None:
         return True   # 正式版 > 预发布版
     if pre_b is None:
         return False
-    return pre_a > pre_b
+    return _pre_key(pre_a) > _pre_key(pre_b)
 
 
 def validate_notice(notice: dict, current_version: str = APP_VERSION,
@@ -142,8 +159,18 @@ def validate_notice(notice: dict, current_version: str = APP_VERSION,
 
 
 def read_state_file(path: Path | None = None) -> dict | None:
-    """读 ``upgrade_state.json``；不存在 / 非法 JSON / phase 非法 → None。"""
+    """读 ``upgrade_state.json``；不存在 / 非法 JSON / phase 非法 → None。
+
+    终审修复⑨：默认路径对齐 §3.6 目录树（``updates/etc/``）；旧位置（``etc/``）
+    存在时沿用并迁移（存量升级无缝保留，同「承接声明」语义）。
+    """
     f = path or STATE_FILE
+    if path is None and not f.exists() and _LEGACY_STATE_FILE.exists():
+        try:
+            paths.ensure_dir(f.parent)
+            os.replace(_LEGACY_STATE_FILE, f)
+        except OSError:
+            f = _LEGACY_STATE_FILE  # 迁移失败沿用旧位置，不阻断状态机
     try:
         obj = json.loads(f.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -178,7 +205,8 @@ class Updater:
                  updates_dir: Path | None = None,
                  allowed_schemes: tuple[str, ...] = ("https",),
                  current_version: str = APP_VERSION,
-                 autoschedule: bool = True) -> None:
+                 autoschedule: bool = True,
+                 stop_check: Callable[[], bool] | None = None) -> None:
         self._logger = logger
         self.state_file = Path(state_file or STATE_FILE)
         self.updates_dir = Path(updates_dir or paths.UPDATES_DIR)
@@ -191,7 +219,37 @@ class Updater:
         #: 事件循环（下载进度/端点快照）读写，跨线程访问统一经此锁。
         self._state_lock = threading.Lock()
         self._notice: dict | None = None     # 已受理通知（下载中供快照展示）
+        #: 停机检查钩子（终审修复⑬）：下载分块循环内调用，返回 True 即中止
+        self._stop_check = stop_check
         self.state: dict = read_state_file(self.state_file) or _empty_state()
+        self._reset_interrupted_download()
+
+    def _reset_interrupted_download(self) -> None:
+        """终审修复⑤：启动时若上次停留在 ``downloading``，重置为 ``noticed``。
+
+        背景：``handle_notice`` 忽略 ``downloading`` 态的重复通知；若服务在下载中
+        崩溃/停机，重启后状态滞留 ``downloading`` 且永不再受理通知 → 升级通道卡死。
+        处理：清理未完成 ``.part`` 临时文件，回退 ``noticed``（保留 version /
+        download_url / file_hash，等服务端重推或手动重播即可恢复）。
+        """
+        if self.state.get("phase") != "downloading":
+            return
+        self._logger.warning(
+            "检测到重启时升级状态停留在 downloading，重置为 noticed"
+            "（清理未完成 .part，允许重新受理通知）")
+        try:
+            if self.updates_dir.exists():
+                for part in self.updates_dir.glob("*.part"):
+                    try:
+                        part.unlink()
+                        self._logger.info("已清理未完成下载临时文件：%s", part)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        self.set_phase("noticed",
+                       error="重启时处于下载中，已重置待重新下载",
+                       downloaded_bytes=0, total_bytes=0)
 
     # ------------------------------------------------------------ 持久化
 
@@ -337,6 +395,10 @@ class Updater:
                                 downloaded += len(chunk)
                                 with self._state_lock:
                                     self.state["downloaded_bytes"] = downloaded
+                                # 终审修复⑬：分块检查停机标志，避免停机被下载阻塞
+                                if self._stop_check is not None and \
+                                        self._stop_check():
+                                    raise RuntimeError("服务正在停机，中止升级下载")
                 digest = hasher.hexdigest()
                 if digest != file_hash.lower():
                     raise ValueError(
@@ -410,13 +472,24 @@ class Updater:
                 pass
         if self.updates_dir.exists():
             target = self.state.get("version")
+            removed_target_installer = False
             for f in self.updates_dir.glob("sau-*.exe*"):
                 try:
+                    is_target = bool(target) and f.name == f"sau-{target}.exe"
                     if f.stat().st_mtime < cutoff or (
-                            target and f.name != f"sau-{target}.exe"):
+                            target and not is_target):
+                        if is_target and not f.name.endswith(".part"):
+                            removed_target_installer = True
                         f.unlink()
                         removed.append(str(f))
                         self._logger.info("已清理过期/旧版安装包：%s", f)
                 except OSError:
                     pass
+            # 终审修复⑭：当前目标安装包被清理后状态同步降级 noticed，
+            # 避免 ready/snoozed 指向已不存在的安装包导致 apply 失败
+            if removed_target_installer and \
+                    self.state.get("phase") in ("ready", "snoozed"):
+                self.set_phase("noticed",
+                               error="安装包已被启动清理移除，等待重新下载",
+                               installer_path=None, verified=False)
         return removed

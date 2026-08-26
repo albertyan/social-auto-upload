@@ -128,7 +128,7 @@ class WSClient:
                 continue  # 被唤醒：立即复查配置
 
             try:
-                machine = get_machine_code()
+                machine = await asyncio.to_thread(get_machine_code)  # 终审修复12：首算不阻塞事件循环（结果缓存）
             except RuntimeError as exc:
                 self._logger.error("机器码生成失败，%s 秒后重试: %s", self._backoff, exc)
                 if await self._sleep_interruptible(self._backoff):
@@ -137,6 +137,12 @@ class WSClient:
                 continue
 
             url = f"{cfg.server_url}?agentId={cfg.agent_id}&machine={machine}"
+            if str(cfg.server_url).lower().startswith("ws://"):
+                # 终审修复14：明文连接强警告（生产建议 wss；doctor 亦提示）
+                self._logger.warning(
+                    "使用 ws:// 明文连接（强警告：生产环境建议使用 wss:// "
+                    "加密传输）: %s", cfg.server_url,
+                )
             self._logger.info("连接 WS: %s?agentId=%s&machine=%s…",
                               cfg.server_url, cfg.agent_id, machine[:8])
             try:
@@ -296,6 +302,8 @@ class WSClient:
                 # file_renew 有连接可发，避免恢复任务因离线发送失败直接 failed。
                 self._dispatcher.recover_pending_once()
         elif msg_type == "heartbeat_ack":
+            if data.get("expire_at") is not None:  # 终审修复11：一行级消费续期
+                self.expire_at = data["expire_at"]
             server_time = data.get("server_time")
             if server_time is not None:
                 avg = self._clock.update(server_time)

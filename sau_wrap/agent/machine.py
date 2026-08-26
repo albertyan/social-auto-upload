@@ -5,7 +5,9 @@
 
 - ``MachineGuid``：注册表 ``HKLM\\SOFTWARE\\Microsoft\\Cryptography\\MachineGuid``；
 - 系统盘卷序列号：``GetVolumeInformation`` 取 ``%SystemDrive%``（缺省 ``C:``）；
-- ``CPU_ID``：``ProcessorId``，先 ``wmic``，失败回退 PowerShell ``Get-CimInstance``。
+- ``CPU_ID``：``ProcessorId``，先 PowerShell ``Get-CimInstance``，失败末位回退 ``wmic``
+  （终审修复12：wmic 在新版 Windows 属可移除的弃用组件，CIM 优先）。
+- **结果缓存（终审修复12）**：机器码算一次后进程内缓存；异步调用方首次计算走 ``asyncio.to_thread``。
 
 任一因子获取失败 → 抛 ``RuntimeError``（调用方负责友好提示，禁止静默降级）。
 """
@@ -62,10 +64,10 @@ _CPUID_POWERSHELL = (
 
 
 def _cpu_id() -> str:
-    """CPU ProcessorId：wmic 优先，PowerShell Get-CimInstance 回退。"""
+    """CPU ProcessorId：PowerShell Get-CimInstance 优先，wmic 末位回退（终审修复12）。"""
     for cmd in (
-        ["wmic", "cpu", "get", "ProcessorId", "/value"],
         ["powershell", "-NoProfile", "-Command", _CPUID_POWERSHELL],
+        ["wmic", "cpu", "get", "ProcessorId", "/value"],
     ):
         try:
             result = subprocess.run(
@@ -83,13 +85,29 @@ def _cpu_id() -> str:
                 line = line.split("=", 1)[1].strip()
             if re.fullmatch(r"[0-9A-Fa-f]{8,32}", line):
                 return line.upper()
-    raise RuntimeError("无法获取 CPU ProcessorId（wmic 与 PowerShell 均失败）")
+    raise RuntimeError("无法获取 CPU ProcessorId（PowerShell CIM 与 wmic 均失败）")
+
+
+#: 机器码进程内缓存（终审修复12：算一次；因子均为机器不变量）
+_CACHE: str | None = None
 
 
 def get_machine_code() -> str:
-    """生成 32 位机器码（小写十六进制）。任一因子失败抛 RuntimeError。"""
-    raw = "|".join([_machine_guid(), _volume_serial(), _cpu_id()])
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+    """生成 32 位机器码（小写十六进制）。任一因子失败抛 RuntimeError；结果缓存。"""
+    global _CACHE
+    if _CACHE is None:
+        raw = "|".join([_machine_guid(), _volume_serial(), _cpu_id()])
+        _CACHE = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+    return _CACHE
+
+
+async def get_machine_code_async() -> str:
+    """异步版：首次计算走 ``asyncio.to_thread``（不阻塞事件循环），命中缓存即返回。"""
+    if _CACHE is not None:
+        return _CACHE
+    import asyncio
+
+    return await asyncio.to_thread(get_machine_code)
 
 
 def is_valid_machine_code(code: str) -> bool:

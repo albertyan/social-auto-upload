@@ -225,6 +225,42 @@ def scenario_log_rotation() -> None:
           f"file={paths.TRAY_LOG_FILE} exists={paths.TRAY_LOG_FILE.is_file()}")
 
 
+# ================================================================ 场景 4b（终审修复⑦）
+
+
+def scenario_sanitize() -> None:
+    print("\n==== 场景4b：日志脱敏（§3.8 第 3 条，终审修复⑦） ====", flush=True)
+    m = logutil.mask_sensitive
+    check("脱敏：凭证键值只记长度 / Bearer 整体掩码",
+          m("token=abcdef123456 done") == "token=***len=12 done"
+          and m("Authorization: Bearer abcdefgh12345678")
+          == "Authorization: Bearer ***",
+          f"sample={m('token=abcdef123456 done')!r}")
+    check("脱敏：手机号中段掩码 / 签名 URL 去 query",
+          m("phone 13812345678") == "phone 138****5678"
+          and m("u https://cdn.x.com/f.mp4?Signature=abc&Expires=1")
+          == "u https://cdn.x.com/f.mp4?<masked>",
+          f"phone={m('phone 13812345678')!r}")
+
+    # 端到端：经 setup_logger 句柄落盘的记录不含明文凭证（含 [AUDIT] 行）
+    logf = paths.LOGS_DIR / "sanitize_check.log"
+    try:
+        logf.unlink()
+    except OSError:
+        pass
+    lg = logutil.setup_logger("sau.verify5.sanitize", logf)
+    lg.info("[AUDIT] op=bind detail=token=aaaa1111bbbb2222")
+    lg.info("ws headers Authorization: Bearer SECRETSECRET123456")
+    for h in lg.handlers:
+        h.flush()
+    content = logf.read_text(encoding="utf-8")
+    check("落盘日志不含明文凭证（含 [AUDIT] 行，句柄过滤器生效）",
+          "aaaa1111bbbb2222" not in content
+          and "SECRETSECRET123456" not in content
+          and "***len=16" in content and "Bearer ***" in content,
+          "明文泄露检查 + 掩码存在检查")
+
+
 # ================================================================ 场景 5
 
 
@@ -293,6 +329,64 @@ def _find_dead_port() -> int:
         return s.getsockname()[1]  # 绑定后立即释放 → 大概率无人监听
 
 
+def scenario_encoding_guard() -> None:
+    print("\n==== 场景4c：入口级编码加固（终审追加：GBK 崩溃根治） ====", flush=True)
+    import io as _io
+
+    from sau_wrap import entry as entry_mod
+
+    raw = "中文与特殊字符: ①② \u00b2 \u2713 \u00b0 emoji \U0001f600"
+
+    # 模拟 GBK 终端流：非 CP936 字符 encode 抛 UnicodeEncodeError（真机崩溃形态）
+    fake = _io.TextIOWrapper(_io.BytesIO(), encoding="gbk")
+    crashed_before = False
+    try:
+        fake.write(raw)
+        fake.flush()
+    except UnicodeEncodeError:
+        crashed_before = True
+
+    old_out = sys.stdout
+    sys.stdout = fake
+    try:
+        entry_mod.harden_stdio_encoding()  # 加固本身不得抛异常（流已是 gbk 包裹）
+        crashed_after = False
+        try:
+            print(raw)
+            sys.stdout.flush()
+        except UnicodeEncodeError:
+            crashed_after = True
+    finally:
+        sys.stdout = old_out
+    check("加固前 GBK 流对非 CP936 字符抛 UnicodeEncodeError（复现真机崩溃）",
+          crashed_before, "stream encoding=gbk")
+    check("加固后 中文+特殊字符（U+00B2/U+2713/U+00B0/emoji）输出不抛异常",
+          crashed_before and not crashed_after,
+          f"before_crash={crashed_before} after_crash={crashed_after}")
+
+    # 哑流（服务 Session 0 无控制台 / 重定向场景）：无 reconfigure 不得新崩
+    class _Dummy:
+        def write(self, s):
+            return len(s)
+
+        def flush(self):
+            pass
+
+    sys.stdout = _Dummy()  # type: ignore[assignment]
+    old_err = sys.stderr
+    sys.stderr = None      # type: ignore[assignment]（None 流分支）
+    try:
+        entry_mod.harden_stdio_encoding()
+        dummy_ok = True
+    except Exception:  # noqa: BLE001
+        dummy_ok = False
+    finally:
+        sys.stdout = old_out
+        sys.stderr = old_err
+    check("哑流/None 流（服务 Session 0 与重定向场景）：加固不抛异常",
+          dummy_ok, "dummy+None stream")
+
+
 def main() -> int:
     dead_port = _find_dead_port()
     server, port = start_mock_status()
@@ -301,6 +395,8 @@ def main() -> int:
         scenario_tracker()
         scenario_mutex()
         scenario_log_rotation()
+        scenario_sanitize()
+        scenario_encoding_guard()
         scenario_urls_and_tooltip()
         scenario_icons()
     finally:

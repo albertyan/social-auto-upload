@@ -23,8 +23,12 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
+
+_LOGGER = logging.getLogger("sau.login_adapt")
 
 #: 上游短信输入框选择器（与上游 _wait_for_douyin_login / 发布流程同源）
 _SMS_INPUT_SELECTOR = (
@@ -38,8 +42,21 @@ _CODE_WAIT_TIMEOUT = 120.0
 
 @asynccontextmanager
 async def douyin_sms_bridge(session):
-    """会话期替换上游等待函数（结束必还原，含异常路径）。"""
+    """会话期替换上游等待函数（结束必还原，含异常路径）。
+
+    **签名守卫（终审修复⑩）**：进入桥接前断言上游四个私有符号存在且签名兼容；
+    不匹配则**放弃桥接**并 WARN 提示人工升级包装层——上游等待逻辑照常运行，
+    不带错运行（短信二验路径退化为上游默认行为：记日志等待手动输入）。
+    """
     from uploader.douyin_uploader import main as dm  # noqa: PLC0415
+
+    issues = upstream_compat_issues(dm)
+    if issues:
+        _LOGGER.warning(
+            "短信二验适配失效，请人工升级包装层：上游私有符号不兼容 %s", issues,
+        )
+        yield
+        return
 
     original = dm._wait_for_douyin_login
     dm._wait_for_douyin_login = _make_adapted_wait(session, dm)
@@ -47,6 +64,37 @@ async def douyin_sms_bridge(session):
         yield
     finally:
         dm._wait_for_douyin_login = original
+
+
+def upstream_compat_issues(dm) -> list[str]:
+    """断言桥接依赖的四个上游私有符号存在且签名兼容，返回问题清单（空=兼容）。
+
+    兼容判据（均以本模块实际调用形态为准）：
+    - ``_wait_for_douyin_login(page, account_file, qrcode_info)``：位置绑定可行，
+      且适配版同名替换可保证上游按关键字调用时不破坏；
+    - ``_is_douyin_login_completed(page)`` / ``_build_login_result(...5位置参)`` /
+      ``_save_douyin_qrcode(page, account_file, qrcode_path)``：位置绑定可行。
+    """
+    issues: list[str] = []
+    checks = (
+        ("_wait_for_douyin_login", (None, None, None)),
+        ("_is_douyin_login_completed", (None,)),
+        ("_build_login_result", (None, None, None, None, None)),
+        ("_save_douyin_qrcode", (None, None, None)),
+    )
+    for name, sample_args in checks:
+        fn = getattr(dm, name, None)
+        if fn is None:
+            issues.append(f"缺少符号 {name}")
+            continue
+        if not callable(fn):
+            issues.append(f"{name} 不可调用")
+            continue
+        try:
+            inspect.signature(fn).bind(*sample_args)
+        except TypeError as exc:
+            issues.append(f"{name} 签名不兼容: {exc}")
+    return issues
 
 
 def _make_adapted_wait(session, dm):

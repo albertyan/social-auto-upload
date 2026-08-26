@@ -90,6 +90,7 @@ INCLUDE_MODULES = (
     "win32api", "win32service", "win32serviceutil", "win32event",
     "win32con", "win32security", "win32process", "pywintypes",
     "servicemanager", "conf",  # conf：uploader 运行期 `from conf import …`
+    "sau_cli",  # 平台 CLI 透传（终审修复⑥）：entry 经 cli_bridge import 调用其 main
 )
 
 #: 体积优化排除清单（§8.6 手段②，逐条依据）
@@ -110,11 +111,9 @@ EXCLUDES = (
     # 旧前端/托盘目录（冲突 1 定案不复用；sau_tray 已由 sau_wrap/tray 替代）
     "sau_frontend", "sau_backend", "sau_tray",
     # 体积裁剪（首构建 400MB 实测后追加，§8.6）：
-    # cv2（98.6MB）：仅上游 utils/login_qrcode.py 登录二维码链路引用，
-    # 登录会话族不在包装层承载范围（/login 501 占位，§6.5 留后续步骤）
-    "cv2",
-    # numpy（~26MB）：仅作为 cv2 伴生依赖存在，上游上传链路无直接引用
-    "numpy",
+    # 注意（终审修复②）：cv2/numpy **不得排除**——上游四大平台上传器模块顶层
+    # `import cv2`（兼带 numpy），排除后冻结产物四平台上传与登录在 import 期即崩；
+    # 属上游隐性依赖，必须随包（BUILD_ENV.md 已固化此纪律）。
     # stream_gears（32.5MB）：biliup 内部推流依赖；biliup 经独立二进制调用，
     # Python 包不进产物（见 INCLUDE_PACKAGES 注释）
     "stream_gears",

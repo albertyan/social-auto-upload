@@ -21,6 +21,13 @@
 :func:`real_executors`；开发验证（无服务注册、无安装器）注入假执行器。
 真机全链路验证留待 S8 打包步骤后（runner 副本形态见 §7.4 端到端链路）。
 
+**runner 副本移交**（终审修复⑧；§7.4 步骤 6-7）：服务进程收到 apply 后
+仅做移交——拷贝自身至 ``updates/runner/`` 并以脱离进程树标志拉起 runner 副本
+（隐藏子命令 ``service upgrade-run``），由 runner 执行停服/备份/安装/启服/
+校验/回滚全流程（服务自身将在 [1/6] 被停掉，编排不能跑在被停的进程里）；
+服务侧置 ``applying`` 即返回。执行器未提供 ``spawn_runner``（假执行器）时
+退回进程内六步全流程（测试路径不变）。
+
 **启动自检三分支**（§15.2，断电/崩溃自动收敛）：见 :func:`startup_selfcheck`。
 """
 
@@ -76,6 +83,9 @@ class UpgradeExecutor:
     #: 安装目录推导（真实：服务注册表 ImagePath，回退 %ProgramFiles%\\SAU）
     resolve_install_dir: Callable[[], Path] = field(
         default=lambda: Path(r"C:\Program Files\SAU"))
+    #: runner 副本移交（终审修复⑧，§7.4 步骤 6-7）：拷贝自身 + 脱离进程树拉起
+    #: ``(installer, target_version) -> bool``；None = 测试/假执行器，进程内全流程。
+    spawn_runner: Callable[[Path, str], bool] | None = None
 
 
 class Orchestrator:
@@ -136,6 +146,23 @@ class Orchestrator:
             return {"ok": False, "phase": up.state.get("phase"), "error": err}
         if up.state.get("phase") != "applying":
             up.set_phase("applying", error=None)  # 幂等：端点已同步置过则不重写
+        # runner 副本移交（终审修复⑧）：服务侧仅拷贝+拉起+置 applying，
+        # 全流程（停服/备份/安装/启服/校验/回滚）由 runner 进程执行。
+        if ex.spawn_runner is not None:
+            try:
+                spawned = bool(ex.spawn_runner(installer, str(target)))
+            except Exception:
+                self._logger.exception("runner 副本移交异常")
+                spawned = False
+            if not spawned:
+                up.set_phase("failed",
+                             error=f"runner 副本拉起失败，升级中止。"
+                                   f"{MANUAL_RESCUE_GUIDE}")
+                return {"ok": False, "phase": "failed",
+                        "error": "runner 副本拉起失败"}
+            self._logger.info("升级已移交 runner 副本（目标版本=%s），"
+                              "服务侧保持 applying 等待编排结果", target)
+            return {"ok": True, "phase": "applying", "handoff": "runner"}
         install_dir = ex.resolve_install_dir()
         backup = up.backup_dir()
         steps = (
@@ -303,14 +330,33 @@ def _run(argv: list[str], ok_exit=frozenset({0})) -> bool:
     return proc.returncode in ok_exit
 
 
+def read_local_token() -> str:
+    """现读本地令牌文件（终审修复①：升级编排令牌快照失效）。
+
+    服务重启后令牌轮换（每次启动重新生成，§3.6），构造期持有的旧令牌
+    在 [6/6] 校验与回滚二次校验时必然 401 → 真实升级被误判失败回滚。
+    故校验每次现读文件（旧进程线程可读新进程写好的文件）；文件缺失/
+    不可读时返回空串（由调用方按无令牌处理）。
+    """
+    try:
+        return paths.LOCAL_TOKEN_FILE.read_bytes().decode("utf-8").strip()
+    except OSError:
+        return ""
+
+
 def real_executors(logger: logging.Logger,
-                   port: int = 5409, token: str = "") -> UpgradeExecutor:
+                   port: int = 5409,
+                   token_provider: Callable[[], str] | None = None) -> UpgradeExecutor:
     """真实执行器（SYSTEM 上下文，无 UAC；开发环境不会触发，仅供真机）。
 
-    注：``/status`` 校验走本地令牌鉴权；安装器为 Inno Setup 产物，
-    ``/SILENT /SUPPRESSMSGBOXES /NORESTART /LOG``（§7.4 步骤 4）。
+    注：``/status`` 校验走本地令牌鉴权，令牌经 ``token_provider`` **每次现读**
+    （默认 :func:`read_local_token`；终审修复①：不再接受构造期令牌快照）；
+    安装器为 Inno Setup 产物，``/SILENT /SUPPRESSMSGBOXES /NORESTART /LOG``
+    （§7.4 步骤 4）。
     """
     import subprocess
+
+    provider = token_provider or read_local_token
 
     def stop_service() -> bool:
         try:
@@ -360,11 +406,28 @@ def real_executors(logger: logging.Logger,
                     ok_exit=frozenset(range(8)))
 
     def kill_tray() -> bool:
-        # 托盘进程命令行含 "sau.exe tray" 子命令；服务主体在 [1/6] 已停，
-        # 按 CommandLine 过滤避免误杀（无匹配时 WMIC 亦返回 0，幂等容忍）
-        return _run(["wmic", "process", "where",
-                     "CommandLine like '%sau.exe%tray%' and Name like '%.exe'",
-                     "delete"], ok_exit=frozenset({0}))
+        # 终审修复14：弃用 WMIC（新版 Windows 可移除的弃用组件）——改 PowerShell
+        # CIM 按 CommandLine 含 'tray' 判别托盘实例（服务主体命令行为 'sau.exe agent'
+        # 不含 'tray'，且 [1/6] 已停服，不会误杀），再逐个 taskkill；
+        # 无匹配返回 True（幂等容忍）。
+        import subprocess as _sp
+        try:
+            proc = _sp.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "Get-CimInstance Win32_Process -Filter \"Name='sau.exe'\" | "
+                 "Where-Object { $_.CommandLine -match 'tray' } | "
+                 "ForEach-Object { $_.ProcessId }"],
+                capture_output=True, text=True, timeout=30,
+                creationflags=getattr(_sp, "CREATE_NO_WINDOW", 0))
+        except (OSError, _sp.TimeoutExpired):
+            return False
+        pids = [ln.strip() for ln in (proc.stdout or "").splitlines()
+                if ln.strip().isdigit()]
+        ok = True
+        for pid in pids:  # 128 = 进程已不存在，幂等容忍
+            ok = _run(["taskkill", "/F", "/PID", pid],
+                      ok_exit=frozenset({0, 128})) and ok
+        return ok
 
     def run_installer(installer: Path) -> bool:
         from sau_wrap import paths
@@ -372,14 +435,71 @@ def real_executors(logger: logging.Logger,
         return _run([str(installer), "/SILENT", "/SUPPRESSMSGBOXES",
                      "/NORESTART", f"/LOG={log}"], ok_exit=frozenset({0, 1}))
 
+    def spawn_runner(installer: Path, target_version: str) -> bool:
+        """拷贝自身到 ``updates/runner/`` 并脱离进程树拉起（§7.4 步骤 6-7，
+        终审修复⑧）。
+
+        **设计偏差（已汇报）**：设计原文写「拷贝自身到 updates/runner/sau.exe」
+        （单文件）；但 Nuitka standalone 产物为**目录形态**（sau.exe + 同目录运行时依赖），
+        单文件拷贝无法运行，故按最接近设计的方式实现：冻结形态整目录镜像拷贝到
+        ``updates/runner/``（robocopy，与备份同工具链），再拉起其中 ``sau.exe``；
+        源码开发形态直接以同一解释器跑 ``sau_wrap/__main__.py``（无拷贝）。
+        拉起标志：``DETACHED_PROCESS | CREATE_BREAKAWAY_FROM_JOB``（脱离服务进程树、
+        避免被 Job 对象连坐终止；服务停机时 runner 不受影响）。
+        """
+        import os
+        import subprocess
+        import sys
+
+        runner_dir = paths.UPDATES_DIR / "runner"
+        try:
+            paths.ensure_dir(runner_dir)
+            if paths.is_frozen():
+                install_dir = resolve_install_dir()
+                if not _run(["robocopy", str(install_dir), str(runner_dir),
+                             "/E", "/PURGE", "/R:1", "/W:1",
+                             "/NFL", "/NDL", "/NP"],
+                            ok_exit=frozenset(range(8))):
+                    logger.error("runner 副本拷贝失败（robocopy exit>=8）")
+                    return False
+                exe = runner_dir / "sau.exe"
+                if not exe.is_file():
+                    logger.error("runner 副本可执行文件缺失：%s", exe)
+                    return False
+                argv = [str(exe), "service", "upgrade-run",
+                        f"--installer={installer}",
+                        f"--target-version={target_version}"]
+            else:
+                entry = Path(__file__).resolve().parents[1] / "__main__.py"
+                argv = [sys.executable, str(entry), "service", "upgrade-run",
+                        f"--installer={installer}",
+                        f"--target-version={target_version}"]
+            flags = 0
+            if os.name == "nt":
+                # DETACHED_PROCESS=0x8；CREATE_BREAKAWAY_FROM_JOB=0x01000000
+                flags = 0x00000008 | 0x01000000
+            subprocess.Popen(argv, creationflags=flags,
+                             stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+            logger.info("runner 副本已拉起：%s", argv[0])
+            return True
+        except OSError as exc:
+            logger.error("runner 副本移交失败：%s", exc)
+            return False
+
     def verify(target: str) -> bool:
-        """轮询 ``GET /status``（60s 窗口 3s 轮询）：200 且 version==目标。"""
+        """轮询 ``GET /status``（60s 窗口 3s 轮询）：200 且 version==目标。
+
+        令牌每次轮询现读文件（终审修复①）：覆盖「校验期间服务重启导致令牌轮换」
+        场景（[5/6] 启服后新进程已写好新令牌）。
+        """
         deadline = time.monotonic() + VERIFY_WINDOW_SECONDS
         while time.monotonic() < deadline:
             try:
                 req = urllib.request.Request(
                     f"http://127.0.0.1:{port}/status",
-                    headers={"X-SAU-Local-Token": token})
+                    headers={"X-SAU-Local-Token": provider()})
                 with urllib.request.urlopen(req, timeout=2) as resp:
                     if resp.status == 200:
                         body = json.loads(resp.read().decode("utf-8"))
@@ -399,4 +519,5 @@ def real_executors(logger: logging.Logger,
         restore_backup=restore,
         verify=verify,
         resolve_install_dir=resolve_install_dir,
+        spawn_runner=spawn_runner,
     )

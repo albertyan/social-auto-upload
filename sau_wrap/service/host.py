@@ -76,8 +76,9 @@ def _run_agent_blocking(logger, request_async_stop) -> None:
                 after_task_hook=client.send_account_sync,  # 任务结束后同步账号快照
             )
             client.attach_dispatcher(dispatcher)
-            # S7：升级状态机（通知校验/后台下载/八态持久化）+ 启动清理（>24h）
-            updater = Updater(logger)
+            # S7：升级状态机（通知校验/后台下载/八态持久化）+ 启动清理（>24h）；
+            # stop_check 接线停机标志，下载分块循环可被停机打断（终审修复⑬）
+            updater = Updater(logger, stop_check=stop_event.is_set)
             updater.cleanup_expired()
             client.attach_updater(updater)
             api = LocalApiServer(logger, client, port, updater=updater)
@@ -88,10 +89,10 @@ def _run_agent_blocking(logger, request_async_stop) -> None:
                 # 排障依 service.log 与 doctor。
                 api = None
             # S7：编排器（真实执行器；开发验证可注入假执行器）+ 启动自检三分支
-            # （§15.2：断电/崩溃场景自动收敛；需先有令牌供校验轮询）
+            # （§15.2：断电/崩溃场景自动收敛；校验令牌每次现读文件，终审修复①）
             orch = Orchestrator(
                 logger, updater,
-                real_executors(logger, port, api.token if api else ""),
+                real_executors(logger, port),
                 local_api_port=port)
             if api is not None:
                 api.attach_orchestrator(orch)

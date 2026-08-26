@@ -12,6 +12,7 @@ from sau_wrap.upgrade.orchestrator import (  # noqa: F401
     MANUAL_RESCUE_GUIDE,
     Orchestrator,
     UpgradeExecutor,
+    read_local_token,
     real_executors,
     resolve_install_dir,
 )

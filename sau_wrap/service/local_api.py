@@ -447,7 +447,7 @@ class LocalApiServer:
         from sau_wrap.agent.machine import get_machine_code
 
         try:
-            code = get_machine_code()
+            code = await asyncio.to_thread(get_machine_code)  # 终审修复12：首算不阻塞事件循环（结果缓存）
         except RuntimeError as exc:
             return web.json_response(
                 {"error": "machine_code_unavailable", "message": str(exc)}, status=503)
@@ -613,6 +613,10 @@ class LocalApiServer:
             pass
         try:
             session = await self._login_manager.create(platform, account_name)
+        except ls.LoginInvalidNameError as exc:
+            # 终审修复④：account_name 路径穿越防护（白名单净化）
+            return web.json_response(
+                {"error": "invalid_account_name", "message": str(exc)}, status=400)
         except ls.LoginPlatformUnsupportedError as exc:
             return web.json_response(
                 {"error": "platform_unsupported", "message": str(exc)}, status=400)
@@ -718,7 +722,21 @@ class LocalApiServer:
         if not platform or not account:
             return web.json_response(
                 {"error": "platform_and_account_required"}, status=400)
-        target = paths.COOKIES_DIR / f"{platform}_{account}.json"
+        # 终审修复③：白名单净化 + 拼接后落点校验双保险，防路径穿越
+        from sau_wrap.service.login_sessions import (  # noqa: PLC0415
+            sanitize_fs_name,
+        )
+        if sanitize_fs_name(platform) is None or sanitize_fs_name(account) is None:
+            return web.json_response(
+                {"error": "invalid_name",
+                 "message": "platform/account 含非法字符"
+                            "（仅允许字母/数字/_/./-，长度 1-64）"},
+                status=400)
+        cookies_root = paths.COOKIES_DIR.resolve()
+        target = (paths.COOKIES_DIR / f"{platform}_{account}.json").resolve()
+        if not target.is_relative_to(cookies_root):  # 双保险（白名单已拦住）
+            return web.json_response(
+                {"error": "invalid_name", "message": "非法路径"}, status=400)
         if target.is_file():
             try:
                 target.unlink()

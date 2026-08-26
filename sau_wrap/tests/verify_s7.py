@@ -45,6 +45,7 @@ os.environ["SAU_DATA_ROOT"] = os.path.join(_HERE, "_tmpdata7")
 
 from aiohttp import web                                   # noqa: E402
 from sau_wrap import paths                                # noqa: E402
+from sau_wrap.agent import db as db_mod                   # noqa: E402
 from sau_wrap.agent import ws_client as ws_mod            # noqa: E402
 from sau_wrap.service.local_api import LocalApiServer     # noqa: E402
 from sau_wrap.upgrade import orchestrator as orch_mod     # noqa: E402
@@ -104,6 +105,7 @@ def fresh_env() -> None:
             pass
     shutil.rmtree(_TMP / "etc", ignore_errors=True)
     shutil.rmtree(_TMP / "updates", ignore_errors=True)
+    db_mod.db_init()  # /status 依赖 local_tasks 表（每场景保证就绪）
 
 
 def mk_updater(name: str, schemes=("http", "https"), **kw) -> Updater:
@@ -136,6 +138,10 @@ def scenario_validate() -> None:
           and version_gt("2.0.0a0", "2.0.0") is False
           and version_gt("2.0.0b1", "2.0.0a0") is True,
           "预发布后缀比较")
+    check("版本比较：预发布数字段按数值比（终审修复14：a10>a9）",
+          version_gt("2.0.0a10", "2.0.0a9") is True
+          and version_gt("2.0.0a9", "2.0.0a10") is False,
+          "2.0.0a10>2.0.0a9 严格大于")
     check("版本比较：非法版本返回 None",
           version_gt("abc", "1.0.0") is None
           and version_gt("1.0", "1.0.0") is None, "非语义化拒绝")
@@ -633,6 +639,147 @@ async def scenario_endpoints() -> None:
         await api.stop()
 
 
+# ================================================================ 场景 9（终审修复①）
+
+
+async def scenario_token_rotation() -> None:
+    print("\n==== 场景9：升级校验令牌现读（终审修复①回归） ====", flush=True)
+    fresh_env()
+    logger, _ = make_logger("tok")
+    stop_event, resume_event = asyncio.Event(), asyncio.Event()
+    client = ws_mod.WSClient(logger, stop_event, resume_event)
+    api = LocalApiServer(logger, client, free_port())
+    await api.start()
+    try:
+        import urllib.request
+        from sau_wrap.version import APP_VERSION
+
+        old_token = api.token
+        # 模拟服务重启令牌轮换（§3.6：每次启动重新生成并落盘）
+        api._regenerate_token()  # noqa: SLF001（测试专用）
+        new_token = paths.LOCAL_TOKEN_FILE.read_bytes().decode("utf-8").strip()
+        check("令牌轮换：新令牌已落盘，read_local_token 现读即新值",
+              new_token != old_token and orch_mod.read_local_token() == new_token,
+              f"old[:8]={old_token[:8]} new[:8]={new_token[:8]}")
+
+        # 反证：构造期旧快照令牌在轮换后必然 401（快照方案的死穴）
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{api.port}/status",
+            headers={"X-SAU-Local-Token": old_token})
+        try:
+            with urllib.request.urlopen(req, timeout=2) as resp:
+                old_ok = resp.status == 200
+        except Exception:
+            old_ok = False
+        check("旧快照令牌请求 /status → 401（快照方案必败）", old_ok is False,
+              "urlopen 抛 401 或非 200")
+
+        # 修复语义：每次现读文件 → 轮换后校验仍通过（首轮命中，不等满窗口）
+        # verify 为阻塞轮询（生产由编排线程调用），测试内经 to_thread 执行，
+        # 避免阻塞事件循环导致 aiohttp 无法应答。
+        ex = orch_mod.real_executors(logger, api.port,
+                                     token_provider=orch_mod.read_local_token)
+        ok = await asyncio.to_thread(ex.verify, APP_VERSION)
+        check("令牌轮换后 verify（每次现读文件）仍通过", ok is True,
+              f"target={APP_VERSION} verify={ok}")
+    finally:
+        await api.stop()
+
+
+# ================================================================ 场景 10（终审修复⑤）
+
+
+def scenario_restart_downloading() -> None:
+    print("\n==== 场景10：downloading 重启重置（终审修复⑤回归） ====", flush=True)
+    fresh_env()
+    write_config(whitelist=["127.0.0.1"])
+    name = "restart"
+    state_file = _TMP / "etc" / f"upgrade_state-{name}.json"
+    updates_dir = _TMP / "updates" / name
+    paths.ensure_dir(state_file.parent)
+    paths.ensure_dir(updates_dir)
+    # 模拟上次服务在下载中崩溃：状态停留 downloading + 残留 .part 临时文件
+    state_file.write_text(json.dumps({
+        "phase": "downloading", "version": "9.9.9",
+        "download_url": "https://127.0.0.1/pkg/sau-9.9.9.exe",
+        "file_hash": PAYLOAD_HASH, "installer_path": None,
+        "downloaded_bytes": 1234, "total_bytes": 99999,
+        "verified": False, "error": None, "last_rejected": None,
+        "updated_at": time.time()}), encoding="utf-8")
+    part = updates_dir / "sau-9.9.9.exe.part"
+    part.write_bytes(b"partial")
+
+    up = mk_updater(name)
+    check("重启时 downloading 状态自动重置为 noticed",
+          up.state["phase"] == "noticed"
+          and up.state.get("version") == "9.9.9"
+          and "重置" in str(up.state.get("error") or ""),
+          f"phase={up.state['phase']} version={up.state.get('version')}")
+    check("未完成 .part 临时文件已清理", not part.exists(),
+          f"part exists={part.exists()}")
+
+    # 卡死根因反证修复：重置后可重新受理新通知（此前 downloading 态永被忽略）
+    accepted = up.handle_notice(notice("127.0.0.1", 8080, version="9.9.9"))
+    check("重置后 handle_notice 可再次受理（升级通道不再卡死）",
+          accepted is True and up.state["phase"] == "noticed",
+          f"accepted={accepted} phase={up.state['phase']}")
+
+
+# ================================================================ 场景 11（终审修复⑧）
+
+
+def scenario_runner_handoff() -> None:
+    print("\n==== 场景11：runner 副本移交与执行（终审修复⑧回归） ====", flush=True)
+    fresh_env()
+    logger, _ = make_logger("runner")
+
+    # ① 服务侧移交：执行器带 spawn_runner → 服务侧仅移交置 applying，不执行六步
+    up1 = ready_updater("h1")
+    spawned: list = []
+
+    def ok_spawn(installer: Path, target: str) -> bool:
+        spawned.append((str(installer), target))
+        return True
+
+    ex1 = fake_exec_of(FakeExecutor())
+    ex1.spawn_runner = ok_spawn
+    o1 = Orchestrator(logger, up1, ex1)
+    r1 = o1.apply()
+    check("服务侧移交：仅拉起 runner + 置 applying（六步不在服务进程执行）",
+          r1 == {"ok": True, "phase": "applying", "handoff": "runner"}
+          and spawned and spawned[0][1] == "9.9.9"
+          and up1.state["phase"] == "applying",
+          f"resp={r1} spawned={spawned}")
+
+    # ② spawn_runner 失败 → failed + 救援指引（不进入六步）
+    up2 = ready_updater("h2")
+    ex2 = fake_exec_of(FakeExecutor())
+    ex2.spawn_runner = lambda installer, target: False
+    r2 = Orchestrator(logger, up2, ex2).apply()
+    check("移交失败 → failed（升级中止，附人工救援指引）",
+          r2["ok"] is False and r2["phase"] == "failed"
+          and up2.state["phase"] == "failed"
+          and "手动下载安装包" in str(up2.state.get("error") or ""),
+          f"resp={r2}")
+
+    # ③ runner 侧：run_upgrade 注入假执行器走全流程（含防递归移交验证）
+    up3 = ready_updater("h3")
+    up3.set_phase("applying")  # 服务侧移交后置位，runner 复用同一状态机继续
+    f3 = FakeExecutor()
+    ex3 = fake_exec_of(f3)
+    spawn_calls: list = []
+    ex3.spawn_runner = lambda installer, target: spawn_calls.append(1) or True
+    from sau_wrap.upgrade import runner as runner_mod
+    r3 = runner_mod.run_upgrade("ignored", "9.9.9",
+                                executor=ex3, updater=up3, logger=logger)
+    check("runner 侧全流程成功（防递归移交：spawn_runner 已置空未调）",
+          r3["phase"] == "success" and up3.state["phase"] == "success"
+          and f3.calls == ["stop_service", "backup_dir", "kill_tray",
+                           "run_installer", "start_service", "verify"]
+          and not spawn_calls,
+          f"resp={r3} calls={f3.calls} spawn_calls={spawn_calls}")
+
+
 # ================================================================ main
 
 
@@ -644,6 +791,9 @@ async def amain() -> int:
     scenario_selfcheck()
     scenario_cleanup()
     await scenario_endpoints()
+    await scenario_token_rotation()
+    scenario_restart_downloading()
+    scenario_runner_handoff()
     failed = [r for r in RESULTS if r.startswith("[FAIL]")]
     print(f"\n==== 汇总：{len(RESULTS) - len(failed)}/{len(RESULTS)} 通过 ====",
           flush=True)

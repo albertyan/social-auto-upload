@@ -21,7 +21,9 @@
 - `CCACHE_DISABLE=1` + `--disable-cache=all`：禁缓存读写，产物可复现；
 - `--assume-yes-for-downloads`：编译器缺失由 Nuitka 自动拉取（构建内行为）；
 - `--remove-output`：清理 `*.build` 中间残留；
-- patchright driver 经 `--include-package-data=patchright` 单份进产物。
+- patchright driver 经 `--include-package-data=patchright` 单份进产物；
+- **上游隐性依赖 cv2/numpy 必须随包**（终审修复②固化纪律）：上游四大平台上传器模块顶层 `import cv2`（兼带 numpy），属上游隐性依赖，**禁止**列入 `EXCLUDES`；构建 venv 必须装有 `opencv-python` 与 `numpy`（缺失时 `uv pip install`）；冻结产物构建后必须做四平台关键 import 烟测；
+- **版本纪律（硬约束）**：正式发布版本禁带预发布后缀（`SAU_VERSION=x.y.z` 纯三段）；开发基线可用 `a/b/rc` 后缀（如 2.0.0a0）。
 
 ## 产物
 
@@ -40,8 +42,8 @@
 | 项 | 体积 | 处置 | 依据 |
 | --- | --- | --- | --- |
 | playwright 浏览器二进制 | +100MB | `--disable-plugin=playwright` | 内核走 `browser install` 独立安装（§8.7）；playwright 本体（driver）保留，上游 baijiahao 仍引 `playwright.async_api` |
-| cv2 | 98.6MB | `--nofollow-import-to=cv2` | 仅 `utils/login_qrcode.py` 登录二维码链路引用；登录会话族不在包装层承载（/login 501 占位，§6.5） |
-| numpy | ~26MB | `--nofollow-import-to=numpy` | 仅作为 cv2 伴生依赖；全仓 grep 无直接引用 |
+| cv2 | 98.6MB | **禁排除（终审修复②改判）** | 初判仅登录二维码链路引用；终审发现上游四大平台上传器模块顶层 `import cv2`，排除后冻结产物四平台上传与登录 import 期即崩 → 已恢复随包 |
+| numpy | ~26MB | **禁排除（同上）** | cv2 伴生依赖，随 cv2 一并恢复随包 |
 | stream_gears | 32.5MB | `--nofollow-import-to=stream_gears` | biliup 内部推流依赖；biliup 经独立二进制调用（上游 `run_biliup_command` 纯 subprocess，首次使用按需下载） |
 | biliup 包 | — | 移出 `INCLUDE_PACKAGES` | 同上；包进产物会带入无效依赖链 |
 

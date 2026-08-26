@@ -190,6 +190,25 @@ def _check_disk() -> tuple[str, str]:
     return "OK", f"{paths.DATA_ROOT.drive or 'C:'} 剩余 {_fmt_bytes(free)}"
 
 
+def _check_ws_transport() -> tuple[str, str]:
+    """WS 传输加密检查（终审修复14：ws:// 明文连接提示生产建议 wss）。"""
+    from sau_wrap.agent import config as agent_config  # noqa: PLC0415
+
+    try:
+        cfg = agent_config.load_config()
+    except Exception:  # noqa: BLE001
+        return "WARN", "config.json 读取失败，跳过传输加密检查"
+    if cfg is None:
+        return "WARN", "未绑定（config.json 不存在），跳过传输加密检查"
+    url = str(getattr(cfg, "server_url", "") or "")
+    if url.startswith("ws://"):
+        return "WARN", (f"服务端为 ws:// 明文连接（{url}），"
+                        "生产环境建议改用 wss:// 加密传输")
+    if url.startswith("wss://"):
+        return "OK", f"服务端为 wss:// 加密连接（{url}）"
+    return "WARN", f"server_url 协议不可识别：{url}"
+
+
 def _check_logs() -> tuple[str, str]:
     lines: list[str] = []
     for name, f in (("service.log", paths.SERVICE_LOG_FILE),
@@ -231,6 +250,7 @@ def run() -> int:
     for lvl, detail in port_out:
         add(f"② 端口 {port}", lvl, detail)
     add("③ WS 连接", *_check_ws(status))
+    add("③2 WS 传输加密", *_check_ws_transport())
     add("④ Agent 凭证", *_check_credential(status))
     add("⑤ 浏览器内核", *_check_browser())
     add("⑥ 数据目录可写", *_check_writable())
