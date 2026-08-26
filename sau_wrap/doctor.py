@@ -62,6 +62,34 @@ def _fetch_status(port: int) -> dict | None:
         return None
 
 
+def _check_frozen() -> tuple[str, str]:
+    """运行形态诊断（真机缺陷修复，2026-08-26）。
+
+    Nuitka standalone 产物**不设** ``sys.frozen``，且 ``__compiled__`` 伪模块
+    不进 ``sys.modules``（是模块级全局名）；冻结判定统一走
+    :func:`sau_wrap.paths.is_frozen`。冻结形态的服务 ImagePath 必须指向
+    sau.exe 自身（``"<exe>" agent --startup auto``，exe 取 ``sys.argv[0]``：
+    Nuitka standalone 的 ``sys.executable`` 指向随附 python.exe，不可用），
+    否则 pywin32 会回退查找 ``pythonservice.exe`` 导致注册失败。
+    """
+    frozen = paths.is_frozen()
+    form = "冻结（打包）" if frozen else "源码（开发）"
+    detail = (f"运行形态={form}；sys.frozen={getattr(sys, 'frozen', None)!r}；"
+              f"'__compiled__' in globals()={'__compiled__' in globals()}；"
+              f"sys.executable={sys.executable}；sys.argv[0]={sys.argv[0]}")
+    try:
+        from sau_wrap.service import ops  # noqa: PLC0415
+
+        exe, args = ops.service_image_parts()
+        detail += f"；ImagePath=\"{exe}\" {args}"
+        if frozen and Path(exe).name.lower() != "sau.exe":
+            return "FAIL", detail + "（冻结形态 ImagePath 必须指向 sau.exe 自身）"
+    except Exception as exc:  # noqa: BLE001
+        detail += f"；ImagePath 推导失败：{exc}"
+        return "FAIL", detail
+    return "OK", detail
+
+
 def _check_service() -> tuple[str, str]:
     try:
         import win32service  # noqa: PLC0415
@@ -197,6 +225,7 @@ def run() -> int:
     def add(title: str, level: str, detail: str) -> None:
         results.append((level, title, detail))
 
+    add("0. 运行形态", *_check_frozen())
     add("① 服务状态", *_check_service())
     port_out, status = _check_port_and_status(port)
     for lvl, detail in port_out:

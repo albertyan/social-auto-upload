@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from sau_wrap import paths
 from sau_wrap.version import APP_VERSION
 
 #: 停服 / 启服等待窗口（秒，任务定义 5）
@@ -263,11 +264,20 @@ class Orchestrator:
 
 def resolve_install_dir() -> Path:
     """安装目录推导（§7.3 要点）：服务注册表 ``ImagePath`` → 回退
-    ``%ProgramFiles%\\SAU``；打包态（sys.frozen）直接取 exe 所在目录。"""
+    ``%ProgramFiles%\\SAU``；打包态（``paths.is_frozen()``，Nuitka 不设
+    ``sys.frozen``）直接取 exe 所在目录。
+
+    冻结形态取 ``sys.argv[0]``（sau.exe 自身）：Nuitka standalone 的
+    ``sys.executable`` 指向随附 ``python.exe``（同目录，兼容但语义不对，
+    与 ops.service_image_parts 的真机缺陷修复同口径）。
+    """
     import sys
 
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
+    if paths.is_frozen():
+        exe = Path(sys.argv[0]).resolve()
+        if not (exe.is_file() and exe.suffix.lower() == ".exe"):
+            exe = Path(sys.executable).resolve().parent / "sau.exe"
+        return exe.parent
     try:
         import winreg
 

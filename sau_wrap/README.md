@@ -1,11 +1,12 @@
-# sau_wrap —— SAU 客户端包装层（S1~S7 已落，S8：打包与分发）
+# sau_wrap —— SAU 客户端包装层（S1~S8 已落，S9：登录扫码会话链路）
 
 按《SAU客户端重建方案-单EXE与包装层设计》实施计划推进：
 单一入口子命令分发 + pywin32 服务宿主 + **Agent WS 主循环（S2）** +
 **5409 本地 API（S3）** + **任务执行核心（S4：dispatcher）** +
 **瘦托盘（S5：pystray）** + **本地 Web 控制台（S6：Vue3 + 静态托管 + 票据/会话鉴权）** +
 **半自动升级编排（S7：八态状态机 + 可注入执行器编排 + 启动自检自愈）** +
-**打包与分发（S8：Nuitka 单 exe + Inno Setup + 哈希发布闭环）**。
+**打包与分发（S8：Nuitka 单 exe + Inno Setup + 哈希发布闭环）** +
+**登录扫码会话链路（S9：登录会话管理器 + 上游登录运行时适配 + 账号端点族）**。
 **上游源码零修改**（只新增本目录；控制台不复用上游 sau_frontend，冲突 1 定案）。
 
 ## 实现状态
@@ -21,7 +22,8 @@
 | 5409 本地 API（S3） | ✅ `GET /status`、`GET/POST /config`、`POST /reload`、`POST /bind`；令牌鉴权；写操作审计；绑定失败明确报错（§4.4） |
 | Web 控制台（S6） | ✅ 静态托管 `/ui/*` + 票据换 Cookie 鉴权 + Nonce 写防护 + 四页面（状态/绑定/账号/升级） |
 | 升级编排（S7） | ✅ `upgrade_notice` 校验（防投毒）+ 后台下载（边下边算 SHA-256/重试/单飞）+ 八态状态机持久化 + `/upgrade` 快照 + `/upgrade/apply`（可注入执行器编排 + 自动回滚）+ `/upgrade/snooze` + 启动自检三分支（§15.2）；真实停服/安装真机验证留待 S8 打包后 |
-| 登录/账号端点 | ⬜ 占位 501（登录会话族 §6.5 留后续步骤） |
+| 登录会话族（S9） | ✅ `POST /login/{platform}` 创建（二维码回调/单会话/5 分钟超时）+ 二维码/状态轮询 + 验证码注入 + 取消；抖音短信二验运行时桥接；成功后落盘→account_sync |
+| 账号端点族（S9） | ✅ `GET /accounts/status`（主目录扫描+基础判定）、`DELETE /accounts`（删除+审计）；`/accounts/recheck` 保留 501 占位（真实浏览器复核后续） |
 | 瘦托盘（S5） | ✅ `sau tray`：三菜单（打开控制台/打开日志目录/退出，无启停）+ `/status` 轮询（5s）+ 图标状态/气泡提示 + Mutex 单实例；「打开控制台」已接票据链路（S6） |
 | `machine-code` | ✅ 真实机器码（SHA-256(MachineGuid+卷序列号+CPU ID) 前 32 位，§5.7） |
 | `bind` | ✅ 写 `config.json` + `credential.bin`（DPAPI LOCAL_MACHINE） |
@@ -56,7 +58,7 @@
   - `POST /bind`：复用 `sau bind` 同一逻辑（config.json + DPAPI 凭证）后热重载；
   - S6 起新增：`GET /ui/*`（静态托管）、`POST /ui-ticket`、`GET /ui/t/<ticket>`、`GET /nonce`、`GET /machine-code`（见下节）；
   - S7 起新增：`GET /upgrade`（只读快照）、`POST /upgrade/apply`（确认编排，写操作走 Nonce 链路）、`POST /upgrade/snooze`（见 S7 节）；
-  - `/login`、`/accounts/*`：占位 501 + 说明（登录会话族留后续步骤）；
+  - S9 起新增：`/login/*` 登录会话族与 `/accounts/*` 账号族（见 S9 节；`/accounts/recheck` 仍 501 占位）；
 - **审计**：绑定/配置写入/热重载在 service.log 记一行 `[AUDIT] op=… source=127.0.0.1 result=… detail=… via=token|cookie`（S6 起附鉴权方式）。
 
 ## S4（任务执行核心）范围与语义（§5.3 流水线 / §4.5 素材重签）
@@ -163,8 +165,29 @@
 - **browser install（§8.7 三层方案）**：默认 npmmirror 镜像（`PLAYWRIGHT_DOWNLOAD_HOST`）+ 官方源，60 秒无输出判卡死自动换源（最多 3 轮）；`--from-file <zip>` 离线安装（兼容两种 zip 布局）；内核统一落 `%ProgramData%\SAU\browsers\`（`entry.py` 顶部 `PLAYWRIGHT_BROWSERS_PATH` setdefault，SYSTEM 服务/托盘/CLI 全路径一致，避免默认 `%USERPROFILE%` 缓存跨会话不一致）；当前 chromium revision 1208；
 - **安装器（sau.iss）**：固定 AppId（新布局自身，支撑覆盖升级 §8.4）；`PrivilegesRequired=admin`；LZMA2 ultra + SolidCompression（§8.6 手段⑤）；首装六步（[Files] 整目录释放 → post_install.bat：数据目录+users-full ACL → VERSION → 服务注册（失败 exit 11 不静默）→ 启动重试 3 次（失败 exit 12）→ HKCU 自启（失败仅记日志，§17 阶段 6））；内核不在安装器内下载（首启按需 §7.3）；覆盖升级 `PrepareToInstall` 停服 + 句柄释放等待 30s；卸载六步（杀托盘/停服/remove+sc delete/删自启项/删程序文件/数据默认保留+勾选全删，§13）；产物命名 `sau-{version}.exe`（与升级链一致）；
 - **哈希发布闭环（§8.5）**：`hash_release.py` 自动计算安装包 64 位小写 SHA-256，输出发布单 `release-manifest.json`（版本/文件名/哈希/下载地址占位）——运营只搬运不手填，管理端 `PUT /sau/upgrade-config` 按发布单填三字段即广播；
-- **doctor 八项（§14）**：服务状态/5409 端口/配置凭证/WS 连通/浏览器内核/数据目录可写/磁盘剩余（<2GB FAIL）/三日志末 20 行；有 FAIL 退出码 1。
-- **验证边界**：本步完成 Nuitka 产物验证（--help/--version/doctor/ui/index.html）与安装包编译实测（ISCC 6.7.3，产物 51.3MB ≤ §8.6 目标 100MB）；真实服务注册/卸载/覆盖升级在干净虚拟环境的验证留待下一步。
+- **冻结形态判定**：统一走 `sau_wrap.paths.is_frozen()`（`"__compiled__" in globals()`：Nuitka 把 `__compiled__` 伪模块注入每个编译模块的模块级全局名，**不进 `sys.modules`**；兼容 `sys.frozen` 兜底）。**不可直接用 `sys.frozen` 或 `"__compiled__" in sys.modules`**：Nuitka standalone 产物不设 `sys.frozen`、伪模块也不在 `sys.modules`（实测 Nuitka 4.1.3），真机缺陷（2026-08-26）即因误判走源码分支构造 `python.exe + __main__.py` 的 ImagePath 导致服务注册失败；另 Nuitka standalone 的 `sys.executable` 指向产物内随附 `python.exe`（非 sau.exe），故冻结形态 ImagePath 一律取 `sys.argv[0]`（即 sau.exe 自身）构造 `"<sau.exe>" agent --startup auto`（SCM 直接拉起自身，无需 pythonservice.exe 代理）；`pythonservice.exe` 仍以 `--include-data-files` 随包同级兜底（pywin32 回退查找路径）；`sau doctor` 首项输出运行形态/ImagePath 诊断；
+- **doctor 九项（§14）**：运行形态（冻结判定 + ImagePath）/服务状态/5409 端口/配置凭证/WS 连通/浏览器内核/数据目录可写/磁盘剩余（<2GB FAIL）/三日志末 20 行；有 FAIL 退出码 1。
+- **验证边界**：本步完成 Nuitka 产物验证（--help/--version/doctor/ui/index.html）与安装包编译实测（ISCC 6.7.3，产物 51.4MB ≤ §8.6 目标 100MB）；2026-08-26 真机缺陷修复（冻结判定改 `__compiled__` + pythonservice.exe 随包）后已重建产物并烟测；真实服务注册/启停/卸载/覆盖升级在干净虚拟环境（或提权）的验证留待下一步。
+
+## S9（登录扫码会话链路）范围与语义（重建方案 §6.5/§3.5）
+
+- **支持平台**：douyin / kuaishou / xiaohongshu / tencent（上游 `*_setup` 原生 `qrcode_callback`）；bilibili（biliup 交互终端）/baijiahao（`page.pause()` 人工介入）/youtube 不支持，创建即 400 附原因说明；
+- **会话管理器**（`service/login_sessions.py`）：每平台单活跃会话（重复创建 409 携带既有 session_id）；状态机 `waiting → need_input（POST code 注入）→ waiting`，终态 `success/failed/timeout/cancelled`；总超时 300s（`asyncio.wait_for` 包裹，异常兜底 failed、取消 cancelled）；终态会话保留 600s 供收尾轮询后逐出；二维码回调兼容 data URL 与文件路径两种载荷；
+- **可注入执行器**：管理器接受 `executor` 注入（verify_s9 全假注入，不真实打开平台页面）；默认 `default_real_executor` 分发四平台，参数 `handle=True, return_detail=True, qrcode_callback=cb, headless=True`，cookie 直写主目录 `%ProgramData%\SAU\cookies\{platform}_{account}.json`（`accounts.py` 双目录兼容扫描既有，登录成功后自动进快照与 account_sync）；
+- **抖音短信二验运行时适配**（`service/login_adapt.py`）：上游抖音登录检测到短信二验输入框后仅记日志、等待有头浏览器中的手动输入，服务端 headless（Session 0）下不可用；本层以**运行时内存级适配**（不改上游源码）：会话期内替换 `dm._wait_for_douyin_login` 模块属性，复刻上游等待循环（登录完成判定/二维码失效刷新复用上游函数），短信输入框分支改为置 `need_input` → 等控制台 `POST /login/{sid}/code` 注入（单次窗口 120s，超时/会话终态 → 本次登录 failed）→ 填入并尝试提交（优先候选确认按钮「验证/确定/确认/登录/提交」，兜底回车）→ 继续等待登录完成；会话结束（含异常）还原原函数；另 `DOUYIN_COOKIE_AUTH_HEADLESS=true` 适配 Session 0 无桌面（上游原生开关）；
+- **内核前置检查**：创建会话前检查浏览器内核，未装 → 503 `browser_missing` + 引导 `sau.exe browser install`；
+- **端点**（替换原 501 占位，写操作并入 Nonce 清单，令牌豁免；GET 轮询不受约束）：
+  - `POST /login/{platform}`：创建会话（body 可选 account_name）→ session_id/platform/status/expires_at；
+  - `GET /login/qrcode/{session_id}`：image/png（no-store，附 `X-Qrcode-Updated-At`）；未就绪 404 `qrcode_not_ready`；
+  - `GET /login/status/{session_id}`：status/message/qrcode_ready/expires_at；
+  - `POST /login/{session_id}/code`：注入验证码（非 need_input → 409 `not_awaiting_code`；空码 400）；
+  - `POST /login/{session_id}/cancel` 与 `DELETE /login/{session_id}`：取消会话；
+  - `GET /accounts/status`：主目录扫描 + 基础判定（JSON 可解析）+ 复核说明；
+  - `DELETE /accounts`：删主目录 cookie（仅存兼容目录 → 409 `fallback_readonly`；不存在 404）+ 审计 `op=account_delete`；
+  - `POST /accounts/recheck`：仍 501 占位（真实浏览器复核留后续）；
+- **成功后链路**：登录成功 → cookie 落盘 → `on_success` 回调 → `send_account_sync` 上行（`LocalApiServer` 无条件接线，含测试注入的管理器）；
+- **控制台**：账号页（`AccountsView.vue`）实现登录表单（4 支持平台下拉 + 不支持平台置说明）/活跃会话面板（2s 轮询状态+二维码 blob 图/状态徽章/验证码输入/取消）/账号表格（主目录可删/兼容目录只读）；409 冲突自动复用既有 session_id 续轮询；
+- **验证边界**：verify_s9 全假执行器覆盖管理器单元/HTTP 链路/账号族 27 项（含停机路径：`LocalApiServer.stop()` 先 `close_all` 取消活跃会话，消除孤儿浏览器窗口）；`default_real_executor` 的平台分发与抖音短信桥接的真实页面注入留待真机回归（需浏览器内核 + 平台网络）。
 
 ## 运行方式（开发环境，仓库根目录）
 
@@ -207,7 +230,7 @@ python -m sau_wrap service remove
 # 当前开发机实装：D:\Program Files (x86)\Inno Setup 6（6.7.3，2026-08-26 实测编译成功）
 & "D:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
     /DMyAppVersion=2.0.0a0 sau_wrap\packaging\installer\sau.iss
-#   → sau_wrap\packaging\installer\Output\sau-{version}.exe（2.0.0a0 实测 51.3MB）
+#   → sau_wrap\packaging\installer\Output\sau-{version}.exe（2.0.0a0 实测 51.4MB）
 
 # 3) 哈希发布闭环（自动算 64 位小写 SHA-256，输出发布单）
 .venv\Scripts\python.exe -m sau_wrap.packaging.hash_release
@@ -215,14 +238,14 @@ python -m sau_wrap service remove
 #     管理端 PUT /sau/upgrade-config 填三字段（版本号/download_url/sha256）
 ```
 
-发布单实测样例（2.0.0a0）：
+发布单实测样例（2.0.0a0，2026-08-26 S9 重建后）：
 
 ```json
 {
   "version": "2.0.0a0",
   "installer_file": "sau-2.0.0a0.exe",
-  "size_bytes": 53757202,
-  "sha256": "85b8550b4bd8bd96458fe6dae8c4c7c1dce167906788e9363fcd00c042a95f67",
+  "size_bytes": 53894041,
+  "sha256": "fb57f70b9e162d416944554e57ad522a7a8a6e913c528588afa1e7c50acfa9b7",
   "download_url": "https://<部署域名>/sau/sau-2.0.0a0.exe"
 }
 ```
@@ -254,8 +277,8 @@ sau_wrap/
 │   ├── dispatcher.py          任务执行核心（S4：流水线/重签/异常分类/恢复）
 │   ├── accounts.py            账号快照扫描（双目录兼容，S4）
 │   └── upstream_adapter.py    上游上传器适配层（平台×内容类型映射，S4）
-├── service/                   host.py 服务宿主（asyncio 接线，含 dispatcher 挂载）；ops.py 服务管理；local_api.py 5409 本地 API（S3；S6：静态托管/票据/会话/Nonce）
-├── tests/                     mock_ws_server.py + verify_s2/s3/s4/s5/s6/s7.py（本地验证，不触碰上游）
+├── service/                   host.py 服务宿主（asyncio 接线，含 dispatcher 挂载）；ops.py 服务管理；local_api.py 5409 本地 API（S3；S6：静态托管/票据/会话/Nonce；S9：登录/账号端点族）；login_sessions.py 登录会话管理器（S9）；login_adapt.py 抖音短信二验运行时桥接（S9）
+├── tests/                     mock_ws_server.py + verify_s2/s3/s4/s5/s6/s7/s9.py（本地验证，不触碰上游）
 ├── tray/                      瘦托盘（S5：app.py 主体，pystray + Pillow 代码生成图标；S6：票据链路）
 ├── console/                   Web 控制台源码（S6：Vue3 + Vite；dist/node_modules 不入库，见 console/.gitignore）
 ├── upgrade/                   半自动升级编排（S7：updater.py 通知校验/下载/八态状态机；orchestrator.py 可注入执行器六步编排/回滚/启动自检）
@@ -273,6 +296,7 @@ python sau_wrap\tests\verify_s4.py   # S4：任务执行核心，16/16 通过（
 python sau_wrap\tests\verify_s5.py   # S5：瘦托盘（模块级），29/29 通过（结果写 tests\_verify_report_s5.txt）
 python sau_wrap\tests\verify_s6.py   # S6：本地 Web 控制台，31/31 通过（需先 npm run build；结果写 tests\_verify_report_s6.txt）
 python sau_wrap\tests\verify_s7.py   # S7：半自动升级编排，36/36 通过（结果写 tests\_verify_report_s7.txt）
+python sau_wrap\tests\verify_s9.py   # S9：登录扫码会话链路，27/27 通过（全假执行器；结果写 tests\_verify_report_s9.txt）
 ```
 
 - **verify_s2**（五场景）：①注册握手 + 心跳往返 + publish_task 落库 + 优雅停止；②断线重连退避
@@ -284,4 +308,5 @@ python sau_wrap\tests\verify_s7.py   # S7：半自动升级编排，36/36 通过
 - **verify_s5**（六场景，模块级不启动 GUI）：①状态轮询四态（在线/离线含挂起/401/不可达，mock /status）；②状态翻转与气泡触发（进入异常提示一次且措辞与 §5.2 一字一致、同态不重复、恢复再提示、首轮不提示）；③Mutex 单实例（会话本地命名；183→None；错误注入非 183 创建失败必须报错不得误报已在运行）；④日志轮转配置（5MB×3）；⑤控制台 URL/日志目录/tooltip 构造与令牌读回；⑥图标色块生成（绿/灰 + 状态→颜色映射）。真实托盘交互验证见上节「S5 手动验证步骤」。
 - **verify_s6**（九组场景，需先 `npm run build`）：①构建产物存在性；②静态托管（/ui/ no-cache、资源长缓存、404、路径穿越编码/明文变体均拒绝）；③dist 缺失 → 503 友好提示页；④票据全链路（签发 401 拦截/60s/核销种 Cookie（HttpOnly+SameSite=Strict）→认证访问、单次核销、过期、托盘链路：build_ticket_url/死端口回退 None/持令牌换票据）；⑤单实例顶替（旧 Cookie 401 + 日志）；⑥会话超时；⑦401 引导页（浏览器式 HTML vs API JSON；含 /ui 无尾斜杠 302 与票据核销失败引导响应）；⑧Nonce 写防护（缺失 403/一次性/重复 409/令牌豁免/审计 via=）；⑨机器码端点。控制台真实交互验证见上节「控制台访问方式」。
 - **verify_s7**（八场景，全假注入不真实停服/安装）：①通知校验与版本比较（三字段/64 位小写 hex/语义化严格大于/强制 https/域名白名单及回退）；②后台下载（本地 http 假文件源：成功落盘校验/失败 2 次重试后成功/哈希不符删文件回 noticed 不重试）；③并发单飞锁（3 并发仅 1 次真实下载）；④状态机迁移全路径 + 原子持久化；⑤编排六步假执行器（成功序列/安装失败→自动回滚→rolled_back/回滚亦失败→failed+人工救援指引/非 ready 拒绝）；⑥启动自检三分支（§15.2：补校验 success+清备份/半替换回滚/无备份人工指引；含校验未过保持 applying、回滚失败 failed 变体）；⑦启动清理（>24h 备份与旧安装包删除、目标安装包保留）；⑧端点（/upgrade 快照、apply 未就绪 409/就绪触发编排+审计、snooze 幂等、Cookie 会话 Nonce 防护、双鉴权共存）。真机验证缺口见 S7 节。
+- **verify_s9**（三场景，全假执行器不真实打开平台页面）：①管理器单元语义（不支持平台拒绝/内核未装/二维码回调写入+on_success/每平台单会话冲突+终态后重建/need_input 注入送达/总超时自动回收/取消/异常兜底 failed/非 need_input 注入 False（含 Manager 级不存在会话））；②HTTP 端点链路（创建契约/重复 409/不支持 400+未知 404/二维码 404→image/png 字节一致/状态契约/注入→success→account_sync 上行/终态注入 409+空码 400/DELETE 取消/Cookie 会话 Nonce 防护/审计 + 独立实例验 503 内核引导 + 停机路径：stop() 先 close_all 活跃会话置 cancelled）；③账号族（/accounts/status 主目录扫描+is_valid 区分/删除+审计/缺参 400/不存在 404/recheck 501 占位）。真实平台登录回归缺口见 S9 节。
 - 数据隔离于 `tests\_tmpdata*`（`SAU_DATA_ROOT` 覆盖，不触碰 `%ProgramData%\SAU`）。

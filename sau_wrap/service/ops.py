@@ -22,6 +22,8 @@ import click
 import win32service
 import win32serviceutil
 
+from sau_wrap import paths
+
 SERVICE_NAME = "SAUAgentService"
 DISPLAY_NAME = "SAU Agent Service"
 DESCRIPTION = (
@@ -54,10 +56,23 @@ def _repo_root() -> Path:
 
 
 def service_image_parts() -> tuple[str, str]:
-    """计算 SCM ImagePath 的 (可执行文件, 参数) 二元组。"""
-    if getattr(sys, "frozen", False):
+    """计算 SCM ImagePath 的 (可执行文件, 参数) 二元组。
+
+    冻结判定走 ``paths.is_frozen()``（Nuitka 不设 ``sys.frozen``，
+    真机缺陷修复：误走源码分支指向不存在的 python.exe）。
+    冻结形态下 SCM 直接拉起 sau.exe 自身（InstallService 传入的 exeName
+    存在时 pywin32 直接以其为宿主，无需 pythonservice.exe 代理）。
+    """
+    if paths.is_frozen():
         # 打包形态：ImagePath = "<{app}\sau.exe>" agent --startup auto（§3.2）
-        return sys.executable, "agent --startup auto"
+        # 注意：Nuitka standalone 的 ``sys.executable`` 指向产物内随附的
+        # ``python.exe``（2026-08-26 产物实测），**不是** sau.exe，不得用于
+        # 构造 ImagePath；``sys.argv[0]`` 即 sau.exe 自身路径（终端/SCM 拉起均如此）。
+        exe = Path(sys.argv[0]).resolve()
+        if not (exe.is_file() and exe.suffix.lower() == ".exe"):
+            # 兜底：与随附解释器同目录的 sau.exe
+            exe = Path(sys.executable).resolve().parent / "sau.exe"
+        return str(exe), "agent --startup auto"
     # 源码开发形态：由 __main__.py 的 sys.path 引导保证任意工作目录可导入
     entry_py = _repo_root() / "sau_wrap" / "__main__.py"
     return sys.executable, f'"{entry_py}" agent --startup auto'

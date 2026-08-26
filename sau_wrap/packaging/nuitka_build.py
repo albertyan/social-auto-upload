@@ -177,6 +177,17 @@ def build_nuitka_args(version: str) -> list[str]:
     args.append(f"--include-data-dir={console_dist}=ui")
     args.append(f"--include-data-files={REPO_ROOT / 'conf.example.py'}"
                 f"={'conf.example.py'}")
+    # pywin32 服务宿主伴随产物（真机缺陷修复，2026-08-26）：
+    # 冻结形态下 InstallService 传入的 exeName 存在时 SCM 直接以 sau.exe 为宿主，
+    # 但 pythonservice.exe 随包兼作兜底（pywin32 回退查找路径、旧版行为差异），
+    # 与 sau.exe 同级；DLL（pywintypes312/pythoncom312）Nuitka 已自动携带。
+    import win32serviceutil  # noqa: PLC0415
+
+    pythonservice = (Path(win32serviceutil.__file__).resolve().parent.parent
+                     / "pythonservice.exe")
+    if not pythonservice.is_file():
+        raise SystemExit(f"[nuitka_build] 未找到 pywin32 伴随产物：{pythonservice}")
+    args.append(f"--include-data-files={pythonservice}=pythonservice.exe")
     if (REPO_ROOT / "skills").is_dir():
         args.append(f"--include-data-dir={REPO_ROOT / 'skills'}=skills")
     if (REPO_ROOT / "static").is_dir():

@@ -27,7 +27,10 @@
   ``GET /machine-code``、``GET /nonce``、``POST /ui-ticket``、``GET /ui/t/<ticket>``、
   ``GET /ui/*``；S7 起升级族落地：``GET /upgrade``（只读快照）、
   ``POST /upgrade/apply``（用户确认触发编排）、``POST /upgrade/snooze``（稍后提醒）；
-  ``/login/*``、``/accounts/*`` **占位 501**（登录扫码会话链路 §6.5 留待后续）；
+  S9 起登录会话族落地（§6.5）：``POST /login/{platform}``、
+  ``GET /login/qrcode/{session_id}``、``GET /login/status/{session_id}``、
+  ``POST /login/{session_id}/code``、``DELETE /login/{session_id}``（及 ``.../cancel``）、
+  ``GET /accounts/status``、``DELETE /accounts``；``/accounts/recheck`` 仍占位 501；
 - 写操作审计：绑定/配置写入记一行审计日志（时间、操作、来源恒 127.0.0.1、结果、鉴权方式）。
 """
 
@@ -63,9 +66,25 @@ SESSION_COOKIE = "sau_session"
 NONCE_WINDOW = 600.0
 
 #: Cookie 会话写操作必须携带 Nonce 的路径（§6.3：/config、/upgrade/apply 等；
-#: S7 起升级写端点并入；令牌鉴权豁免，见中间件）
+#: S7 起升级写端点并入；S9 起登录会话写族与账号删除并入（前缀匹配，
+#: 见 _nonce_required）；令牌鉴权豁免，见中间件）
 _NONCE_REQUIRED = frozenset({"/config", "/bind", "/reload",
                              "/upgrade/apply", "/upgrade/snooze"})
+
+
+def _nonce_required(method: str, path: str) -> bool:
+    """Cookie 会话写操作 Nonce 约束判定（§6.3；S9 扩展登录/账号写族）。
+
+    GET 类（含 /login/qrcode 与 /login/status 轮询）不受约束；
+    ``/login/*`` 的 POST/DELETE 与 ``DELETE /accounts`` 属写操作，纳入防护。
+    """
+    if method not in ("POST", "DELETE"):
+        return False
+    if path in _NONCE_REQUIRED:
+        return True
+    if path.startswith("/login/"):
+        return True
+    return path == "/accounts"
 
 #: 401 引导页（§6.3：未认证访问控制台 → 说明从托盘「打开控制台」进入）
 _UNAUTH_HTML = """<!DOCTYPE html>
@@ -104,15 +123,15 @@ def resolve_ui_dist_dir() -> Path:
     """控制台静态资源目录解析（§6.4/§6.7）。
 
     优先级：``SAU_UI_DIST_DIR`` 环境变量（测试/自定义）→ 打包后 ``{app}\\ui``
-    （Nuitka standalone：sys.frozen，§7.1 --include-data-dir=console/dist=ui）→
-    开发默认 ``sau_wrap/console/dist``。
+    （Nuitka standalone：``paths.is_frozen()``——Nuitka 不设 ``sys.frozen``，
+    §7.1 --include-data-dir=console/dist=ui）→ 开发默认 ``sau_wrap/console/dist``。
     """
     import os
 
     env = os.environ.get("SAU_UI_DIST_DIR")
     if env:
         return Path(env)
-    if getattr(sys, "frozen", False):  # Nuitka/PyInstaller 打包后（§6.7）
+    if paths.is_frozen():  # Nuitka/PyInstaller 打包后（§6.7）
         return Path(sys.executable).parent / "ui"
     return Path(__file__).resolve().parents[1] / "console" / "dist"
 
@@ -133,6 +152,7 @@ class LocalApiServer:
         ticket_ttl: float = UI_TICKET_TTL,
         session_timeout: float = SESSION_TIMEOUT,
         updater=None,
+        login_manager=None,
     ) -> None:
         self._logger = logger
         self._client = ws_client
@@ -147,6 +167,13 @@ class LocalApiServer:
         self._updater = updater
         #: S7：升级编排器（host 接线；可注入执行器，见 upgrade.orchestrator）
         self._orchestrator = None
+        # ---- S9 登录会话管理器（§6.5；可注入执行器便于测试）----
+        from sau_wrap.service.login_sessions import LoginSessionManager  # noqa: PLC0415
+
+        self._login_manager = login_manager or LoginSessionManager(logger)
+        # 成功后置动作由服务端统一接线（§6.5：自动 account_sync 上行），
+        # 无论管理器是默认创建还是测试注入。
+        self._login_manager.set_on_success(self._notify_account_sync)
         # ---- S6 会话状态（内存表，服务重启失效可接受，§6.4）----
         self._tickets: dict[str, float] = {}   # 一次性票据 → 过期时间戳
         self._sessions: dict[str, float] = {}  # 会话 id → 最近活动时间戳
@@ -185,6 +212,9 @@ class LocalApiServer:
             )
 
     async def stop(self) -> None:
+        # S9 收尾：停机先取消全部活跃登录会话（close_all），收敛执行器浏览器
+        # 句柄，消除服务停止瞬间的孤儿进程窗口（优雅停机；幂等，重复调用无副作用）。
+        await self._login_manager.close_all()
         if self._runner is not None:
             await self._runner.cleanup()
             self._runner = None
@@ -224,8 +254,8 @@ class LocalApiServer:
 
         # 写操作 Nonce 双重防护（§6.3）：仅约束 Cookie 会话（浏览器上下文存在
         # CSRF 面）；令牌鉴权（托盘/CLI）不经浏览器，豁免。
-        if (request["auth_via"] == "cookie" and request.method == "POST"
-                and path in _NONCE_REQUIRED):
+        if (request["auth_via"] == "cookie"
+                and _nonce_required(request.method, path)):
             err = self._consume_nonce(request)
             if err is not None:
                 return err
@@ -341,7 +371,21 @@ class LocalApiServer:
         app.router.add_get("/upgrade", self._get_upgrade)
         app.router.add_post("/upgrade/apply", self._post_upgrade_apply)
         app.router.add_post("/upgrade/snooze", self._post_upgrade_snooze)
-        # 占位端点（后续步骤实现；登录扫码会话链路 §6.5）
+        # S9：登录会话族（§6.5：创建/二维码/状态/验证码注入/取消）
+        # 注意：/login/qrcode 与 /login/status 必须先于 /login/{session_id} 族注册；
+        # /login/{platform}（POST）与 /login/{session_id} 族同方法不冲突靠路径段区分——
+        # aiohttp 动态路由均为单段匹配，此处平台/会话 id 同为单段，故创建端点用独立前缀语义：
+        # POST /login/{platform}（创建）与 POST /login/{session_id}/code（注入）段数不同不冲突。
+        app.router.add_post("/login/{platform}", self._post_login_start)
+        app.router.add_get("/login/qrcode/{session_id}", self._get_login_qrcode)
+        app.router.add_get("/login/status/{session_id}", self._get_login_status)
+        app.router.add_post("/login/{session_id}/code", self._post_login_code)
+        app.router.add_post("/login/{session_id}/cancel", self._post_login_cancel)
+        app.router.add_delete("/login/{session_id}", self._post_login_cancel)
+        # S9：账号族（§3.5：状态查询 / 删除；真实浏览器复核 /accounts/recheck 仍占位）
+        app.router.add_get("/accounts/status", self._get_accounts_status)
+        app.router.add_delete("/accounts", self._delete_account)
+        # 占位端点（后续步骤实现）
         for method, path, note in _PLACEHOLDER_ROUTES:
             app.router.add_route(method, path, self._make_placeholder(note))
 
@@ -538,6 +582,163 @@ class LocalApiServer:
                     f"version={updater.state.get('version')}", request)
         return web.json_response({"ok": True, "phase": "snoozed"})
 
+    # ------------------------------------------------------------ S9 登录会话端点（§6.5）
+
+    async def _notify_account_sync(self, session) -> None:
+        """登录成功后置动作（§6.5）：触发 account_sync 上行更新账号快照。
+
+        cookie 已由执行器落主目录，``scan_accounts`` 自动可见；
+        WS 未连接时 ``send_account_sync`` 返回 False（下次心跳带快照兜底）。
+        """
+        sender = getattr(self._client, "send_account_sync", None)
+        if sender is None:
+            return
+        await sender()
+
+    async def _post_login_start(self, request: web.Request) -> web.Response:
+        """``POST /login/{platform}``：创建登录会话（每平台单会话，§6.5）。
+
+        请求体可选 ``{"account_name": "..."}``（缺省 default）。
+        错误：平台不支持 → 400；内核未装 → 503（引导 browser install）；
+        已有活跃会话 → 409（携带既有 session_id）。
+        """
+        from sau_wrap.service import login_sessions as ls  # noqa: PLC0415
+
+        platform = request.match_info.get("platform", "")
+        account_name = "default"
+        try:
+            body = await request.json()
+            account_name = str(body.get("account_name") or "default")
+        except (ValueError, json.JSONDecodeError, AttributeError):
+            pass
+        try:
+            session = await self._login_manager.create(platform, account_name)
+        except ls.LoginPlatformUnsupportedError as exc:
+            return web.json_response(
+                {"error": "platform_unsupported", "message": str(exc)}, status=400)
+        except ls.LoginBrowserMissingError as exc:
+            return web.json_response(
+                {"error": "browser_missing", "message": str(exc),
+                 "guide": "sau.exe browser install"},
+                status=503)
+        except ls.LoginSessionConflictError as exc:
+            return web.json_response(
+                {"error": "session_conflict",
+                 "message": "该平台已有进行中的登录会话",
+                 "session_id": exc.existing_session_id},
+                status=409)
+        self._audit("login_start", "success",
+                    f"platform={platform} account={account_name} "
+                    f"session={session.session_id}", request)
+        return web.json_response(session.to_status_dict())
+
+    async def _get_login_qrcode(self, request: web.Request) -> web.Response:
+        """``GET /login/qrcode/{session_id}``：二维码图片（PNG；未就绪 404）。
+        前端每 2s 轮询；上游刷新二维码后回调覆盖，轮询即得新图。"""
+        session = self._login_manager.get(request.match_info["session_id"])
+        if session is None:
+            return web.json_response({"error": "session_not_found"}, status=404)
+        if not session.qrcode_bytes:
+            return web.json_response(
+                {"error": "qrcode_not_ready",
+                 "message": "二维码尚未就绪（浏览器启动/页面加载中）",
+                 "status": session.status},
+                status=404)
+        return web.Response(body=session.qrcode_bytes, content_type="image/png",
+                            headers={"Cache-Control": "no-store",
+                                     "X-Qrcode-Updated-At": str(int(session.qrcode_updated_at))})
+
+    async def _get_login_status(self, request: web.Request) -> web.Response:
+        """``GET /login/status/{session_id}``：状态机轮询（前端每 2s）。"""
+        session = self._login_manager.get(request.match_info["session_id"])
+        if session is None:
+            return web.json_response({"error": "session_not_found"}, status=404)
+        return web.json_response(session.to_status_dict())
+
+    async def _post_login_code(self, request: web.Request) -> web.Response:
+        """``POST /login/{session_id}/code``：短信验证码注入（§6.5 need_input）。"""
+        session = self._login_manager.get(request.match_info["session_id"])
+        if session is None:
+            return web.json_response({"error": "session_not_found"}, status=404)
+        try:
+            body = await request.json()
+        except (ValueError, json.JSONDecodeError):
+            return web.json_response({"error": "invalid_json"}, status=400)
+        code = str(body.get("code") or "").strip()
+        if not code:
+            return web.json_response(
+                {"error": "code_required", "message": "验证码不能为空"}, status=400)
+        if not session.inject_code(code):
+            return web.json_response(
+                {"error": "not_awaiting_code",
+                 "message": f"当前状态 {session.status} 不在等待验证码",
+                 "status": session.status},
+                status=409)
+        self._audit("login_code", "success",
+                    f"session={session.session_id} platform={session.platform}",
+                    request)
+        return web.json_response({"ok": True, "status": session.status})
+
+    async def _post_login_cancel(self, request: web.Request) -> web.Response:
+        """``DELETE /login/{session_id}``（及 ``POST .../cancel``）：取消会话。"""
+        session = await self._login_manager.cancel(request.match_info["session_id"])
+        if session is None:
+            return web.json_response({"error": "session_not_found"}, status=404)
+        self._audit("login_cancel", "success",
+                    f"session={session.session_id} platform={session.platform}",
+                    request)
+        return web.json_response({"ok": True, "status": session.status})
+
+    # ------------------------------------------------------------ S9 账号端点（§3.5）
+
+    async def _get_accounts_status(self, request: web.Request) -> web.Response:
+        """``GET /accounts/status``：账号列表（双目录兼容扫描，§3.6）。
+
+        基础判定：文件存在且合法 JSON 即 is_valid；真实浏览器复核标注后续
+        （``/accounts/recheck`` 占位）。
+        """
+        from sau_wrap.agent import accounts as accounts_mod  # noqa: PLC0415
+
+        return web.json_response({"accounts": accounts_mod.scan_accounts(),
+                                  "note": "is_valid 为基础判定（文件存在且合法 JSON）；"
+                                          "真实浏览器复核待 /accounts/recheck 实现"})
+
+    async def _delete_account(self, request: web.Request) -> web.Response:
+        """``DELETE /accounts``：删除主目录账号 cookie 文件（写操作：Nonce + 审计）。
+
+        仅删主目录 ``%ProgramData%\\SAU\\cookies``；上游兼容目录只读回退，
+        同名仅存在于兼容目录时 409 说明（不删上游仓库文件）。
+        """
+        try:
+            body = await request.json()
+        except (ValueError, json.JSONDecodeError):
+            return web.json_response({"error": "invalid_json"}, status=400)
+        platform = str(body.get("platform") or "").strip()
+        account = str(body.get("account") or "").strip()
+        if not platform or not account:
+            return web.json_response(
+                {"error": "platform_and_account_required"}, status=400)
+        target = paths.COOKIES_DIR / f"{platform}_{account}.json"
+        if target.is_file():
+            try:
+                target.unlink()
+            except OSError as exc:
+                self._audit("account_delete", "fail",
+                            f"{platform}_{account} err={exc}", request)
+                return web.json_response(
+                    {"error": "delete_failed", "message": str(exc)}, status=500)
+            self._audit("account_delete", "success",
+                        f"{platform}_{account}", request)
+            return web.json_response({"ok": True,
+                                       "message": f"已删除 {platform}_{account}"})
+        from sau_wrap.agent import accounts as accounts_mod  # noqa: PLC0415
+        if accounts_mod.find_account_file(platform, account) is not None:
+            return web.json_response(
+                {"error": "fallback_readonly",
+                 "message": "该账号仅存在于上游兼容目录（只读回退，包装层不删）"},
+                status=409)
+        return web.json_response({"error": "account_not_found"}, status=404)
+
     # ------------------------------------------------------------ 既有端点实现
 
     async def _get_status(self, request: web.Request) -> web.Response:
@@ -665,10 +866,8 @@ class LocalApiServer:
 
 
 #: 占位端点（本步返回 501 + 说明，后续步骤实现；
-#: /ui/* 与票据链路已由 S6 实现、升级族已由 S7 实现，从此清单移除）
+#: /ui/* 与票据链路已由 S6 实现、升级族已由 S7 实现、登录会话族与账号
+#: 查询/删除已由 S9 实现，从此清单移除；仅留真实浏览器复核）
 _PLACEHOLDER_ROUTES = (
-    ("POST", "/login", "扫码登录会话（后续步骤：§6.5 登录会话族）"),
-    ("POST", "/accounts/recheck", "账号状态复核（后续步骤）"),
-    ("GET", "/accounts/status", "账号状态查询（后续步骤）"),
-    ("DELETE", "/accounts", "账号删除（后续步骤）"),
+    ("POST", "/accounts/recheck", "账号状态真实浏览器复核（后续步骤）"),
 )

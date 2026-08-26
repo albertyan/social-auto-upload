@@ -21,7 +21,25 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
+
+
+def is_frozen() -> bool:
+    """冻结（打包）形态统一判定。
+
+    **不可用 ``sys.frozen``**：Nuitka standalone 产物不设 ``sys.frozen``
+    （实测 Nuitka 4.1.3）。
+    **也不可用 ``"__compiled__" in sys.modules``**：Nuitka 的 ``__compiled__``
+    是注入到**每个编译模块模块级全局名**的伪模块，不进 ``sys.modules``
+    （2026-08-26 产物实测：``sys.frozen=None`` 且 sys.modules 无
+    ``__compiled__``，首版判定因此失效）。正确姿势为 ``globals()`` 存在性
+    检查（本模块被 Nuitka 编译时即携带该伪模块）；``sys.frozen`` 保留为
+    兼容其他打包器（PyInstaller）的兜底。
+    """
+    if "__compiled__" in globals():
+        return True
+    return bool(getattr(sys, "frozen", False))
 
 #: 运行时数据根目录（%ProgramData%\SAU）；SAU_DATA_ROOT 环境变量可覆盖（测试隔离）
 DATA_ROOT: Path = Path(
