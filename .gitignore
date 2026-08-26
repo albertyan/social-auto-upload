@@ -189,3 +189,6 @@ uploadFile
 videoFile
 
 /uploader/bilibili_uploader/qrcode.png
+/_e2e_shots/**
+*review*.txt
+*.diff
