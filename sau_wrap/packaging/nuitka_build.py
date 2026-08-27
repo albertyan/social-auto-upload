@@ -117,6 +117,10 @@ EXCLUDES = (
     # stream_gears（32.5MB）：biliup 内部推流依赖；biliup 经独立二进制调用，
     # Python 包不进产物（见 INCLUDE_PACKAGES 注释）
     "stream_gears",
+    # patchright_driver：部分安装方式下作为独立分发单元存在（与 patchright 主体
+    # 共享 driver 数据），排除后避免与显式 --include-data-files 的 node.exe 重复；
+    # 若环境中不存在该包，Nuitka 静默忽略本条
+    "patchright_driver",
 )
 
 
@@ -168,6 +172,17 @@ def build_nuitka_args(version: str) -> list[str]:
         args.append(f"--nofollow-import-to={ex}")
     # patchright driver 单份进产物（§7.5）：含 node.exe / cli.js / browsers.json
     args.append("--include-package-data=patchright")
+    # patchright/driver/package/ 含安装脚本/shell 脚本，Windows 运行时不需要，
+    # 但 Nuitka 无 --exclude-package-data 选项，此处不再单独排除
+    # 显式包含 patchright 的 node.exe（--include-package-data 不处理 .exe，
+    # 实测 Nuitka 4.1.3 产物中 patchright/driver/node.exe 缺失）
+    import patchright as _pr  # noqa: PLC0415
+    _patchright_node = Path(_pr.__file__).parent / "driver" / "node.exe"
+    if _patchright_node.is_file():
+        args.append(f"--include-data-files={_patchright_node}=patchright/driver/node.exe")
+    else:
+        print(f"[nuitka_build] 警告：patchright node.exe 未找到：{_patchright_node}",
+              file=sys.stderr)
     args.append("--include-package-data=certifi")
     # 数据文件（§7.1）
     console_dist = _HERE.parent / "console" / "dist"
@@ -176,6 +191,9 @@ def build_nuitka_args(version: str) -> list[str]:
     args.append(f"--include-data-dir={console_dist}=ui")
     args.append(f"--include-data-files={REPO_ROOT / 'conf.example.py'}"
                 f"={'conf.example.py'}")
+    # 上游浏览器反检测脚本（utils/base_social_media.py、uploader/xhs_uploader/main.py）
+    args.append(f"--include-data-files={REPO_ROOT / 'utils' / 'stealth.min.js'}"
+                f"=utils/stealth.min.js")
     # pywin32 服务宿主伴随产物（真机缺陷修复，2026-08-26）：
     # 冻结形态下 InstallService 传入的 exeName 存在时 SCM 直接以 sau.exe 为宿主，
     # 但 pythonservice.exe 随包兼作兜底（pywin32 回退查找路径、旧版行为差异），

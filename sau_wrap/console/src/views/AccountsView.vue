@@ -1,15 +1,13 @@
 <!-- 账号页（S9：登录扫码会话链路 §6.5；任务 #3 布局重构）
      - 账号列表：GET /accounts/status（双目录兼容扫描；基础判定，真实复核待 /accounts/recheck）；
-     - 多 Tab 按平台分组展示（douyin/kuaishou/xiaohongshu/tencent，前端按 platform_key 过滤；
-       四平台之外的账号收纳于「其他」Tab）；
+     - 多 Tab 按平台分组展示（全部 + douyin/kuaishou/xiaohongshu/tencent 四平台 Tab）；
      - 每 Tab「检查状态」→ POST /accounts/recheck（文件级重扫；写请求走 api.js 统一 Nonce 流程）；
      - 「新增平台账号」弹框：POST /login/{platform} 创建会话 → 每 2s 轮询 qrcode + status
        （waiting/need_input/success/failed/timeout/cancelled 状态机，§6.5）；
      - need_input：弹验证码输入框 → POST /login/{session_id}/code 注入；
      - 取消：DELETE /login/{session_id}；删除账号：DELETE /accounts（Nonce 防护）。
-     - 任务 #5：登录方式单选（无头默认/有头）；有头模式无二维码、短信二验在浏览器窗口手动完成，
-       控制台不渲染注入框（仅引导文案）；503 no_interactive_session 与 failed（含手动命令引导）
-       直接展示后端 message。 -->
+     - 任务 #5：登录方式下拉框（浏览器登录/二维码登录）；
+       503 no_interactive_session 与 failed（含手动命令引导）直接展示后端 message。 -->
 <script setup>
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { apiGet, apiWrite, apiDelete, fetchQrcodeUrl, UnauthorizedError } from '../api.js'
@@ -32,20 +30,16 @@ const accountsNote = ref('')
 const err = ref('')
 
 // ---- 任务 #3：平台 Tab（前端按 platform_key 分组过滤）
-const OTHER_TAB = '__other__'  // 兜底 Tab：收纳 platform_key 不属于四平台的账号（如 bilibili/baijiahao/youtube）
-const activeTab = ref('douyin')
-function isOther(acc) {
-  return !PLATFORMS.includes(acc.platform_key)
-}
+const ALL_TAB = '__all__'
+const activeTab = ref(ALL_TAB)
 const currentAccounts = computed(() =>
-  activeTab.value === OTHER_TAB
-    ? accounts.value.filter(isOther)
+  activeTab.value === ALL_TAB
+    ? accounts.value
     : accounts.value.filter((a) => a.platform_key === activeTab.value))
 function countOf(platform) {
-  if (platform === OTHER_TAB) return accounts.value.filter(isOther).length
+  if (platform === ALL_TAB) return accounts.value.length
   return accounts.value.filter((a) => a.platform_key === platform).length
 }
-// 「其他」Tab 恒显示（角标可为 0）：与四平台 Tab 行为一致，实现最简
 
 // ---- 任务 #3：检查状态（文件级重扫）提示
 const rechecking = ref(false)
@@ -93,15 +87,14 @@ async function refreshBrowserStatus() {
 // ---- 登录表单（任务 #3：挪入「新增平台账号」弹框）
 const dialogOpen = ref(false)
 const platform = ref('douyin')
-const accountName = ref('default')
-const loginMode = ref('headless')  // 任务 #5：登录方式（无头默认/有头；请求体附 mode 字段）
+const accountName = ref('')
+const loginMode = ref('headed')  // 任务 #5：登录方式（浏览器登录/二维码登录；请求体附 mode 字段）
 const starting = ref(false)
 
 function openDialog() {
-  // 「其他」Tab 的账号无法新增登录，弹框平台默认回落到第一个支持平台（下拉仍仅四平台可选）
-  platform.value = activeTab.value === OTHER_TAB ? 'douyin' : activeTab.value
-  accountName.value = 'default'
-  loginMode.value = 'headless'
+  platform.value = activeTab.value === ALL_TAB ? PLATFORMS[0] : activeTab.value
+  accountName.value = ''
+  loginMode.value = 'headed'
   dialogOpen.value = true
 }
 
@@ -179,7 +172,7 @@ async function startLogin() {
   starting.value = true
   try {
     const data = await apiWrite(`/login/${platform.value}`, {
-      account_name: accountName.value || 'default',
+      account_name: accountName.value || '',
       mode: loginMode.value,  // 任务 #5：无头（缺省语义）/有头；后端 400 invalid_mode、503 no_interactive_session
     })
     session.value = data
@@ -293,15 +286,14 @@ onUnmounted(() => { stopPolling(); releaseQrcode(); if (flashTimer) clearTimeout
 
     <!-- 任务 #3：平台 Tab 条（账号数角标沿用 .badge 风格） -->
     <div class="tabbar">
+      <button class="tab" :class="{ active: activeTab === ALL_TAB }" @click="activeTab = ALL_TAB">
+        全部
+        <span class="badge tab-count">{{ countOf(ALL_TAB) }}</span>
+      </button>
       <button v-for="p in PLATFORMS" :key="p" class="tab" :class="{ active: activeTab === p }"
               @click="activeTab = p">
         {{ PLATFORM_NAMES[p] }}
         <span class="badge tab-count">{{ countOf(p) }}</span>
-      </button>
-      <!-- 任务 #7：兜底「其他」Tab，收纳四平台之外的账号（恒显示，角标可为 0） -->
-      <button class="tab" :class="{ active: activeTab === OTHER_TAB }" @click="activeTab = OTHER_TAB">
-        其他
-        <span class="badge tab-count">{{ countOf(OTHER_TAB) }}</span>
       </button>
     </div>
 
@@ -316,14 +308,14 @@ onUnmounted(() => { stopPolling(); releaseQrcode(); if (flashTimer) clearTimeout
     <!-- 当前 Tab 账号列表 -->
     <table v-if="currentAccounts.length">
       <tr>
-        <th v-if="activeTab === OTHER_TAB">平台</th>
+        <th>平台</th>
         <th>账号</th>
         <th>状态</th>
         <th>来源</th>
         <th>操作</th>
       </tr>
       <tr v-for="acc in currentAccounts" :key="acc.platform_key + ':' + acc.account_name">
-        <td v-if="activeTab === OTHER_TAB">{{ acc.platform_key }}</td>
+        <td>{{ PLATFORM_NAMES[acc.platform_key] || acc.platform_key }}</td>
         <td>{{ acc.account_name }}</td>
         <td>
           <span class="badge" :class="acc.is_valid ? 'ok' : 'bad'">
@@ -363,36 +355,21 @@ onUnmounted(() => { stopPolling(); releaseQrcode(); if (flashTimer) clearTimeout
       </div>
       <div class="field">
         <label>账号名</label>
-        <input v-model="accountName" placeholder="账号名（默认 default）"
+        <input v-model="accountName" placeholder="请输入账号名"
                :disabled="session && !isTerminal" @keyup.enter="startLogin" />
       </div>
-      <!-- 任务 #5：登录方式单选（无头默认/有头）；会话进行中锁定，与平台/账号名一致 -->
+      <!-- 任务 #5：登录方式下拉框（浏览器登录/二维码登录）；会话进行中锁定，与平台/账号名一致 -->
       <div class="field">
         <label>登录方式</label>
-        <div class="mode-group">
-          <label class="mode-opt">
-            <input type="radio" v-model="loginMode" value="headless" :disabled="session && !isTerminal" />
-            无头（默认，控制台内扫码）
-          </label>
-          <label class="mode-opt">
-            <input type="radio" v-model="loginMode" value="headed" :disabled="session && !isTerminal" />
-            有头（本机桌面浏览器窗口内操作）
-          </label>
-        </div>
+        <select v-model="loginMode" :disabled="session && !isTerminal">
+          <option value="headed">浏览器登录</option>
+          <option value="headless">二维码登录</option>
+        </select>
       </div>
-      <p style="color:#7f8c9b;font-size:12px">
-        无头：登录在服务进程内以无头浏览器执行，二维码 5 分钟内有效；
-        有头：在本机桌面打开浏览器窗口，请在窗口中完成登录（含短信验证），无需活跃桌面会话时不可用。
-        每平台同时进行一个会话；若提示内核未安装，请先执行 <code>sau.exe browser install</code>。
-      </p>
-      <button @click="startLogin" :disabled="starting || (session && !isTerminal)">
-        {{ starting ? '启动中…' : '开始登录' }}
-      </button>
-
       <!-- 活跃会话（原内联面板搬入弹框，状态机逻辑不变） -->
       <div v-if="session" style="margin-top:12px">
         <p>
-          <b>{{ session.platform }}</b>（{{ session.account_name || 'default' }}）：
+          <b>{{ session.platform }}</b>（{{ session.account_name === 'default' ? '未命名' : session.account_name }}）：
           <span class="badge" :class="badgeClass(session.status)">
             {{ statusText }}
           </span>
@@ -418,10 +395,15 @@ onUnmounted(() => { stopPolling(); releaseQrcode(); if (flashTimer) clearTimeout
             <button @click="submitCode" :disabled="submittingCode">提交验证码</button>
           </div>
         </template>
-        <div style="margin-top:8px;display:flex;gap:8px">
-          <button v-if="!isTerminal" @click="cancelSession">取消登录</button>
-          <button v-else @click="closeSessionPanel">关闭</button>
-        </div>
+      </div>
+
+      <!-- 底部操作按钮：根据会话状态切换 -->
+      <div style="margin-top:12px">
+        <button v-if="!session" @click="startLogin" :disabled="starting">
+          {{ starting ? '启动中…' : '开始登录' }}
+        </button>
+        <button v-else-if="!isTerminal" @click="cancelSession">取消登录</button>
+        <button v-else @click="closeSessionPanel">关闭</button>
       </div>
     </div>
   </div>
@@ -496,21 +478,7 @@ onUnmounted(() => { stopPolling(); releaseQrcode(); if (flashTimer) clearTimeout
   padding: 4px 8px;
 }
 .dialog-close:hover { color: #2c3e50; }
-/* 任务 #5：登录方式单选（原生 radio，沿用弹框字段风格） */
-.mode-group {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-.mode-opt {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 14px;
-  color: #2c3e50;
-  cursor: pointer;
-}
-.mode-opt input { margin: 0; }
+/* 任务 #5：登录方式下拉框（沿用弹框字段风格） */
 .headed-guide {
   color: #3b82f6;
   background: #e8f0fe;

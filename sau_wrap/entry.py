@@ -38,7 +38,52 @@ from sau_wrap.version import APP_VERSION
 # 浏览器内核统一落 %ProgramData%\SAU\browsers（§3.6/§8.7）：
 # 服务（SYSTEM）/托盘/CLI 全路径一致，避免默认 %USERPROFILE% 缓存
 # 在 SYSTEM 与用户会话间不一致（任务 #19 ②-2 决策）。
+from pathlib import Path as _Path  # noqa: E402
+
 os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(paths.BROWSERS_DIR))
+
+# 兜底：patchright 的 node.exe 可能未被 Nuitka 包含（--include-package-data
+# 不处理 .exe），复用 playwright 已包含的 node.exe。
+# PLAYWRIGHT_NODEJS_PATH 是 patchright compute_driver_executable() 检查的
+# 环境变量，设置后 patchright 使用 playwright 的 node.exe 作为驱动。
+_pw_node = _Path(sys.executable).parent / "playwright" / "driver" / "node.exe"
+if _pw_node.is_file():
+    os.environ.setdefault("PLAYWRIGHT_NODEJS_PATH", str(_pw_node))
+
+# 确保打包资源 stealth.min.js 在运行时数据目录可用。
+# 上游代码（utils/base_social_media.py, uploader/xhs_uploader/main.py）
+# 通过 ``BASE_DIR / "utils/stealth.min.js"`` 查找该文件。
+# 冻结模式下 BASE_DIR = %ProgramData%\SAU\（可写数据目录），
+# 而 Nuitka 将 stealth.min.js 放在 exe 同级的 utils/ 目录（安装目录可能只读）。
+# 启动时将其复制到数据目录，上游代码即可正常找到。
+def _bootstrap_bundle_resources() -> None:
+    """将 bundled 资源从 exe 安装目录复制到运行时数据目录。"""
+    import shutil as _shutil
+
+    _exe_dir = _Path(sys.executable).resolve().parent
+    _bundle_utils = _exe_dir / "utils"
+    _runtime_utils = paths.DATA_ROOT / "utils"
+    if _bundle_utils.is_dir():
+        _runtime_utils.mkdir(parents=True, exist_ok=True)
+        for _js_file in _bundle_utils.glob("*.js"):
+            _dest = _runtime_utils / _js_file.name
+            if not _dest.exists():
+                _shutil.copy2(_js_file, _dest)
+
+
+# 仅在冻结（打包）形态下执行复制；开发模式下 BASE_DIR 就是项目根，文件自然存在。
+if getattr(sys, "frozen", False) or "__compiled__" in globals():
+    try:
+        _bootstrap_bundle_resources()
+    except Exception:  # noqa: BLE001  资源复制失败不阻断启动
+        pass
+
+# 无侵入 patch：拦截上游 ``playwright.chromium.launch(channel=...)`` 调用，
+# 将 channel 替换为 executable_path 指向 SAU 自管浏览器（任务 #3）。
+# 放在入口模块级，所有子命令（agent / login-headed / 平台透传）均覆盖。
+from sau_wrap.service.browser_patch import patch_playwright_launch as _patch  # noqa: E402, PLC0415
+
+_patch()
 
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})

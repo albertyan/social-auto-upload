@@ -1,27 +1,29 @@
 # -*- coding: utf-8 -*-
-"""有头登录拉起器（任务 #4 阶段二：服务 Session 0 无桌面的破局通道）。
+"""有头登录拉起器（任务 #4 阶段二 + 任务 #8 CreateProcessAsUser 升级）。
 
 背景：服务（``sau.exe agent``）运行在 Session 0（无桌面、无交互窗口站），
 有头浏览器（``headless=False``）必须由**用户桌面会话内的独立进程**承载。
-本模块经系统计划任务（``schtasks``，``LogonType=InteractiveToken``）把
-:mod:`sau_wrap.service.headed_login` 子进程投送到当前活跃用户桌面会话执行：
+
+首选路径（任务 #8）：
+    ``WTSQueryUserToken`` → ``DuplicateTokenEx`` → ``CreateEnvironmentBlock``
+    → ``CreateProcessAsUserW``（``lpDesktop = "winsta0\\default"``），
+    直接把子进程投送到活跃用户桌面会话——不经 schtasks，无延迟、无 ACL 风险。
+
+降级路径（CPAU 失败时回退）：
+    经系统计划任务（``schtasks``，``LogonType=InteractiveToken``）把子进程投送
+    到当前活跃用户桌面会话执行（兼容旧版 Windows / 异常环境）。
 
     服务侧（Session 0）                用户桌面会话
     ──────────────────                 ────────────────────────
-    launch_headed()                    sau(.exe) login-headed …
-      写任务 XML → schtasks /Create      ↑（InteractiveToken 投放）
-      → schtasks /Run ──────────────→  有头浏览器扫码登录
-      异步 /Delete（延迟，幂等）          ↓ 结束（成败均）
+    launch_headed()
+      ├─ _launch_as_user() ──────────→ 有头浏览器扫码登录  （首选）
+      └─ 失败 → schtasks /Create/Run → 有头浏览器扫码登录  （降级）
     POST /login/headed/result ←──────── 令牌现读 + urllib 回报（3 次重试）
 
 纪律：
 - 服务主循环为 Selector（§5.1 定案，不支持 ``create_subprocess_*``）——本模块
   全部进程操作使用 ``subprocess`` 同步调用（调用方经 ``asyncio.to_thread``
   下沉线程），并统一 ``CREATE_NO_WINDOW``（Session 0 无控制台，防弹窗/挂起）；
-- 任务名固定前缀 ``SAU\\HeadedLogin-{session_id}``（session_id 白名单校验，
-  杜绝注入任务名/路径）；XML 落 ``%ProgramData%\\SAU\\headed-login\\``；
-- 拉起后立即调度**延迟异步删除**任务注册（守护线程，不阻塞调用方）；
-  服务重启等场景的残留任务与 XML 由服务启动序列的 :func:`cleanup_stale` 收敛；
 - 上游文件零修改（铁律）：子进程复用上游 ``*_setup``，仅 ``headless`` 差异。
 """
 
@@ -34,6 +36,7 @@ import subprocess
 import sys
 import threading
 import time
+from ctypes import wintypes
 from pathlib import Path
 from xml.sax.saxutils import quoteattr
 
@@ -118,44 +121,135 @@ def _decode_out(data: bytes | None) -> str:
         return data.decode("utf-8", errors="replace")
 
 
+# ================================================================ Win32 API 声明
+
+#: 无活跃控制台会话标记
+_NO_ACTIVE_SESSION = 0xFFFFFFFF
+
+# -- kernel32 --
+_kernel32 = ctypes.windll.kernel32
+_kernel32.WTSGetActiveConsoleSessionId.restype = wintypes.DWORD
+_kernel32.WTSGetActiveConsoleSessionId.argtypes = []
+_kernel32.CloseHandle.restype = wintypes.BOOL
+_kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+_kernel32.GetLastError.restype = wintypes.DWORD
+_kernel32.GetLastError.argtypes = []
+
+# -- wtsapi32 --
+_wtsapi32 = ctypes.windll.wtsapi32
+_wtsapi32.WTSQueryUserToken.restype = wintypes.BOOL
+_wtsapi32.WTSQueryUserToken.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE)]
+_wtsapi32.WTSQuerySessionInformationW.restype = wintypes.BOOL
+_wtsapi32.WTSQuerySessionInformationW.argtypes = [
+    wintypes.HANDLE, wintypes.DWORD, ctypes.c_int,
+    ctypes.POINTER(ctypes.c_wchar_p), ctypes.POINTER(wintypes.DWORD),
+]
+_wtsapi32.WTSFreeMemory.argtypes = [ctypes.c_void_p]
+_wtsapi32.WTSFreeMemory.restype = None
+
+# -- advapi32 --
+_advapi32 = ctypes.windll.advapi32
+_advapi32.DuplicateTokenEx.restype = wintypes.BOOL
+_advapi32.DuplicateTokenEx.argtypes = [
+    wintypes.HANDLE, wintypes.DWORD, ctypes.c_void_p,
+    ctypes.c_int, ctypes.c_int, ctypes.POINTER(wintypes.HANDLE),
+]
+_advapi32.CreateProcessAsUserW.restype = wintypes.BOOL
+_advapi32.CreateProcessAsUserW.argtypes = [
+    wintypes.HANDLE, ctypes.c_wchar_p, ctypes.c_wchar_p,
+    ctypes.c_void_p, ctypes.c_void_p, wintypes.BOOL,
+    wintypes.DWORD, ctypes.c_void_p, ctypes.c_wchar_p,
+    ctypes.c_void_p, ctypes.c_void_p,
+]
+
+# -- userenv --
+_userenv = ctypes.windll.userenv
+_userenv.CreateEnvironmentBlock.restype = wintypes.BOOL
+_userenv.CreateEnvironmentBlock.argtypes = [
+    ctypes.POINTER(ctypes.c_void_p), wintypes.HANDLE, wintypes.BOOL,
+]
+_userenv.DestroyEnvironmentBlock.restype = wintypes.BOOL
+_userenv.DestroyEnvironmentBlock.argtypes = [ctypes.c_void_p]
+
+
+#: SECURITY_ATTRIBUTES 结构体（CreateProcessAsUser 须传非 NULL）
+class _SECURITY_ATTRIBUTES(ctypes.Structure):
+    _fields_ = [
+        ("nLength", wintypes.DWORD),
+        ("lpSecurityDescriptor", wintypes.LPVOID),
+        ("bInheritHandle", wintypes.BOOL),
+    ]
+
+
+#: STARTUPINFOW 结构体
+class _STARTUPINFOW(ctypes.Structure):
+    _fields_ = [
+        ("cb", wintypes.DWORD),
+        ("lpReserved", ctypes.c_wchar_p),
+        ("lpDesktop", ctypes.c_wchar_p),
+        ("lpTitle", ctypes.c_wchar_p),
+        ("dwX", wintypes.DWORD),
+        ("dwY", wintypes.DWORD),
+        ("dwXSize", wintypes.DWORD),
+        ("dwYSize", wintypes.DWORD),
+        ("dwXCountChars", wintypes.DWORD),
+        ("dwYCountChars", wintypes.DWORD),
+        ("dwFillAttribute", wintypes.DWORD),
+        ("dwFlags", wintypes.DWORD),
+        ("wShowWindow", wintypes.WORD),
+        ("cbReserved2", wintypes.WORD),
+        ("lpReserved2", ctypes.POINTER(ctypes.c_byte)),
+        ("hStdInput", wintypes.HANDLE),
+        ("hStdOutput", wintypes.HANDLE),
+        ("hStdError", wintypes.HANDLE),
+    ]
+
+
+#: PROCESS_INFORMATION 结构体
+class _PROCESS_INFORMATION(ctypes.Structure):
+    _fields_ = [
+        ("hProcess", wintypes.HANDLE),
+        ("hThread", wintypes.HANDLE),
+        ("dwProcessId", wintypes.DWORD),
+        ("dwThreadId", wintypes.DWORD),
+    ]
+
+
+# -- Win32 常量 --
+_TOKEN_ALL_ACCESS = 0xF01FF
+_TokenPrimary = 1
+_SecurityImpersonation = 2
+_CREATE_UNICODE_ENVIRONMENT = 0x00000400
+_STARTF_USESHOWWINDOW = 0x00000001
+_SW_SHOW = 1
+
+
 # ================================================================ 活跃会话探测
 
 
-def find_interactive_user() -> str | None:
-    """探测当前是否存在活跃桌面会话（有头登录前置条件）。
+def find_interactive_user() -> tuple[str, int] | None:
+    """探测当前是否存在活跃桌面会话，返回 ``(username, session_id)`` 或 ``None``。
 
-    改用 Windows 终端服务（WTS）API 替代 ``quser`` 解析（评审修复 #1）：
-    ``quser`` 的 STATE 列在中文系统显示「运行中」而非 ``Active``，字符串匹配在
-    zh-CN 永不命中致有头登录恒定 503。本实现经 ``kernel32.WTSGetActiveConsoleSessionId``
-    取活跃控制台会话（``0xFFFFFFFF`` 表示无活跃会话），再经 ``wtsapi32.WTSQuerySessionInformationW``
+    经 ``kernel32.WTSGetActiveConsoleSessionId`` 取活跃控制台会话
+    （``0xFFFFFFFF`` 表示无活跃会话），再经 ``wtsapi32.WTSQuerySessionInformationW``
     读该会话的 ``WTSUserName``；空用户名视为无人登录返回 ``None``。
 
-    保留原函数签名与返回语义：用户名仅用于日志，主判断是「存在活跃会话」。
-    快速用户切换下 Console 会话可能断开，此时返回 ``None`` 属可接受（前置探测本为尽力而为）。
-    任何异常 → ``None``（调用方据此 503 引导）。
+    .. versionchanged:: 任务 #8
+       返回值由 ``str | None`` 改为 ``tuple[str, int] | None``，
+       新增 session_id 供 :func:`_launch_as_user` 的 ``WTSQueryUserToken`` 使用。
+       调用方（``local_api.py``）仅做 ``if not user`` 真值判断，向后兼容。
     """
-    _NO_ACTIVE_SESSION = 0xFFFFFFFF
     _WTS_USERNAME = 5  # WTS_INFO_CLASS.WTSUserName
     try:
-        kernel32 = ctypes.windll.kernel32
-        kernel32.WTSGetActiveConsoleSessionId.restype = ctypes.c_uint32
-        session_id = kernel32.WTSGetActiveConsoleSessionId()
+        session_id = _kernel32.WTSGetActiveConsoleSessionId()
     except (AttributeError, OSError, ValueError):
         return None
     if session_id == _NO_ACTIVE_SESSION:  # 无活跃控制台会话（锁屏/无人登录）
         return None
     try:
-        wtsapi32 = ctypes.windll.wtsapi32
-        wtsapi32.WTSQuerySessionInformationW.restype = ctypes.c_int
-        wtsapi32.WTSQuerySessionInformationW.argtypes = [
-            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int,
-            ctypes.POINTER(ctypes.c_wchar_p), ctypes.POINTER(ctypes.c_uint32),
-        ]
-        wtsapi32.WTSFreeMemory.argtypes = [ctypes.c_void_p]
-        wtsapi32.WTSFreeMemory.restype = None
         buffer = ctypes.c_wchar_p()
-        returned = ctypes.c_uint32(0)
-        ok = wtsapi32.WTSQuerySessionInformationW(
+        returned = wintypes.DWORD(0)
+        ok = _wtsapi32.WTSQuerySessionInformationW(
             None,  # WTS_CURRENT_SERVER_HANDLE（本机）
             session_id, _WTS_USERNAME,
             ctypes.byref(buffer), ctypes.byref(returned))
@@ -164,14 +258,15 @@ def find_interactive_user() -> str | None:
         try:
             user = (buffer.value or "").strip()
         finally:
-            # 释放 WTS 分配的内存（即便取用户名失败也须释放）
             try:
-                wtsapi32.WTSFreeMemory(buffer)
+                _wtsapi32.WTSFreeMemory(buffer)
             except (AttributeError, OSError, ValueError):
                 pass
     except (AttributeError, OSError, ValueError):
         return None
-    return user or None
+    if not user:
+        return None
+    return (user, session_id)
 
 
 # ================================================================ 命令形态推导
@@ -270,6 +365,132 @@ def _task_xml(command: str, arguments: str) -> str:
     )
 
 
+# ================================================================ CreateProcessAsUser 投放
+
+
+def _launch_as_user(cmd_args: list[str], session_id: int
+                    ) -> subprocess.Popen | None:
+    """经 ``CreateProcessAsUserW`` 把子进程投放到指定会话的用户桌面。
+
+    调用链：``WTSQueryUserToken(sid)`` → ``DuplicateTokenEx`` →
+    ``CreateEnvironmentBlock`` → ``CreateProcessAsUserW``（``lpDesktop``
+    固定 ``winsta0\\default``）。
+
+    成功返回 ``Popen``-like 对象（仅保证 ``.pid`` 可用）；任何环节失败返回
+    ``None`` 并记日志（调用方据此降级到 schtasks）。
+
+    所有 Win32 句均在 finally 块中释放，环境块亦销毁——无论成败。
+    """
+    h_token = wintypes.HANDLE()
+    h_dup_token = wintypes.HANDLE()
+    env_block = ctypes.c_void_p()
+
+    # 1. WTSQueryUserToken —— 取指定会话的用户主令牌
+    if not _wtsapi32.WTSQueryUserToken(session_id, ctypes.byref(h_token)):
+        err = _kernel32.GetLastError()
+        logger.warning("WTSQueryUserToken 失败 session=%d err=%d", session_id, err)
+        return None
+
+    try:
+        # 2. DuplicateTokenEx —— 复制为 Primary Token（CreateProcessAsUser 须）
+        sa = _SECURITY_ATTRIBUTES()
+        sa.nLength = ctypes.sizeof(_SECURITY_ATTRIBUTES)
+        sa.bInheritHandle = False
+        if not _advapi32.DuplicateTokenEx(
+                h_token, _TOKEN_ALL_ACCESS, ctypes.byref(sa),
+                _SecurityImpersonation, _TokenPrimary,
+                ctypes.byref(h_dup_token)):
+            err = _kernel32.GetLastError()
+            logger.warning("DuplicateTokenEx 失败 err=%d", err)
+            return None
+
+        try:
+            # 3. CreateEnvironmentBlock —— 取用户环境变量块
+            if not _userenv.CreateEnvironmentBlock(
+                    ctypes.byref(env_block), h_dup_token, False):
+                err = _kernel32.GetLastError()
+                logger.warning("CreateEnvironmentBlock 失败 err=%d", err)
+                return None
+
+            try:
+                # 4. 构造命令行字符串（CreateProcessAsUserW 须可写缓冲区）
+                cmd_line = " ".join(
+                    f'"{a}"' if " " in a else a for a in cmd_args)
+
+                si = _STARTUPINFOW()
+                si.cb = ctypes.sizeof(_STARTUPINFOW)
+                si.lpDesktop = "winsta0\\default"
+                si.dwFlags = _STARTF_USESHOWWINDOW
+                si.wShowWindow = _SW_SHOW
+
+                pi = _PROCESS_INFORMATION()
+
+                # 5. CreateProcessAsUserW
+                work_dir = str(paths.DATA_ROOT)
+                ok = _advapi32.CreateProcessAsUserW(
+                    h_dup_token,           # hToken
+                    None,                   # lpApplicationName
+                    cmd_line,               # lpCommandLine（可写）
+                    None,                   # lpProcessAttributes
+                    None,                   # lpThreadAttributes
+                    False,                  # bInheritHandles
+                    _CREATE_UNICODE_ENVIRONMENT,  # dwCreationFlags
+                    env_block,              # lpEnvironment
+                    work_dir,               # lpCurrentDirectory
+                    ctypes.byref(si),       # lpStartupInfo
+                    ctypes.byref(pi),       # lpProcessInformation
+                )
+                if not ok:
+                    err = _kernel32.GetLastError()
+                    logger.warning("CreateProcessAsUserW 失败 err=%d cmd=%s",
+                                   err, cmd_line)
+                    return None
+
+                pid = pi.dwProcessId
+                logger.info("CreateProcessAsUser 成功 pid=%d session=%d",
+                            pid, session_id)
+
+                # 关闭子进程线程句柄（不需要），保留进程句柄用于 Popen
+                _kernel32.CloseHandle(pi.hThread)
+
+                # 构造轻量 Popen-like 对象（仅 pid 被下游使用）
+                popen = subprocess.Popen.__new__(subprocess.Popen)
+                popen.pid = pid
+                popen.returncode = None
+                popen._handle = pi.hProcess  # 保留句柄供后续 wait/kill
+                return popen
+
+            except Exception:
+                # CreateProcessAsUserW 之后的异常——须关闭已创建的进程/线程句柄
+                try:
+                    if pi.hProcess:
+                        _kernel32.CloseHandle(pi.hProcess)
+                    if pi.hThread:
+                        _kernel32.CloseHandle(pi.hThread)
+                except Exception:
+                    pass
+                raise
+
+            finally:
+                # 环境块始终销毁
+                try:
+                    _userenv.DestroyEnvironmentBlock(env_block)
+                except (AttributeError, OSError, ValueError):
+                    pass
+
+        finally:
+            try:
+                _kernel32.CloseHandle(h_dup_token)
+            except (AttributeError, OSError, ValueError):
+                pass
+
+    finally:
+        try:
+            _kernel32.CloseHandle(h_token)
+        except (AttributeError, OSError, ValueError):
+            pass
+
+
 # ================================================================ 拉起主流程
 
 
@@ -294,13 +515,15 @@ def _schedule_task_delete(task_name: str, delay: float = _DEFER_DELETE_DELAY
 
 
 def launch_headed(platform: str, account: str, session_id: str) -> tuple[bool, str]:
-    """经计划任务把有头登录子进程投放到用户桌面会话。
+    """把有头登录子进程投放到用户桌面会话（首选 CPAU，降级 schtasks）。
 
     返回 ``(成功与否, 手动命令字符串)``——拉起失败**不拒绝创建会话**
     （任务 #4 契约）：执行器据失败置 ``failed`` 时 message 附手动命令引导。
 
-    步骤：写任务 XML → ``schtasks /Create /XML /F`` → ``schtasks /Run``
-    → 调度延迟 ``/Delete /F``；全程 ``subprocess`` 同步 + CREATE_NO_WINDOW。
+    投放策略（任务 #8）：
+    1. 首选 ``CreateProcessAsUser`` 链——直接、无 schtasks 依赖、兼容性好；
+    2. CPAU 失败（无活跃会话 / API 报错）→ 降级到 ``schtasks`` 计划任务；
+    3. 两者均败 → 返回手动命令供用户自行执行。
     """
     manual_cmd = build_manual_command(platform, account, session_id)
     if not _SAFE_SESSION_ID_RE.fullmatch(session_id or ""):
@@ -316,19 +539,45 @@ def launch_headed(platform: str, account: str, session_id: str) -> tuple[bool, s
     if _ls.sanitize_fs_name(account) is None:
         logger.error("account 非法（未过白名单），拒绝拉起: %r", account)
         return False, manual_cmd
-    task_name = TASK_NAME_PREFIX + session_id
-    command, argv = _command_parts()
+
+    _, argv = _command_parts()
     sub_args = _login_headed_args(platform, account, session_id)
-    # 参数拼接（评审修复 #3）：逐项引号包裹且拒绝任何含双引号的参数——
-    # 白名单本已排除引号，此为防御性断言；不再用「含空格才加引号」的脆弱逻辑。
+    cmd_args = argv + sub_args
+
+    # 参数校验（评审修复 #3）：拒绝含双引号的参数（白名单本已排除）
     tokens = argv[1:] + sub_args
     if any('"' in a for a in tokens):
-        logger.error("参数含双引号，拒绝构造计划任务命令行: %r", tokens)
+        logger.error("参数含双引号，拒绝构造命令行: %r", tokens)
         return False, manual_cmd
+
+    # ---- 首选路径：CreateProcessAsUser（任务 #8）----
+    user_info = find_interactive_user()
+    if user_info is not None:
+        _, win_session_id = user_info
+        try:
+            popen = _launch_as_user(cmd_args, win_session_id)
+            if popen is not None:
+                logger.info("有头登录子进程已投放（CPAU）: pid=%d session=%d",
+                            popen.pid, win_session_id)
+                return True, manual_cmd
+        except Exception as exc:
+            logger.warning("CPAU 投放异常，降级到 schtasks: %s", exc)
+    else:
+        logger.info("无活跃用户会话，跳过 CPAU，尝试 schtasks 降级路径")
+
+    # ---- 降级路径：schtasks 计划任务 ----
+    return _launch_via_schtasks(cmd_args, session_id, manual_cmd)
+
+
+def _launch_via_schtasks(cmd_args: list[str], session_id: str,
+                         manual_cmd: str) -> tuple[bool, str]:
+    """经 schtasks 计划任务投放子进程（CPAU 失败时的降级路径）。"""
+    task_name = TASK_NAME_PREFIX + session_id
+    command = cmd_args[0]
+    tokens = cmd_args[1:]
     arguments = " ".join(f'"{a}"' for a in tokens)
     xml_file = _headed_login_dir() / f"{session_id}.xml"
     try:
-        # UTF-16（Task Scheduler 原生编码；内容经白名单校验恒为 ASCII 安全）
         xml_file.write_bytes(
             _task_xml(command, arguments).encode("utf-16"))
     except OSError as exc:
@@ -347,13 +596,14 @@ def launch_headed(platform: str, account: str, session_id: str) -> tuple[bool, s
             logger.error("schtasks /Run 失败: rc=%s out=%s",
                          proc.returncode, _decode_out(proc.stderr)
                          or _decode_out(proc.stdout))
-            _schtasks_delete(task_name)  # 未跑成即回收注册，不留垃圾
+            _schtasks_delete(task_name)
             return False, manual_cmd
     except (OSError, subprocess.TimeoutExpired) as exc:
         logger.error("schtasks 调用异常: %s task=%s", exc, task_name)
         return False, manual_cmd
     _schedule_task_delete(task_name)
-    logger.info("有头登录子进程已投放: task=%s command=%s", task_name, command)
+    logger.info("有头登录子进程已投放（schtasks 降级）: task=%s command=%s",
+                task_name, command)
     return True, manual_cmd
 
 

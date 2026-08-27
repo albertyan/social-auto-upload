@@ -56,6 +56,20 @@ Source: "{#BuildDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs c
 ; post-install 编排脚本（§17 失败不静默）
 Source: "..\post_install.bat"; DestDir: "{app}"; Flags: ignoreversion
 
+[Tasks]
+; 桌面快捷方式：安装向导"附加任务"页可勾选，默认创建。
+Name: "desktopicon"; Description: "创建桌面快捷方式(&D)"; GroupDescription: "附加快捷方式:"
+
+[Icons]
+; 桌面快捷方式（受 [Tasks] desktopicon 控制）
+Name: "{autodesktop}\SAU"; Filename: "{app}\sau.exe"; Parameters: "tray"; \
+  WorkingDir: "{app}"; IconFilename: "{app}\sau.exe"; \
+  Comment: "SAU Agent - 社交媒体自动化上传"; Tasks: desktopicon
+; 开始菜单快捷方式（DefaultGroupName = {#MyAppName} = SAU）
+Name: "{group}\SAU"; Filename: "{app}\sau.exe"; Parameters: "tray"; \
+  WorkingDir: "{app}"; IconFilename: "{app}\sau.exe"; \
+  Comment: "SAU Agent - 社交媒体自动化上传"
+
 [Run]
 ; 任务 #26（托盘缺失修复）：sau.iss 原本无 [Run] 段，装完从不拉起托盘；
 ; post-install 异常中断时 HKCU 自启项也未写入 → 重启后托盘同样缺席。
